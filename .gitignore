@@ -11,15 +11,21 @@ __pycache__/
 checkpoints/
 best_restore_rwkv_ref.pth
 
-# CUDA 编译产物（如果你编译 .cu 生成 .o 或 .so 的话）
-*.o
-*.so
-*.exe
+# 数据集
+data/
+# 如果你 data/ 里有少量配置文件想提交，可以放开特定文件：
+# !data/*.yaml
 
-# 训练日志或输出
+# 训练/评估日志和输出
+evaluation/outputs/
+evaluation/logs/
 *.log
 outputs/
 lightning_logs/
+
+# CUDA 编译产物
+*.o
+*.so
 
 # IDE
 .vscode/
