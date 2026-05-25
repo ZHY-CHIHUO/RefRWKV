@@ -16,12 +16,8 @@ data/
 # 如果你 data/ 里有少量配置文件想提交，可以放开特定文件：
 # !data/*.yaml
 
-# 训练/评估日志和输出
-evaluation/outputs/
-evaluation/logs/
-*.log
-outputs/
-lightning_logs/
+# 评估
+evaluation/
 
 # CUDA 编译产物
 *.o
