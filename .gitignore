@@ -1,0 +1,29 @@
+# Python 编译缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型权重（绝对不提交）
+*.pth
+*.ckpt
+*.bin
+*.onnx
+checkpoints/
+best_restore_rwkv_ref.pth
+
+# CUDA 编译产物（如果你编译 .cu 生成 .o 或 .so 的话）
+*.o
+*.so
+*.exe
+
+# 训练日志或输出
+*.log
+outputs/
+lightning_logs/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
