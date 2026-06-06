@@ -89,22 +89,32 @@ class RefPNGDataset(Dataset):
         return np.array(img, dtype=np.float32) / 255.0
 
     def _random_crop(self, lr, hr, ref):
-        H_hr, W_hr = hr.shape[:2]
-        th, tw = self.patch_size, self.patch_size
-        if H_hr < th or W_hr < tw:
-            raise ValueError(f"HR image {H_hr}×{W_hr} smaller than patch {th}×{tw}")
-        y = random.randint(0, H_hr - th)
-        x = random.randint(0, W_hr - tw)
-        hr_crop = hr[y:y+th, x:x+tw]
-        ref_crop = ref[y:y+th, x:x+tw]
-        y_lr = y // self.scale
-        x_lr = x // self.scale
-        th_lr = th // self.scale
-        tw_lr = tw // self.scale
+        # 1. 计算 LR 裁剪尺寸（向下取整，与现有逻辑一致）
+        th_lr = self.patch_size // self.scale
+        tw_lr = self.patch_size // self.scale
+
         H_lr, W_lr = lr.shape[:2]
-        y_lr = min(y_lr, H_lr - th_lr)
-        x_lr = min(x_lr, W_lr - tw_lr)
-        lr_crop = lr[y_lr:y_lr+th_lr, x_lr:x_lr+tw_lr]
+        H_hr, W_hr = hr.shape[:2]
+
+        # 2. 检查尺寸是否足够（用 HR 尺寸保证 patch 不超出；同时检查 LR 尺寸）
+        if H_hr < self.patch_size or W_hr < self.patch_size:
+            raise ValueError(f"HR image {H_hr}×{W_hr} smaller than patch {self.patch_size}×{self.patch_size}")
+        if H_lr < th_lr or W_lr < tw_lr:
+            raise ValueError(f"LR image {H_lr}×{W_lr} smaller than required LR patch {th_lr}×{tw_lr}")
+
+        # 3. 在 LR 上随机确定合法位置
+        y_lr = random.randint(0, H_lr - th_lr)
+        x_lr = random.randint(0, W_lr - tw_lr)
+
+        # 4. 反推 HR 坐标（直接乘 scale，无需边界检查）
+        y_hr = y_lr * self.scale
+        x_hr = x_lr * self.scale
+
+        # 5. 裁剪三张图
+        lr_crop = lr[y_lr:y_lr + th_lr, x_lr:x_lr + tw_lr]
+        hr_crop = hr[y_hr:y_hr + self.patch_size, x_hr:x_hr + self.patch_size]
+        ref_crop = ref[y_hr:y_hr + self.patch_size, x_hr:x_hr + self.patch_size]
+
         return lr_crop, hr_crop, ref_crop
 
     def _augment(self, lr, hr, ref):
@@ -133,7 +143,7 @@ class RefPNGDataset(Dataset):
         hr = self._load_image(self.hr_dir / f"{name}.png")
         ref = self._load_image(self.ref_dir / f"{name}.png")
         if self.patch_size is not None:
-            lr, hr, ref = self._random_crop(hr, lr, ref)
+            lr, hr, ref = self._random_crop(lr, hr, ref)
         lr = np.transpose(lr, (2,0,1))
         hr = np.transpose(hr, (2,0,1))
         ref = np.transpose(ref, (2,0,1))
