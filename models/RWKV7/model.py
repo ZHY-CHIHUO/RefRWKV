@@ -9,6 +9,7 @@ from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
+import copy
 
 if importlib.util.find_spec("deepspeed"):
     import deepspeed
@@ -317,73 +318,26 @@ class Block(nn.Module):
 
         x = x + self.ffn(self.ln2(x))
         return x, v_first
-
-
-class RWKV(pl.LightningModule):
+    
+class RWKV(nn.Module):
+    """RWKV 的主体：多个 Block 堆叠 + 最后的 LayerNorm"""
 
     def __init__(self, args):
         super().__init__()
         self.args = args
-        if not hasattr(args, "dim_att"):
+        if not hasattr(args, 'dim_att'):
             args.dim_att = args.n_embd
-        if not hasattr(args, "dim_ffn"):
-            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)
-
+        if not hasattr(args, 'dim_ffn'):
+            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size            
         assert args.n_embd % 32 == 0
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0
 
-        # ---------- 图像参数 ----------
-        self.hr_size = args.hr_size
-        self.lr_size = args.lr_size
-        self.patch_size_hr = args.patch_size_hr
-        self.patch_size_lr = args.patch_size_lr
-        self.hr_grid_size = self.hr_size // self.patch_size_hr
-        self.lr_grid_size = self.lr_size // self.patch_size_lr
-        self.hr_patches = self.hr_grid_size ** 2
-        self.lr_patches = self.lr_grid_size ** 2
-
-        self.hr_dim = 4 * self.patch_size_hr**2
-        self.lr_dim = 8 * self.patch_size_lr**2
-
-        # 动态计算序列长度（lr1 + hr1 + lr2 + hr2）
-        self.total_seq_len = 2 * self.lr_patches + 2 * self.hr_patches
-
-        # hr2 第一个 token 在整个序列中的起始索引（0-based）
-        self.hr2_start_idx = 2 * self.lr_patches + self.hr_patches
-
-        # ---------- Patch 投影 ----------
-        self.hr_proj = nn.Linear(self.hr_dim, args.n_embd)
-        self.lr_proj = nn.Linear(self.lr_dim, args.n_embd)
-
-        # RWKV 主体
         self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
-
-        # 输出层
         self.ln_out = nn.LayerNorm(args.n_embd)
-        self.lr_head = nn.Linear(args.n_embd, self.lr_dim)
-        self.hr_head = nn.Linear(args.n_embd, self.hr_dim)
-
-        # 平滑卷积（仅用于 HR）
-        self.smooth = nn.Sequential(
-            nn.Conv2d(4, 4, 3, padding=1, bias=False),
-            nn.ReLU(),
-            nn.Conv2d(4, 4, 3, padding=1, bias=False),
-        )
-
-        from torchmetrics.image import (
-            PeakSignalNoiseRatio,
-            StructuralSimilarityIndexMeasure,
-        )
-        from torchmetrics import MeanSquaredError
-
-        self.test_psnr = PeakSignalNoiseRatio(data_range=1.0)
-        self.test_ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
-        self.test_rmse = MeanSquaredError(squared=False)
 
     def forward(self, x):
-        """因果序列前向"""
-        v_first = torch.empty_like(x)
+        v_first = torch.zeros_like(x)
         for block in self.blocks:
             if self.args.grad_cp == 1:
                 x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
@@ -392,154 +346,274 @@ class RWKV(pl.LightningModule):
         x = self.ln_out(x)
         return x
 
-    def tokenize_image(self, img, is_hr):
-        """将单张影像转换为 token 序列 (B, N, d_model)"""
-        if is_hr:
-            patch_size = self.patch_size_hr
-            proj = self.hr_proj
-        else:
-            patch_size = self.patch_size_lr
-            proj = self.lr_proj
-        patches = F.unfold(img, kernel_size=patch_size, stride=patch_size)
-        patches = patches.transpose(1, 2)  # (B, N, dim)
-        return proj(patches)
+class ChannelBiRWKV(nn.Module):
+    """通道维度的双向交叉 RWKV（通道间全局建模）"""
+    def __init__(self, channel_rwkv_args):
+        super().__init__()
+        self.n_embd = channel_rwkv_args.n_embd
+        self.embed = nn.Linear(1, self.n_embd)
+        self.rwkv = RWKV(channel_rwkv_args)   # 共享权重，用于正向+反向
+        self.head = nn.Linear(self.n_embd, 1)
+        self.alpha = nn.Parameter(torch.zeros(1))
 
-    def detokenize_image(self, tokens, is_hr):
-        """将 token 序列还原为图像"""
-        if is_hr:
-            head = self.hr_head
-            out_dim = self.hr_dim
-            patch_size = self.patch_size_hr
-            output_size = self.hr_size
-            channels = 4
-        else:
-            head = self.lr_head
-            out_dim = self.lr_dim
-            patch_size = self.patch_size_lr
-            output_size = self.lr_size
-            channels = 8
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_flat = x.permute(0, 2, 3, 1).reshape(B * H * W, C)
+        x_seq = x_flat.unsqueeze(-1)                     # (N, C, 1)
+        x_seq = self.embed(x_seq)                        # (N, C, n_embd)
 
-        patches = head(tokens)
-        patches = patches.transpose(1, 2)
-        img = F.fold(
-            patches,
-            output_size=(output_size, output_size),
-            kernel_size=patch_size,
-            stride=patch_size,
+        pad_len = (16 - C % 16) % 16
+        if pad_len > 0:
+            x_seq = F.pad(x_seq, (0, 0, 0, pad_len))
+
+        # 双向交叉
+        out1 = self.rwkv(x_seq)
+        out1_rev = out1.flip(1)
+        out2_rev = self.rwkv(out1_rev)
+        out2 = out2_rev.flip(1)
+
+        if pad_len > 0:
+            out2 = out2[:, :C, :]
+
+        x_out = self.head(out2).squeeze(-1)
+        x_out = x_out.view(B, H, W, C).permute(0, 3, 1, 2)
+        return x + self.alpha * x_out
+
+class SpatialBiRWKV(nn.Module):
+    """空间维度的双向交叉 RWKV（空间位置间全局建模）"""
+    def __init__(self, channels, spatial_rwkv_args):
+        super().__init__()
+        self.d_model = spatial_rwkv_args.n_embd
+        self.proj_in = nn.Linear(channels, self.d_model)
+        self.rwkv = RWKV(spatial_rwkv_args)   # 共享权重
+        self.proj_out = nn.Linear(self.d_model, channels)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)       # (B, N, C)
+        x = self.proj_in(x)                    # (B, N, d_model)
+
+        # 双向交叉
+        out1 = self.rwkv(x)
+        out1_rev = out1.flip(1)
+        out2_rev = self.rwkv(out1_rev)
+        out2 = out2_rev.flip(1)
+
+        x = self.proj_out(out2)
+        x = x.transpose(1, 2).view(B, C, H, W)
+        return x
+
+########################################################################################################
+# RIRBlock 与 U-Net 编码器/解码器
+########################################################################################################
+
+class BasicBlock(nn.Module):
+    """基础残差块 (无BN) + 可选通道注意力"""
+    def __init__(self, channels, use_ca=False):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.use_ca = use_ca
+        if use_ca:
+            self.ca = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // 16, 1),
+                nn.ReLU(),
+                nn.Conv2d(channels // 16, channels, 1),
+                nn.Sigmoid()
+            )
+
+    def forward(self, x):
+        res = self.conv2(self.relu(self.conv1(x)))
+        if self.use_ca:
+            res = res * self.ca(res)
+        return x + res
+
+
+class ResidualGroup(nn.Module):
+    """一组 BasicBlock + 组内跳跃连接"""
+    def __init__(self, channels, n_blocks=4, use_ca=False):
+        super().__init__()
+        self.blocks = nn.Sequential(*[BasicBlock(channels, use_ca) for _ in range(n_blocks)])
+
+    def forward(self, x):
+        return x + self.blocks(x)
+
+
+class RIRBlock(nn.Module):
+    def __init__(self, channels, n_groups=3, n_blocks=4,
+                 use_ca=False, use_channel_rwkv=False, channel_rwkv_args=None):
+        super().__init__()
+        self.entry = nn.Conv2d(channels, channels, 3, padding=1)
+        self.groups = nn.ModuleList([ResidualGroup(channels, n_blocks, use_ca)for _ in range(n_groups)])
+        self.exit = nn.Conv2d(channels, channels, 3, padding=1)
+
+        self.use_channel_rwkv = use_channel_rwkv
+        if use_channel_rwkv:
+            self.channel_rwkv = ChannelBiRWKV(channel_rwkv_args)
+
+    def forward(self, x):
+        res = self.entry(x)
+        for group in self.groups:
+            res = group(res)
+        res = self.exit(res)
+        if self.use_channel_rwkv:
+            res = self.channel_rwkv(res)   # 通道全局调制
+        return x + res
+
+
+class DownBlock(nn.Module):
+    """下采样 + RIRBlock"""
+    def __init__(self, in_ch, out_ch, n_groups, n_blocks, use_ca=False, use_channel_rwkv=False, channel_rwkv_args=None):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1)
+        self.rir = RIRBlock(out_ch, n_groups, n_blocks, use_ca, use_channel_rwkv, channel_rwkv_args)
+
+    def forward(self, x):
+        return self.rir(self.conv(x))
+
+
+class UpBlock(nn.Module):
+    """上采样 + 跳跃连接 + 参考特征拼接 + RIRBlock"""
+    def __init__(self, in_ch, skip_ch, ref_ch, out_ch, n_groups, n_blocks,
+                 use_ca=False, use_channel_rwkv=False, channel_rwkv_args=None):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
+        self.fuse = nn.Conv2d(out_ch + skip_ch + ref_ch, out_ch, 1)
+        self.rir = RIRBlock(out_ch, n_groups, n_blocks, use_ca, use_channel_rwkv, channel_rwkv_args)
+
+    def forward(self, x, skip, ref):
+        x = self.up(x)
+        x = torch.cat([x, skip, ref], dim=1)
+        x = self.fuse(x)
+        return self.rir(x)
+
+class RWKVSR(pl.LightningModule):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.lr_size = args.lr_size
+        self.hr_size = args.hr_size
+
+        # 参数解耦：通道 RWKV 和空间 RWKV 使用独立配置
+        self.channel_rwkv_args = args.channel_rwkv_args
+        self.spatial_rwkv_args = args.spatial_rwkv_args
+
+        # ===== 投影层 =====
+        # 将拼接后的 lr1 + lr2 (共16通道) 投影到 4 通道
+        self.lr_proj = nn.Conv2d(16, 4, 1)
+        self.base_proj = nn.Conv2d(8, 4, 1)
+
+        # ===== 目标编码器（带通道双向 RWKV）=====
+        self.enc1 = DownBlock(4, 32, n_groups=3, n_blocks=4,
+                              use_channel_rwkv=True, channel_rwkv_args=self.channel_rwkv_args)
+        self.enc2 = DownBlock(32, 64, n_groups=3, n_blocks=4,
+                              use_channel_rwkv=True, channel_rwkv_args=self.channel_rwkv_args)
+
+        # ===== 参考编码器（轻量，无通道 RWKV）=====
+        # ref_enc1: 256 -> 32  (3次下采样)
+        self.ref_enc1 = nn.Sequential(
+            nn.Conv2d(4, 32, 3, stride=2, padding=1),  # 128
+            nn.ReLU(inplace=True),
+            RIRBlock(32, n_groups=2, n_blocks=4, use_ca=False),  # 轻量精炼
+            nn.Conv2d(32, 32, 3, stride=2, padding=1),  # 64
+            nn.ReLU(inplace=True),
+            RIRBlock(32, n_groups=2, n_blocks=4, use_ca=False),
+            nn.Conv2d(32, 32, 3, stride=2, padding=1),  # 32
+            nn.ReLU(inplace=True),
+            RIRBlock(32, n_groups=2, n_blocks=4, use_ca=False),
         )
-        if is_hr:
-            img = self.smooth(img)
-        return img
+        # ref_enc2: 32 -> 16 (1次下采样)
+        self.ref_enc2 = DownBlock(32, 64, n_groups=2, n_blocks=4, use_ca=False)
 
-    def upsample_lr_tokens(self, lr_tokens):
-        B, N, D = lr_tokens.shape
-        H_lr = W_lr = self.lr_grid_size
-        H_hr = W_hr = self.hr_grid_size
+        # ===== 瓶颈：空间双向 RWKV =====
+        self.bottleneck = SpatialBiRWKV(64, self.spatial_rwkv_args)
 
-        # 安全检查：token 数量必须与空间网格匹配
-        assert N == H_lr * W_lr, f"lr_tokens has {N} tokens, expected {H_lr*W_lr}"
+        # ===== 解码器 =====
+        # dec2: 8 -> 16, 接收 e1(32ch) 和 ref2(64ch)
+        self.dec2 = UpBlock(in_ch=64, skip_ch=32, ref_ch=64, out_ch=64,
+                            n_groups=3, n_blocks=4,
+                            use_channel_rwkv=True, channel_rwkv_args=self.channel_rwkv_args)
+        # dec1: 16 -> 32, 接收 lr_fused(4ch) 和 ref1(32ch)
+        self.dec1 = UpBlock(in_ch=64, skip_ch=4, ref_ch=32, out_ch=32,
+                            n_groups=3, n_blocks=4,
+                            use_channel_rwkv=True, channel_rwkv_args=self.channel_rwkv_args)
 
-        # 折叠为特征图: (B, D, H_lr, W_lr)
-        feat = lr_tokens.reshape(B, H_lr, W_lr, D).permute(0, 3, 1, 2)
-        # 双线性插值到 HR 空间尺寸
-        up = F.interpolate(
-            feat, size=(H_hr, W_hr), mode="bilinear", align_corners=False
+        # ===== 输出头 =====
+        # 先将 32x32 特征上采样到 64x64，再卷积输出 4 通道残差
+        self.dec0 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 4, 3, padding=1)
         )
-        # 展开回 token 序列: (B, hr_patches, D)
-        return up.permute(0, 2, 3, 1).reshape(B, -1, D)
 
+        # 测试指标（可选）
+        from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+        from torchmetrics import MeanSquaredError
+        self.test_psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.test_ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
+        self.test_rmse = MeanSquaredError(squared=False)
+
+    def forward(self, lr1, lr2, hr1):
+        # 拼接低分影像并投影
+        lr_cat = torch.cat([lr1, lr2], dim=1)          # (B, 16, 32, 32)
+        lr_fused = self.lr_proj(lr_cat)                # (B, 4, 32, 32)
+
+        # 目标编码器
+        e1 = self.enc1(lr_fused)                       # (B, 32, 16, 16)
+        e2 = self.enc2(e1)                             # (B, 64, 8, 8)
+
+        # 参考编码器
+        ref1 = self.ref_enc1(hr1)                      # (B, 32, 32, 32)
+        ref2 = self.ref_enc2(ref1)                     # (B, 64, 16, 16)
+
+        # 瓶颈
+        b = self.bottleneck(e2)                        # (B, 64, 8, 8)
+
+        # 解码器（融合跳跃连接和参考特征）
+        d2 = self.dec2(b, e1, ref2)                    # (B, 64, 16, 16)
+        d1 = self.dec1(d2, lr_fused, ref1)             # (B, 32, 32, 32)
+
+        # 输出残差
+        d0 = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=False)
+        res_64 = self.dec0(d0)                         # (B, 4, 64, 64)
+        res = F.interpolate(res_64, scale_factor=4, mode='bilinear', align_corners=False)
+        return res
+
+    # ---------- 训练 / 验证 / 测试步骤保持不变 ----------
     def training_step(self, batch, batch_idx):
         lr1, hr1, lr2, hr2 = batch
-        B = lr1.size(0)
-
-        # ----- 1. 随机选择一个旋转角度 (0, 90, 180, 270) -----
-        k = torch.randint(0, 4, (1,)).item()  # 随机整数 0~3
-        # -------------------------------------------------
-
-        # 旋转图像
-        lr1_r = torch.rot90(lr1, k, [2, 3])
-        hr1_r = torch.rot90(hr1, k, [2, 3])
-        lr2_r = torch.rot90(lr2, k, [2, 3])
-        hr2_r = torch.rot90(hr2, k, [2, 3])
-
-        # ----- 2. Tokenize -----
-        lr1_tok = self.tokenize_image(lr1_r, False)
-        hr1_tok = self.tokenize_image(hr1_r, True)
-        lr2_tok = self.tokenize_image(lr2_r, False)
-        hr2_tok = self.tokenize_image(hr2_r, True)
-
-        # ----- 3. Scheduled Sampling -----
-        hr2_base = self.upsample_lr_tokens(lr2_tok)
-        if torch.rand(1).item() < self.args.ss_prob:
-            hr2_inp = hr2_tok
-        else:
-            hr2_inp = hr2_base
-
-        # ----- 4. 拼接序列并前向 -----
-        full_tokens = torch.cat([lr1_tok, hr1_tok, lr2_tok, hr2_inp], dim=1)
-        out = self(full_tokens)
-
-        # ----- 5. 提取 hr2 预测部分 -----
-        pred = out[:, : self.total_seq_len - 1, :]
-        pred_hr2_start = self.hr2_start_idx - 1
-        pred_hr2_tok = pred[:, pred_hr2_start : pred_hr2_start + self.hr_patches, :]
-
-        # ----- 6. 还原为图像（仅当前角度）-----
-        pred_hr2_r = self.detokenize_image(pred_hr2_tok, is_hr=True)
-
-        # ----- 7. 反向旋转回原角度 -----
-        back_k = (-k) % 4
-        pred_hr2_orig = torch.rot90(pred_hr2_r, back_k, [2, 3])
-
-        # ----- 8. 损失（直接与原始 hr2 比较）-----
-        loss = F.l1_loss(pred_hr2_orig, hr2)
+        base_lr2 = self.base_proj(lr2)          # (B, 4, 32, 32)
+        base = F.interpolate(base_lr2, scale_factor=8, mode='bicubic', align_corners=False)  # (B, 4, 256, 256)
+        res = self(lr1, lr2, hr1)
+        sr = base + res
+        loss = F.l1_loss(sr, hr2)
         self.log("train_loss", loss, prog_bar=True, on_step=True)
         return loss
 
-    def generate_hr2(self, lr1, hr1, lr2):
-        B = lr1.shape[0]
-
-        # Tokenize
-        lr1_tok = self.tokenize_image(lr1, False)
-        hr1_tok = self.tokenize_image(hr1, True)
-        lr2_tok = self.tokenize_image(lr2, False)
-
-        # 占位符：上采样后的 lr2
-        placeholder = self.upsample_lr_tokens(lr2_tok)  # (B, hr_patches, C)
-
-        # 拼接完整序列
-        full_seq = torch.cat([lr1_tok, hr1_tok, lr2_tok, placeholder], dim=1)
-
-        # 一次性前向
-        out = self(full_seq)
-
-        # 提取 hr2 部分的预测（注意：输出是 shifted 一位的，取 pred 对应位置）
-        pred = out[
-            :, : self.total_seq_len - 1, :
-        ]  # 去掉最后一个预测（它对应 placeholder 后的空）
-        pred_hr2_start = self.hr2_start_idx - 1  # 与训练完全一致
-        hr2_tokens = pred[:, pred_hr2_start : pred_hr2_start + self.hr_patches, :]
-
-        hr2 = self.detokenize_image(hr2_tokens, is_hr=True)
-        return torch.clamp(hr2, 0.0, 1.0)
-
     def validation_step(self, batch, batch_idx):
         lr1, hr1, lr2, hr2 = batch
-        sr_hr2 = self.generate_hr2(lr1, hr1, lr2)
-        loss = F.l1_loss(sr_hr2, hr2)
+        base_lr2 = self.base_proj(lr2)          # (B, 4, 32, 32)
+        base = F.interpolate(base_lr2, scale_factor=8, mode='bicubic', align_corners=False)  # (B, 4, 256, 256)
+        res = self(lr1, lr2, hr1)
+        sr = base + res
+        loss = F.l1_loss(sr, hr2)
         self.log("val_loss", loss, sync_dist=True, prog_bar=True)
         return loss
 
     def test_step(self, batch, batch_idx):
         lr1, hr1, lr2, hr2 = batch
-        sr_hr2 = self.generate_hr2(lr1, hr1, lr2)
-        loss = F.l1_loss(sr_hr2, hr2)
+        base_lr2 = self.base_proj(lr2)          # (B, 4, 32, 32)
+        base = F.interpolate(base_lr2, scale_factor=8, mode='bicubic', align_corners=False)  # (B, 4, 256, 256)
+        res = self(lr1, lr2, hr1)
+        sr = base + res
+        loss = F.l1_loss(sr, hr2)
         self.log("test_loss", loss, on_step=True, on_epoch=True)
-        sr_hr2 = torch.clamp(sr_hr2, 0.0, 1.0)
-        hr2 = torch.clamp(hr2, 0.0, 1.0)
-        self.test_psnr.update(sr_hr2, hr2)
-        self.test_ssim.update(sr_hr2, hr2)
-        self.test_rmse.update(sr_hr2, hr2)
+        sr, hr2 = torch.clamp(sr, 0, 1), torch.clamp(hr2, 0, 1)
+        self.test_psnr.update(sr, hr2)
+        self.test_ssim.update(sr, hr2)
+        self.test_rmse.update(sr, hr2)
         return loss
 
     def on_test_epoch_end(self):
@@ -552,93 +626,32 @@ class RWKV(pl.LightningModule):
         self.test_psnr.reset()
         self.test_ssim.reset()
         self.test_rmse.reset()
-        print(
-            f"\nTest Results - PSNR: {avg_psnr:.4f} dB, SSIM: {avg_ssim:.4f}, RMSE: {avg_rmse:.6f}"
-        )
+        print(f"\nTest Results - PSNR: {avg_psnr:.4f} dB, SSIM: {avg_ssim:.4f}, RMSE: {avg_rmse:.6f}")
 
+    # ---------- 优化器 ----------
     def configure_optimizers(self):
         args = self.args
-        lr_decay = set()
-        lr_1x = set()
-        lr_2x = set()
+        lr_decay, lr_1x, lr_2x = set(), set(), set()
         for n, p in self.named_parameters():
             if "att.w0" in n:
                 lr_2x.add(n)
-            elif (
-                (len(p.squeeze().shape) >= 2)
-                and (args.weight_decay > 0)
-                and ".weight" in n
-            ):
+            elif (len(p.squeeze().shape) >= 2) and (args.weight_decay > 0) and ".weight" in n:
                 lr_decay.add(n)
             else:
                 lr_1x.add(n)
 
-        lr_decay = sorted(list(lr_decay))
-        lr_1x = sorted(list(lr_1x))
-        lr_2x = sorted(list(lr_2x))
-
         param_dict = {n: p for n, p in self.named_parameters()}
-
-        optim_groups = [
-            {
-                "params": [param_dict[n] for n in lr_1x],
-                "lr": args.lr_init * 1.0,
-                "weight_decay": 0.0,
-            },
-            {
-                "params": [param_dict[n] for n in lr_2x],
-                "lr": args.lr_init * 2.0,
-                "weight_decay": 0.0,
-            },
+        groups = [
+            {"params": [param_dict[n] for n in lr_1x], "lr": args.lr_init, "weight_decay": 0.0},
+            {"params": [param_dict[n] for n in lr_2x], "lr": args.lr_init * 2, "weight_decay": 0.0},
         ]
         if args.weight_decay > 0:
-            optim_groups.append(
-                {
-                    "params": [param_dict[n] for n in lr_decay],
-                    "lr": args.lr_init * 1.0,
-                    "weight_decay": args.weight_decay,
-                }
-            )
+            groups.append({"params": [param_dict[n] for n in lr_decay], "lr": args.lr_init, "weight_decay": args.weight_decay})
 
-        # 选择优化器
-        if self.deepspeed_offload:
-            optimizer = DeepSpeedCPUAdam(
-                optim_groups,
-                betas=args.betas,
-                eps=args.adam_eps,
-                bias_correction=True,
-                adamw_mode=True,
-                amsgrad=False,
-            )
-        else:
-            optimizer = FusedAdam(
-                optim_groups,
-                betas=args.betas,
-                eps=args.adam_eps,
-                bias_correction=True,
-                adam_w_mode=True,
-                amsgrad=False,
-            )
+        optimizer = torch.optim.AdamW(groups, betas=args.betas, eps=args.adam_eps, amsgrad=False)
         from torch.optim.lr_scheduler import ReduceLROnPlateau
-
-        scheduler = ReduceLROnPlateau(
-            optimizer,
-            mode="min",  # 因为要最小化 val_loss
-            factor=0.75,  # 触发时学习率乘以 0.75
-            patience=1,  # val_loss 连续 1 个 epoch 不下降才降低
-            threshold=1e-4,  # 最小改善量，低于此视为未改善
-            min_lr=1e-6,  # 学习率下限
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",  # 监控验证损失
-                "interval": "epoch",  # 每个 epoch 检查一次
-                "frequency": 1,  # 每1个epoch检查
-            },
-        }
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.9, patience=1, threshold=1e-3, min_lr=5e-5)
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss", "interval": "epoch", "frequency": 1}}
 
     @property
     def deepspeed_offload(self) -> bool:

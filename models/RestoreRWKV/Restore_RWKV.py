@@ -396,3 +396,6 @@ if __name__ == "__main__":
     print(loss)
     pred_hr2 = model(lr1, hr1, lr2)
     print(pred_hr2.shape)  # (4, 4, 256, 256)
+    model = Restore_RWKV_Ref().cuda()
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"可训练参数：{total_params/1e6:.2f} M")

@@ -9,12 +9,15 @@ __pycache__/
 *.bin
 *.onnx
 checkpoints/
+logs/
 best_restore_rwkv_ref.pth
 
 # 数据集
-data/
+data/*
+RefSR_data/*
 # 如果你 data/ 里有少量配置文件想提交，可以放开特定文件：
-# !data/*.yaml
+!data/*.py
+!RefSR_data/*.py
 
 # 评估
 evaluation/
