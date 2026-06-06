@@ -16,8 +16,8 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
 batch_size = 8
 accumulation_steps = 4
-num_epochs = 50
-num_workers = 4
+num_epochs = 200
+num_workers = 0
 scale = 10
 patch_size = 480
 
@@ -87,7 +87,7 @@ start_epoch = 1
 global_step = 0
 best_val_loss = float('inf')
 early_stop_counter = 0
-early_stop_patience = 5
+early_stop_patience = 10
 
 if os.path.exists(latest_ckpt_path):
     checkpoint = torch.load(latest_ckpt_path, map_location=device)
