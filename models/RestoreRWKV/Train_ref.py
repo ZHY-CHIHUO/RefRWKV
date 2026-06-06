@@ -164,6 +164,7 @@ for epoch in range(start_epoch, num_epochs + 1):
         print(f"  New best model (val loss {best_val_loss:.4f})")
     else:
         early_stop_counter += 1
+        print(f"  No improvement. Early stop counter: {early_stop_counter}/{early_stop_patience}")
         if early_stop_counter >= early_stop_patience:
             print("Early stopping triggered.")
             torch.save({
