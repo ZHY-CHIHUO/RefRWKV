@@ -88,7 +88,7 @@ class RefPNGDataset(Dataset):
         img = Image.open(path).convert("RGB")
         return np.array(img, dtype=np.float32) / 255.0
 
-    def _random_crop(self, hr, lr, ref):
+    def _random_crop(self, lr, hr, ref):
         H_hr, W_hr = hr.shape[:2]
         th, tw = self.patch_size, self.patch_size
         if H_hr < th or W_hr < tw:
