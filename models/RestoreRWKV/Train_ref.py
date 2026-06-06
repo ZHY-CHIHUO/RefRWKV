@@ -22,7 +22,7 @@ scale = 10
 patch_size = 480
 
 # 控制各集数量：train 取2000张，val/test 全取
-max_samples = (2000, None, None)
+max_samples = (10000, None, None)
 
 # ----------------- 数据集构建 -----------------
 train_dataset = RefPNGDataset(
