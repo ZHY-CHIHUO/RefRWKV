@@ -141,7 +141,7 @@ def main():
     from torch.utils.data import DataLoader
 
     # 数据集路径与参数
-    data_root = r"D:\Download\Edge\ALL_2"
+    data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
     max_samples = (1000, 200, None)  # train:1000, val:200, test:全部
     patch_size = 128
     batch_size = 4
