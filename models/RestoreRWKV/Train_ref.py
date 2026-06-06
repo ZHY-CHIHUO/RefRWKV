@@ -13,12 +13,13 @@ from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset              # 你新写
 
 # ----------------- 配置 -----------------
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2_zip"
-batch_size = 16
+data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
+batch_size = 8
+accumulation_steps = 4
 num_epochs = 50
 num_workers = 4
-scale = 10                     # HR 480 / LR 48 = 10
-patch_size = 160               # 被 scale 整除（160//10=16），也可用 240, 120 等
+scale = 10
+patch_size = 480
 
 # 控制各集数量：train 取2000张，val/test 全取
 max_samples = (2000, None, None)
@@ -69,8 +70,7 @@ test_loader = DataLoader(
 )
 
 # ----------------- 模型 -----------------
-# 注意：通道数由原遥感(4波段)改为RGB(3波段)，总输入 = lr1(3) + hr1(3) + lr2(3) = 9
-model = Restore_RWKV_Ref(inp_channels=9, out_channels=3, scale=scale).to(device)
+model = Restore_RWKV_Ref(inp_channels=3, out_channels=3, scale=scale).to(device)
 criterion = nn.L1Loss()
 lr_max = 1e-4
 optimizer = torch.optim.Adam(model.parameters(), lr=lr_max)
@@ -104,23 +104,42 @@ if os.path.exists(latest_ckpt_path):
 for epoch in range(start_epoch, num_epochs + 1):
     model.train()
     train_loss = 0.0
+    optimizer.zero_grad()                         # 每个累积周期开始时清零
+
     for step, (lr1, hr1, lr2, hr2) in enumerate(train_loader):
         lr1, hr1, lr2, hr2 = lr1.to(device), hr1.to(device), lr2.to(device), hr2.to(device)
-        optimizer.zero_grad()
-        output = model(lr1, hr1, lr2)            # 前向
+
+        output = model(lr1, hr1, lr2)
         loss = criterion(output, hr2)
+
+        # 梯度累积：将 loss 除以累积步数，反向传播时梯度自动叠加
+        loss = loss / accumulation_steps
         loss.backward()
-        optimizer.step()
 
-        global_step += 1
-        if global_step <= 100:                    # warmup
-            warmup_lr = lr_max * global_step / 100
-            for pg in optimizer.param_groups:
-                pg['lr'] = warmup_lr
+        # 每 accumulation_steps 步才更新一次
+        if (step + 1) % accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
-        train_loss += loss.item() * lr1.size(0)
+            # warmup 逻辑也放在这里（基于实际更新次数）
+            global_step += 1
+            if global_step <= 100:
+                warmup_lr = lr_max * global_step / 100
+                for pg in optimizer.param_groups:
+                    pg['lr'] = warmup_lr
+
+        # 记录 loss 时使用原始 loss（未除以 accumulation_steps）
+        train_loss += loss.item() * accumulation_steps * lr1.size(0)
+
         if step % 10 == 0:
-            print(f"Epoch {epoch}/{num_epochs} Step {step} Loss {loss.item():.4f}")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch}/{num_epochs} Step {step} Loss {loss.item() * accumulation_steps:.4f} "
+                  f"LR: {current_lr:.2e}")
+
+    # 处理可能不满 accumulation_steps 的尾部数据
+    if (step + 1) % accumulation_steps != 0:
+        optimizer.step()
+        optimizer.zero_grad()
 
     train_loss /= len(train_loader.dataset)
 

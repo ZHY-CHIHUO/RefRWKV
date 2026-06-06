@@ -271,13 +271,13 @@ class Upsample(nn.Module):
 
 class Restore_RWKV_Ref(nn.Module):
     def __init__(self,
-        inp_channels=8,                # 单个低分图像的通道数
-        out_channels=4,
+        inp_channels=3,
+        out_channels=3,
         dim = 48,
         num_blocks = [4,6,6,8],
         num_refinement_blocks = 8,
         loss_fun = nn.L1Loss(),
-        scale = 8
+        scale = 10
     ):
         super().__init__()
         self.scale = scale
@@ -316,24 +316,41 @@ class Restore_RWKV_Ref(nn.Module):
         self.decoder_level1 = nn.Sequential(*[Block(n_embd=int(dim*2)) for _ in range(num_blocks[0])])
         self.refinement      = nn.Sequential(*[Block(n_embd=int(dim*2)) for _ in range(num_refinement_blocks)])
 
-        # ---------- 6. 超分上采样与输出 ----------
-        up_hr_layers = []
-        for _ in range(int(math.log2(scale))):
-            up_hr_layers += [
-                nn.Conv2d(int(dim*2), int(dim*2)*4, 3, padding=1, bias=False),
-                nn.PixelShuffle(2)
-            ]
-        self.up_hr = nn.Sequential(*up_hr_layers)
-        self.output = nn.Sequential(nn.Conv2d(int(dim*2), out_channels, 3, padding=1, bias=True), nn.Sigmoid())
+        # ---------- 6. 自适应上采样与输出 ----------
+        if scale & (scale - 1) == 0:   # 2的幂，如 2,4,8
+            up_hr_layers = []
+            for _ in range(int(math.log2(scale))):
+                up_hr_layers += [
+                    nn.Conv2d(int(dim*2), int(dim*2)*4, 3, padding=1, bias=False),
+                    nn.PixelShuffle(2)
+                ]
+            self.up_hr = nn.Sequential(*up_hr_layers)
+            self.output = nn.Sequential(
+                nn.Conv2d(int(dim*2), out_channels, 3, padding=1, bias=True),
+                nn.Sigmoid()
+            )
+        else:                            # 非2的幂，如10
+            self.up_hr = nn.Sequential(
+                nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False),
+                nn.Conv2d(int(dim*2), out_channels, 3, padding=1, bias=True),
+                nn.Sigmoid()
+            )
+            self.output = nn.Identity()   # 上采样已输出最终图像
 
     def forward(self, lr1, hr1, lr2, label=None):
         # a) 拼接低分输入
-        lr_cat = torch.cat([lr1, lr2], dim=1)          # (B, 16, 32, 32)
-        fea = self.lr_fuse(lr_cat)                     # (B, dim, 32, 32)
+        lr_cat = torch.cat([lr1, lr2], dim=1)
+        fea = self.lr_fuse(lr_cat)
 
         # b) 多尺度参考特征
         f32, f16, f8, f4 = self.ref_extractor(hr1)
-        # f32: (B,dim,32)  f16: (B,2dim,16)  f8: (B,4dim,8)  f4: (B,8dim,4)
+        
+        # ---------- 动态对齐参考特征到编码器各级尺寸 ----------
+        H, W = fea.shape[2], fea.shape[3]
+        f32 = F.interpolate(f32, size=(H, W), mode='bilinear', align_corners=False)
+        f16 = F.interpolate(f16, size=(H//2, W//2), mode='bilinear', align_corners=False)
+        f8  = F.interpolate(f8,  size=(H//4, W//4), mode='bilinear', align_corners=False)
+        f4  = F.interpolate(f4,  size=(H//8, W//8), mode='bilinear', align_corners=False)
 
         # c) 编码器：逐级融合参考特征
         e1 = self.encoder_level1(self.fuse1(torch.cat([fea, f32], dim=1)))
@@ -347,9 +364,9 @@ class Restore_RWKV_Ref(nn.Module):
         d1 = self.decoder_level1(torch.cat([self.up2_1(d2), e1], 1))
 
         # e) 精炼与输出
-        d1 = self.refinement(d1)          # 原模型此处有两次 refinement，保留一次即可
+        d1 = self.refinement(d1)
         hr_feat = self.up_hr(d1)
-        out_hr = self.output(hr_feat)     # (B, out_channels, 256, 256)
+        out_hr = self.output(hr_feat)
 
         if label is None:
             return out_hr
@@ -358,10 +375,8 @@ class Restore_RWKV_Ref(nn.Module):
 
 
 class RefExtractor(nn.Module):
-    """从 256×256 参考图像提取四层特征，下采样至 32,16,8,4"""
     def __init__(self, in_ch, dim):
         super().__init__()
-        # 256 -> 128 -> 64 -> 32
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, dim, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -376,26 +391,31 @@ class RefExtractor(nn.Module):
         self.to_f4  = nn.Conv2d(dim*4, dim*8, 3, stride=2, padding=1)
 
     def forward(self, hr):
-        f32 = self.stem(hr)        # (B, dim, 32, 32)
+        f32 = self.stem(hr)
         f16 = F.relu(self.to_f16(f32))
         f8  = F.relu(self.to_f8(f16))
         f4  = F.relu(self.to_f4(f8))
         return f32, f16, f8, f4
 
 
+# ---------- 测试（使用你的真实数据尺寸）----------
 if __name__ == "__main__":
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model = Restore_RWKV_Ref(inp_channels=3, out_channels=3, dim=48, scale=10).to(device)
 
-    lr1 = torch.randn(4, 8, 32, 32).cuda()   # 参考低分
-    hr1 = torch.randn(4, 4, 256, 256).cuda() # 参考高分
-    lr2 = torch.randn(4, 8, 32, 32).cuda()   # 待超分
-    hr2 = torch.randn(4, 4, 256, 256).cuda() # 参考高分
+    # 模拟你的真实输入：LR 48×48, HR 参考 480×480
+    lr1 = torch.randn((2, 3, 48, 48)).to(device)
+    hr1 = torch.randn((2, 3, 480, 480)).to(device)
+    lr2 = torch.randn((2, 3, 48, 48)).to(device)
 
-    model = Restore_RWKV_Ref().cuda()
+    # 推理模式
+    out = model(lr1, hr1, lr2)
+    print(f"输出形状: {out.shape}")   # 应为 [2, 3, 480, 480]
+
+    # 训练模式（需要 label）
+    hr2 = torch.randn((2, 3, 480, 480)).to(device)
     loss = model(lr1, hr1, lr2, hr2)
-    print(loss)
-    pred_hr2 = model(lr1, hr1, lr2)
-    print(pred_hr2.shape)  # (4, 4, 256, 256)
-    model = Restore_RWKV_Ref().cuda()
+    print(f"Loss: {loss.item()}")
+
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"可训练参数：{total_params/1e6:.2f} M")
+    print(f"可训练参数: {total_params/1e6:.2f} M")
