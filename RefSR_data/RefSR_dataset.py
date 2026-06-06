@@ -108,13 +108,23 @@ class RefPNGDataset(Dataset):
         return lr_crop, hr_crop, ref_crop
 
     def _augment(self, lr, hr, ref):
+        """注意：输入为 (C, H, W) 格式"""
         if random.random() > 0.5:
-            lr = np.flip(lr, axis=1); hr = np.flip(hr, axis=1); ref = np.flip(ref, axis=1)
+            lr = np.flip(lr, axis=2)   # 水平翻转 (左右)
+            hr = np.flip(hr, axis=2)
+            ref = np.flip(ref, axis=2)
+
         if random.random() > 0.5:
-            lr = np.flip(lr, axis=0); hr = np.flip(hr, axis=0); ref = np.flip(ref, axis=0)
+            lr = np.flip(lr, axis=1)   # 垂直翻转 (上下)
+            hr = np.flip(hr, axis=1)
+            ref = np.flip(ref, axis=1)
+
         k = random.randint(0, 3)
         if k > 0:
-            lr = np.rot90(lr, k, axes=(0,1)); hr = np.rot90(hr, k, axes=(0,1)); ref = np.rot90(ref, k, axes=(0,1))
+            lr = np.rot90(lr, k, axes=(1, 2))   # 只在 H 和 W 上旋转
+            hr = np.rot90(hr, k, axes=(1, 2))
+            ref = np.rot90(ref, k, axes=(1, 2))
+
         return lr, hr, ref
 
     def __getitem__(self, idx):
