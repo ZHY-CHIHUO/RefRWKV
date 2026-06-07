@@ -19,9 +19,6 @@ RefSR_data/*
 !data/*.py
 !RefSR_data/*.py
 
-# 评估
-evaluation/
-
 # CUDA 编译产物
 *.o
 *.so
