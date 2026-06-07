@@ -519,6 +519,8 @@ class LitRestoreRWKV_Ref(pl.LightningModule):
 
         self.criterion = loss_fn
 
+        self._step_count = 0 
+
     def forward(self, lr1, hr1, lr2, label=None):
         # 直接调用原始模型的 forward
         return self.model(lr1, hr1, lr2, label)
@@ -548,7 +550,7 @@ class LitRestoreRWKV_Ref(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         # 正常使用 ReduceLROnPlateau，它会在每个 epoch 结束时根据 val_loss 调整学习率
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, verbose=True
+            optimizer, mode="min", factor=0.5, patience=5
         )
         return {
             "optimizer": optimizer,
@@ -561,13 +563,12 @@ class LitRestoreRWKV_Ref(pl.LightningModule):
         }
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
-        # 在每次 optimizer step 之前，如果还在 warmup 阶段，手动调整学习率
-        if self._step_count < self.warmup_steps:
-            # 线性 warmup: 从 0 线性增长到 hparams.learning_rate
-            lr_scale = min(1.0, (self._step_count + 1) / self.warmup_steps)
+        # warmup：当步数小于 warmup_steps 时，线性增加学习率
+        if self._step_count < self.hparams.warmup_steps:
+            lr_scale = min(1.0, (self._step_count + 1) / self.hparams.warmup_steps)
             for pg in optimizer.param_groups:
                 pg['lr'] = self.hparams.learning_rate * lr_scale
-        # 调用父类方法执行实际的 optimizer step
+        # 执行实际的优化步骤
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
         self._step_count += 1
 
