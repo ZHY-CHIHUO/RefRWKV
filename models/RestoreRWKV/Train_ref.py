@@ -17,7 +17,7 @@ data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
 batch_size = 8
 accumulation_steps = 4
 num_epochs = 200
-num_workers = 0
+num_workers = 2
 scale = 10
 patch_size = 480
 
