@@ -276,9 +276,13 @@ class Downsample(nn.Module):
     def __init__(self, n_feat, channel_scale=2):
         super(Downsample, self).__init__()
         mid_channels = n_feat * channel_scale // 4
-        assert mid_channels > 0, "channel_scale must be such that n_feat * channel_scale is divisible by 4"
+        assert (
+            mid_channels > 0
+        ), "channel_scale must be such that n_feat * channel_scale is divisible by 4"
         self.body = nn.Sequential(
-            nn.Conv2d(n_feat, mid_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Conv2d(
+                n_feat, mid_channels, kernel_size=3, stride=1, padding=1, bias=False
+            ),
             nn.PixelUnshuffle(2),
         )
 
@@ -291,7 +295,9 @@ class Upsample(nn.Module):
         super(Upsample, self).__init__()
         mid_channels = int(n_feat * channel_scale * 4)
         self.body = nn.Sequential(
-            nn.Conv2d(n_feat, mid_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Conv2d(
+                n_feat, mid_channels, kernel_size=3, stride=1, padding=1, bias=False
+            ),
             nn.PixelShuffle(2),
         )
 
@@ -300,14 +306,15 @@ class Upsample(nn.Module):
 
 
 class Restore_RWKV_Ref(nn.Module):
-    def __init__(self,
+    def __init__(
+        self,
         inp_channels=3,
         out_channels=3,
         dim=48,
-        num_blocks=[4,6,6,8],
+        num_blocks=[4, 6, 6, 8],
         num_refinement_blocks=8,
         loss_fun=nn.L1Loss(),
-        scale=10
+        scale=10,
     ):
         super().__init__()
         self.scale = scale
@@ -316,82 +323,86 @@ class Restore_RWKV_Ref(nn.Module):
         # ---- LR 上采样到 120×120 ----
         # 原 LR 为 48×48，目标 120×120，倍率 120/48 = 2.5
         self.lr_up = nn.Sequential(
-            nn.Upsample(scale_factor=2.5, mode='bilinear', align_corners=False),
-            nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False)
+            nn.Upsample(scale_factor=2.5, mode="bilinear", align_corners=False),
+            nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False),
         )
 
         # ---- 参考图像多尺度提取 (输出 120,60,30,15) ----
-        self.ref_extractor = nn.ModuleList([
-            nn.Sequential(                           # 120×120
-                nn.Conv2d(out_channels, dim, 3, padding=1),
-                nn.ReLU(inplace=True)
+        # 先通过卷积从 480 降到 120 (两次 stride=2)
+        self.ref_to_120 = nn.Sequential(
+            nn.Conv2d(
+                out_channels, dim, kernel_size=3, stride=2, padding=1, bias=False
             ),
-            nn.Sequential(                           # 60×60
-                nn.Conv2d(out_channels, dim*2, 3, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim*2, dim*2, 3, padding=1),
-                nn.ReLU(inplace=True)
-            ),
-            nn.Sequential(                           # 30×30
-                nn.Conv2d(out_channels, dim*4, 3, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim*4, dim*4, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim*4, dim*4, 3, stride=2, padding=1),
-                nn.ReLU(inplace=True)
-            ),
-            nn.Sequential(                           # 15×15
-                nn.Conv2d(out_channels, dim*8, 3, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim*8, dim*8, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim*8, dim*8, 3, stride=2, padding=1),
-                nn.ReLU(inplace=True)
-            )
-        ])
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        # 然后连续使用 Downsample 得到 60,30,15
+        self.ref_down_60 = Downsample(dim)  # 120 -> 60, 通道 dim -> 2*dim
+        self.ref_down_30 = Downsample(dim * 2)  # 60  -> 30, 通道 2*dim -> 4*dim
+        self.ref_down_15 = Downsample(dim * 4)  # 30  -> 15, 通道 4*dim -> 8*dim
 
         # ---- 各层级融合卷积 (1×1) ----
-        self.fuse1 = nn.Conv2d(dim*2, dim, 1)      # fea(120) + ref(120)
-        self.fuse2 = nn.Conv2d(dim*4, dim*2, 1)    # e1下采样(60) + ref(60)
-        self.fuse3 = nn.Conv2d(dim*8, dim*4, 1)    # e2下采样(30) + ref(30)
-        self.fuse4 = nn.Conv2d(dim*16, dim*8, 1)   # e3下采样(15) + ref(15)
+        self.fuse1 = nn.Conv2d(dim * 2, dim, 1)  # fea(120) + ref(120)
+        self.fuse2 = nn.Conv2d(dim * 4, dim * 2, 1)  # e1下采样(60) + ref(60)
+        self.fuse3 = nn.Conv2d(dim * 8, dim * 4, 1)  # e2下采样(30) + ref(30)
+        self.fuse4 = nn.Conv2d(dim * 16, dim * 8, 1)  # e3下采样(15) + ref(15)
 
         # ---- 编码器 (分辨率从120开始, 下采样3次) ----
-        self.encoder_level1 = nn.Sequential(*[Block(n_embd=dim) for _ in range(num_blocks[0])])
-        self.down1_2 = Downsample(dim)                     # 120 → 60, 通道: dim → 2*dim
-        self.encoder_level2 = nn.Sequential(*[Block(n_embd=dim*2) for _ in range(num_blocks[1])])
-        self.down2_3 = Downsample(dim*2)                   # 60 → 30, 通道: 2*dim → 4*dim
-        self.encoder_level3 = nn.Sequential(*[Block(n_embd=dim*4) for _ in range(num_blocks[2])])
-        self.down3_4 = Downsample(dim*4)                   # 30 → 15, 通道: 4*dim → 8*dim
-        self.latent = nn.Sequential(*[Block(n_embd=dim*8) for _ in range(num_blocks[3])])
+        self.encoder_level1 = nn.Sequential(
+            *[Block(n_embd=dim) for _ in range(num_blocks[0])]
+        )
+        self.down1_2 = Downsample(dim)  # 120 → 60, 通道: dim → 2*dim
+        self.encoder_level2 = nn.Sequential(
+            *[Block(n_embd=dim * 2) for _ in range(num_blocks[1])]
+        )
+        self.down2_3 = Downsample(dim * 2)  # 60 → 30, 通道: 2*dim → 4*dim
+        self.encoder_level3 = nn.Sequential(
+            *[Block(n_embd=dim * 4) for _ in range(num_blocks[2])]
+        )
+        self.down3_4 = Downsample(dim * 4)  # 30 → 15, 通道: 4*dim → 8*dim
+        self.latent = nn.Sequential(
+            *[Block(n_embd=dim * 8) for _ in range(num_blocks[3])]
+        )
 
         # ---- 解码器 (上采样3次，并融合跳跃连接) ----
-        self.up4_3 = Upsample(dim*8)                       # 15 → 30, 通道: 8*dim → 4*dim
-        self.reduce_chan_level3 = nn.Conv2d(4*dim + 4*dim, 4*dim, 1)   # 拼接 up(4*dim) + e3(4*dim) → 8*dim → 4*dim
-        self.decoder_level3 = nn.Sequential(*[Block(n_embd=dim*4) for _ in range(num_blocks[2])])
+        self.up4_3 = Upsample(dim * 8)  # 15 → 30, 通道: 8*dim → 4*dim
+        self.reduce_chan_level3 = nn.Conv2d(
+            4 * dim + 4 * dim, 4 * dim, 1
+        )  # 拼接 up(4*dim) + e3(4*dim) → 8*dim → 4*dim
+        self.decoder_level3 = nn.Sequential(
+            *[Block(n_embd=dim * 4) for _ in range(num_blocks[2])]
+        )
 
-        self.up3_2 = Upsample(dim*4)                       # 30 → 60, 通道: 4*dim → 2*dim
-        self.reduce_chan_level2 = nn.Conv2d(2*dim + 2*dim, 2*dim, 1)   # 拼接 up(2*dim) + e2(2*dim) → 4*dim → 2*dim
-        self.decoder_level2 = nn.Sequential(*[Block(n_embd=dim*2) for _ in range(num_blocks[1])])
+        self.up3_2 = Upsample(dim * 4)  # 30 → 60, 通道: 4*dim → 2*dim
+        self.reduce_chan_level2 = nn.Conv2d(
+            2 * dim + 2 * dim, 2 * dim, 1
+        )  # 拼接 up(2*dim) + e2(2*dim) → 4*dim → 2*dim
+        self.decoder_level2 = nn.Sequential(
+            *[Block(n_embd=dim * 2) for _ in range(num_blocks[1])]
+        )
 
-        self.up2_1 = Upsample(dim*2)                       # 60 → 120, 通道: 2*dim → dim
-        self.reduce_chan_level1 = nn.Conv2d(dim + dim, dim, 1)         # 拼接 up(dim) + e1(dim) → 2*dim → dim
-        self.decoder_level1 = nn.Sequential(*[Block(n_embd=dim) for _ in range(num_blocks[0])])
+        self.up2_1 = Upsample(dim * 2)  # 60 → 120, 通道: 2*dim → dim
+        self.reduce_chan_level1 = nn.Conv2d(
+            dim + dim, dim, 1
+        )  # 拼接 up(dim) + e1(dim) → 2*dim → dim
+        self.decoder_level1 = nn.Sequential(
+            *[Block(n_embd=dim) for _ in range(num_blocks[0])]
+        )
 
-        self.refinement = nn.Sequential(*[Block(n_embd=dim) for _ in range(num_refinement_blocks)])
+        self.refinement = nn.Sequential(
+            *[Block(n_embd=dim) for _ in range(num_refinement_blocks)]
+        )
 
         # ---- 最终上采样: 120 -> 480 (4倍) ----
         self.up_final = nn.Sequential(
-            nn.Conv2d(dim, dim*4, 3, padding=1, bias=False),
-            nn.PixelShuffle(2),                 # dim -> dim, 分辨率*2
-            nn.Conv2d(dim, dim*4, 3, padding=1, bias=False),
-            nn.PixelShuffle(2)                  # dim -> dim, 分辨率*2  最终 120*4=480
+            nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
+            nn.PixelShuffle(2),  # dim -> dim, 分辨率*2
+            nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
+            nn.PixelShuffle(2),  # dim -> dim, 分辨率*2  最终 120*4=480
         )
         # 高分辨率引导融合 (与原始HR残差)
-        self.hr_refine = nn.Sequential(
-            nn.Conv2d(out_channels*2, out_channels, 3, padding=1),
-            nn.Sigmoid()
-        )
+        self.hr_refine = nn.Conv2d(out_channels*2, out_channels, 3, padding=1)  # 无激活
         self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=True)
 
     def forward(self, lr1, hr1, lr2, label=None):
@@ -399,34 +410,48 @@ class Restore_RWKV_Ref(nn.Module):
         B = lr1.shape[0]
 
         # 1. LR 上采样到 120×120
-        fea = self.lr_up(lr1)               # (B,dim,120,120)
+        fea = self.lr_up(lr1)  # (B,dim,120,120)
 
         # 2. 提取参考金字塔 (120,60,30,15)
-        ref_120 = self.ref_extractor[0](hr1)   # (B,dim,120,120)
-        ref_60  = self.ref_extractor[1](hr1)   # (B,dim*2,60,60)
-        ref_30  = self.ref_extractor[2](hr1)   # (B,dim*4,30,30)
-        ref_15  = self.ref_extractor[3](hr1)   # (B,dim*8,15,15)
+        ref_120 = self.ref_to_120(hr1)  # (B,dim,120,120)
+        ref_60 = self.ref_down_60(ref_120)  # (B,2*dim,60,60)
+        ref_30 = self.ref_down_30(ref_60)  # (B,4*dim,30,30)
+        ref_15 = self.ref_down_15(ref_30)  # (B,8*dim,15,15)
 
         # 3. 编码器 + 参考注入
         # 编码器
-        e1 = self.encoder_level1(self.fuse1(torch.cat([fea, ref_120], dim=1)))   # (B,dim,120,120)
-        e2 = self.encoder_level2(self.fuse2(torch.cat([self.down1_2(e1), ref_60], dim=1)))   # (B,2*dim,60,60)
-        e3 = self.encoder_level3(self.fuse3(torch.cat([self.down2_3(e2), ref_30], dim=1)))   # (B,4*dim,30,30)
-        l = self.latent(self.fuse4(torch.cat([self.down3_4(e3), ref_15], dim=1)))            # (B,8*dim,15,15)
+        e1 = self.encoder_level1(
+            self.fuse1(torch.cat([fea, ref_120], dim=1))
+        )  # (B,dim,120,120)
+        e2 = self.encoder_level2(
+            self.fuse2(torch.cat([self.down1_2(e1), ref_60], dim=1))
+        )  # (B,2*dim,60,60)
+        e3 = self.encoder_level3(
+            self.fuse3(torch.cat([self.down2_3(e2), ref_30], dim=1))
+        )  # (B,4*dim,30,30)
+        l = self.latent(
+            self.fuse4(torch.cat([self.down3_4(e3), ref_15], dim=1))
+        )  # (B,8*dim,15,15)
 
         # 解码器
-        d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(l), e3], dim=1)))   # (B,4*dim,30,30)
-        d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)))   # (B,2*dim,60,60)
-        d1 = self.decoder_level1(self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)))   # (B,dim,120,120)
+        d3 = self.decoder_level3(
+            self.reduce_chan_level3(torch.cat([self.up4_3(l), e3], dim=1))
+        )  # (B,4*dim,30,30)
+        d2 = self.decoder_level2(
+            self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
+        )  # (B,2*dim,60,60)
+        d1 = self.decoder_level1(
+            self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
+        )  # (B,dim,120,120)
         d1 = self.refinement(d1)
 
         # 5. 最终上采样到 480×480
-        hr_feat = self.up_final(d1)              # (B,dim,480,480)
-        out = self.output_conv(hr_feat)          # (B,3,480,480)
+        hr_feat = self.up_final(d1)  # (B,dim,480,480)
+        out = self.output_conv(hr_feat)  # (B,3,480,480)
 
         # 6. 高分辨率参考引导 (直接使用原始HR)
-        refine_input = torch.cat([out, hr1], dim=1)   # (B,6,480,480)
-        residual = self.hr_refine(refine_input)       # (B,3,480,480)
+        refine_input = torch.cat([out, hr1], dim=1)  # (B,6,480,480)
+        residual = self.hr_refine(refine_input)  # (B,3,480,480)
         out = out + residual
 
         if label is None:
