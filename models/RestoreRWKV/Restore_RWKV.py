@@ -3,16 +3,30 @@ import math, os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F 
+from torch.nn import functional as F
 from einops import rearrange
 from torch.utils.cpp_extension import load
-wkv_cuda = load(name="bi_wkv", sources=["./cuda/bi_wkv.cpp", "./cuda/bi_wkv_kernel.cu"],
-                        verbose=True, extra_cuda_cflags=['-res-usage', '--maxrregcount 60', '--use_fast_math', '-O3', '-Xptxas -O3', '-gencode arch=compute_120,code=sm_120'])
+
+wkv_cuda = load(
+    name="bi_wkv",
+    sources=["./cuda/bi_wkv.cpp", "./cuda/bi_wkv_kernel.cu"],
+    verbose=True,
+    extra_cuda_cflags=[
+        "-res-usage",
+        "--maxrregcount 60",
+        "--use_fast_math",
+        "-O3",
+        "-Xptxas -O3",
+        "-gencode arch=compute_120,code=sm_120",
+    ],
+)
+
+
 class WKV(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, u, k, v):
-        half_mode = (w.dtype == torch.half)
-        bf_mode = (w.dtype == torch.bfloat16)
+        half_mode = w.dtype == torch.half
+        bf_mode = w.dtype == torch.bfloat16
         ctx.save_for_backward(w, u, k, v)
         w = w.float().contiguous()
         u = u.float().contiguous()
@@ -28,13 +42,15 @@ class WKV(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gy):
         w, u, k, v = ctx.saved_tensors
-        half_mode = (w.dtype == torch.half)
-        bf_mode = (w.dtype == torch.bfloat16)
-        gw, gu, gk, gv = wkv_cuda.bi_wkv_backward(w.float().contiguous(),
-                          u.float().contiguous(),
-                          k.float().contiguous(),
-                          v.float().contiguous(),
-                          gy.float().contiguous())
+        half_mode = w.dtype == torch.half
+        bf_mode = w.dtype == torch.bfloat16
+        gw, gu, gk, gv = wkv_cuda.bi_wkv_backward(
+            w.float().contiguous(),
+            u.float().contiguous(),
+            k.float().contiguous(),
+            v.float().contiguous(),
+            gy.float().contiguous(),
+        )
         if half_mode:
             return (gw.half(), gu.half(), gk.half(), gv.half())
         elif bf_mode:
@@ -47,64 +63,91 @@ def RUN_CUDA(w, u, k, v):
     return WKV.apply(w.cuda(), u.cuda(), k.cuda(), v.cuda())
 
 
-
-
 class OmniShift(nn.Module):
     def __init__(self, dim):
         super(OmniShift, self).__init__()
         # Define the layers for training
-        self.conv1x1 = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=1, groups=dim, bias=False)
-        self.conv3x3 = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=3, padding=1, groups=dim, bias=False)
-        self.conv5x5 = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=5, padding=2, groups=dim, bias=False) 
-        self.alpha = nn.Parameter(torch.randn(4), requires_grad=True) 
-        
+        self.conv1x1 = nn.Conv2d(
+            in_channels=dim, out_channels=dim, kernel_size=1, groups=dim, bias=False
+        )
+        self.conv3x3 = nn.Conv2d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=3,
+            padding=1,
+            groups=dim,
+            bias=False,
+        )
+        self.conv5x5 = nn.Conv2d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=5,
+            padding=2,
+            groups=dim,
+            bias=False,
+        )
+        self.alpha = nn.Parameter(torch.randn(4), requires_grad=True)
 
         # Define the layers for testing
-        self.conv5x5_reparam = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=5, padding=2, groups=dim, bias = False) 
+        self.conv5x5_reparam = nn.Conv2d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=5,
+            padding=2,
+            groups=dim,
+            bias=False,
+        )
         self.repram_flag = True
 
     def forward_train(self, x):
         out1x1 = self.conv1x1(x)
         out3x3 = self.conv3x3(x)
-        out5x5 = self.conv5x5(x) 
-        # import pdb 
-        # pdb.set_trace() 
-        
-        
-        out = self.alpha[0]*x + self.alpha[1]*out1x1 + self.alpha[2]*out3x3 + self.alpha[3]*out5x5
+        out5x5 = self.conv5x5(x)
+        # import pdb
+        # pdb.set_trace()
+
+        out = (
+            self.alpha[0] * x
+            + self.alpha[1] * out1x1
+            + self.alpha[2] * out3x3
+            + self.alpha[3] * out5x5
+        )
         return out
 
     def reparam_5x5(self):
-        # Combine the parameters of conv1x1, conv3x3, and conv5x5 to form a single 5x5 depth-wise convolution 
-        
-        padded_weight_1x1 = F.pad(self.conv1x1.weight, (2, 2, 2, 2)) 
-        padded_weight_3x3 = F.pad(self.conv3x3.weight, (1, 1, 1, 1)) 
-        
-        identity_weight = F.pad(torch.ones_like(self.conv1x1.weight), (2, 2, 2, 2)) 
-        
-        combined_weight = self.alpha[0]*identity_weight + self.alpha[1]*padded_weight_1x1 + self.alpha[2]*padded_weight_3x3 + self.alpha[3]*self.conv5x5.weight 
-        
-        device = self.conv5x5_reparam.weight.device 
+        # Combine the parameters of conv1x1, conv3x3, and conv5x5 to form a single 5x5 depth-wise convolution
+
+        padded_weight_1x1 = F.pad(self.conv1x1.weight, (2, 2, 2, 2))
+        padded_weight_3x3 = F.pad(self.conv3x3.weight, (1, 1, 1, 1))
+
+        identity_weight = F.pad(torch.ones_like(self.conv1x1.weight), (2, 2, 2, 2))
+
+        combined_weight = (
+            self.alpha[0] * identity_weight
+            + self.alpha[1] * padded_weight_1x1
+            + self.alpha[2] * padded_weight_3x3
+            + self.alpha[3] * self.conv5x5.weight
+        )
+
+        device = self.conv5x5_reparam.weight.device
 
         combined_weight = combined_weight.to(device)
 
         self.conv5x5_reparam.weight = nn.Parameter(combined_weight)
 
+    def forward(self, x):
 
-    def forward(self, x): 
-        
-        if self.training: 
+        if self.training:
             self.repram_flag = True
-            out = self.forward_train(x) 
+            out = self.forward_train(x)
         elif self.training == False and self.repram_flag == True:
-            self.reparam_5x5() 
-            self.repram_flag = False 
+            self.reparam_5x5()
+            self.repram_flag = False
             out = self.conv5x5_reparam(x)
         elif self.training == False and self.repram_flag == False:
             out = self.conv5x5_reparam(x)
-        
-        return out 
 
+        return out
 
 
 class VRWKV_SpatialMix(nn.Module):
@@ -113,34 +156,32 @@ class VRWKV_SpatialMix(nn.Module):
         self.n_embd = n_embd
         self.device = None
         attn_sz = n_embd
-        
-        self.recurrence = 2 
-        
-        self.omni_shift = OmniShift(dim=n_embd)
 
+        self.recurrence = 2
+
+        self.omni_shift = OmniShift(dim=n_embd)
 
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
         self.value = nn.Linear(n_embd, attn_sz, bias=False)
         self.receptance = nn.Linear(n_embd, attn_sz, bias=False)
-        self.output = nn.Linear(attn_sz, n_embd, bias=False) 
-
+        self.output = nn.Linear(attn_sz, n_embd, bias=False)
 
         with torch.no_grad():
-            self.spatial_decay = nn.Parameter(torch.randn((self.recurrence, self.n_embd))) 
-            self.spatial_first = nn.Parameter(torch.randn((self.recurrence, self.n_embd))) 
-
-
+            self.spatial_decay = nn.Parameter(
+                torch.randn((self.recurrence, self.n_embd))
+            )
+            self.spatial_first = nn.Parameter(
+                torch.randn((self.recurrence, self.n_embd))
+            )
 
     def jit_func(self, x, resolution):
         # Mix x with the previous timestep to produce xk, xv, xr
 
-        
         h, w = resolution
 
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         x = self.omni_shift(x)
-        x = rearrange(x, 'b c h w -> b (h w) c')    
-
+        x = rearrange(x, "b c h w -> b (h w) c")
 
         k = self.key(x)
         v = self.value(x)
@@ -149,27 +190,22 @@ class VRWKV_SpatialMix(nn.Module):
 
         return sr, k, v
 
-
-        
-        
-
     def forward(self, x, resolution):
         B, T, C = x.size()
         self.device = x.device
 
-        sr, k, v = self.jit_func(x, resolution) 
-        
-        for j in range(self.recurrence): 
-            if j%2==0:
-                v = RUN_CUDA(self.spatial_decay[j] / T, self.spatial_first[j] / T, k, v) 
+        sr, k, v = self.jit_func(x, resolution)
+
+        for j in range(self.recurrence):
+            if j % 2 == 0:
+                v = RUN_CUDA(self.spatial_decay[j] / T, self.spatial_first[j] / T, k, v)
             else:
-                h, w = resolution 
-                k = rearrange(k, 'b (h w) c -> b (w h) c', h=h, w=w) 
-                v = rearrange(v, 'b (h w) c -> b (w h) c', h=h, w=w) 
-                v = RUN_CUDA(self.spatial_decay[j] / T, self.spatial_first[j] / T, k, v) 
-                k = rearrange(k, 'b (w h) c -> b (h w) c', h=h, w=w) 
-                v = rearrange(v, 'b (w h) c -> b (h w) c', h=h, w=w) 
-                
+                h, w = resolution
+                k = rearrange(k, "b (h w) c -> b (w h) c", h=h, w=w)
+                v = rearrange(v, "b (h w) c -> b (w h) c", h=h, w=w)
+                v = RUN_CUDA(self.spatial_decay[j] / T, self.spatial_first[j] / T, k, v)
+                k = rearrange(k, "b (w h) c -> b (h w) c", h=h, w=w)
+                v = rearrange(v, "b (w h) c -> b (h w) c", h=h, w=w)
 
         x = v
         x = sr * x
@@ -177,231 +213,234 @@ class VRWKV_SpatialMix(nn.Module):
         return x
 
 
-
 class VRWKV_ChannelMix(nn.Module):
     def __init__(self, n_embd, hidden_rate=4):
         super().__init__()
         self.n_embd = n_embd
         hidden_sz = int(hidden_rate * n_embd)
-        self.key = nn.Linear(n_embd, hidden_sz, bias=False) 
-        
+        self.key = nn.Linear(n_embd, hidden_sz, bias=False)
+
         self.omni_shift = OmniShift(dim=n_embd)
         self.receptance = nn.Linear(n_embd, n_embd, bias=False)
         self.value = nn.Linear(hidden_sz, n_embd, bias=False)
-
-
 
     def forward(self, x, resolution):
 
         h, w = resolution
 
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         x = self.omni_shift(x)
-        x = rearrange(x, 'b c h w -> b (h w) c')    
-
+        x = rearrange(x, "b c h w -> b (h w) c")
 
         k = self.key(x)
         k = torch.square(torch.relu(k))
         kv = self.value(k)
-        x = torch.sigmoid(self.receptance(x)) * kv 
+        x = torch.sigmoid(self.receptance(x)) * kv
 
         return x
-
 
 
 class Block(nn.Module):
     def __init__(self, n_embd, hidden_rate=4):
         super().__init__()
 
-         
-
-        
         self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd) 
-
+        self.ln2 = nn.LayerNorm(n_embd)
 
         self.att = VRWKV_SpatialMix(n_embd)
 
         self.ffn = VRWKV_ChannelMix(n_embd, hidden_rate)
 
-
-
         self.gamma1 = nn.Parameter(torch.ones((n_embd)), requires_grad=True)
         self.gamma2 = nn.Parameter(torch.ones((n_embd)), requires_grad=True)
 
-
-    def forward(self, x): 
+    def forward(self, x):
         b, c, h, w = x.shape
-        
+
         resolution = (h, w)
 
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        x = x + self.gamma1 * self.att(self.ln1(x), resolution) 
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
-    
-        x = rearrange(x, 'b c h w -> b (h w) c')    
-        x = x + self.gamma2 * self.ffn(self.ln2(x), resolution) 
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+        x = rearrange(x, "b c h w -> b (h w) c")
+        x = x + self.gamma1 * self.att(self.ln1(x), resolution)
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
+
+        x = rearrange(x, "b c h w -> b (h w) c")
+        x = x + self.gamma2 * self.ffn(self.ln2(x), resolution)
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
 
         return x
-
 
 
 ##########################################################################
 ## Resizing modules
 class Downsample(nn.Module):
-    def __init__(self, n_feat):
+    def __init__(self, n_feat, channel_scale=2):
         super(Downsample, self).__init__()
-
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat//2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelUnshuffle(2))
+        mid_channels = n_feat * channel_scale // 4
+        assert mid_channels > 0, "channel_scale must be such that n_feat * channel_scale is divisible by 4"
+        self.body = nn.Sequential(
+            nn.Conv2d(n_feat, mid_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelUnshuffle(2),
+        )
 
     def forward(self, x):
         return self.body(x)
+
 
 class Upsample(nn.Module):
-    def __init__(self, n_feat):
+    def __init__(self, n_feat, channel_scale=0.5):
         super(Upsample, self).__init__()
-
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat*2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelShuffle(2))
+        mid_channels = int(n_feat * channel_scale * 4)
+        self.body = nn.Sequential(
+            nn.Conv2d(n_feat, mid_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelShuffle(2),
+        )
 
     def forward(self, x):
         return self.body(x)
+
 
 class Restore_RWKV_Ref(nn.Module):
     def __init__(self,
         inp_channels=3,
         out_channels=3,
-        dim = 48,
-        num_blocks = [4,6,6,8],
-        num_refinement_blocks = 8,
-        loss_fun = nn.L1Loss(),
-        scale = 10
+        dim=48,
+        num_blocks=[4,6,6,8],
+        num_refinement_blocks=8,
+        loss_fun=nn.L1Loss(),
+        scale=10
     ):
         super().__init__()
         self.scale = scale
         self.loss_fun = loss_fun
 
-        # ---------- 1. 输入融合：拼接 lr1 与 lr2 ----------
-        # 原 patch_embed 改为接受 2*inp_channels 通道
-        self.lr_fuse = nn.Conv2d(inp_channels * 2, dim, 3, padding=1, bias=True)
+        # ---- LR 上采样到 120×120 ----
+        # 原 LR 为 48×48，目标 120×120，倍率 120/48 = 2.5
+        self.lr_up = nn.Sequential(
+            nn.Upsample(scale_factor=2.5, mode='bilinear', align_corners=False),
+            nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False)
+        )
 
-        # ---------- 2. 参考图像多尺度提取 ----------
-        self.ref_extractor = RefExtractor(out_channels, dim)
+        # ---- 参考图像多尺度提取 (输出 120,60,30,15) ----
+        self.ref_extractor = nn.ModuleList([
+            nn.Sequential(                           # 120×120
+                nn.Conv2d(out_channels, dim, 3, padding=1),
+                nn.ReLU(inplace=True)
+            ),
+            nn.Sequential(                           # 60×60
+                nn.Conv2d(out_channels, dim*2, 3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim*2, dim*2, 3, padding=1),
+                nn.ReLU(inplace=True)
+            ),
+            nn.Sequential(                           # 30×30
+                nn.Conv2d(out_channels, dim*4, 3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim*4, dim*4, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim*4, dim*4, 3, stride=2, padding=1),
+                nn.ReLU(inplace=True)
+            ),
+            nn.Sequential(                           # 15×15
+                nn.Conv2d(out_channels, dim*8, 3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim*8, dim*8, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim*8, dim*8, 3, stride=2, padding=1),
+                nn.ReLU(inplace=True)
+            )
+        ])
 
-        # ---------- 3. 各层级 1×1 融合卷积 ----------
-        self.fuse1 = nn.Conv2d(dim * 2,      dim,      1, bias=False)
-        self.fuse2 = nn.Conv2d(dim * 4,      dim * 2,  1, bias=False)
-        self.fuse3 = nn.Conv2d(dim * 8,      dim * 4,  1, bias=False)
-        self.fuse4 = nn.Conv2d(dim * 16,     dim * 8,  1, bias=False)
+        # ---- 各层级融合卷积 (1×1) ----
+        self.fuse1 = nn.Conv2d(dim*2, dim, 1)      # fea(120) + ref(120)
+        self.fuse2 = nn.Conv2d(dim*4, dim*2, 1)    # e1下采样(60) + ref(60)
+        self.fuse3 = nn.Conv2d(dim*8, dim*4, 1)    # e2下采样(30) + ref(30)
+        self.fuse4 = nn.Conv2d(dim*16, dim*8, 1)   # e3下采样(15) + ref(15)
 
-        # ---------- 4. U‑Net 编码器（尺寸与通道与原模型一致） ----------
+        # ---- 编码器 (分辨率从120开始, 下采样3次) ----
         self.encoder_level1 = nn.Sequential(*[Block(n_embd=dim) for _ in range(num_blocks[0])])
-        self.down1_2 = Downsample(dim)
-        self.encoder_level2 = nn.Sequential(*[Block(n_embd=int(dim*2)) for _ in range(num_blocks[1])])
-        self.down2_3 = Downsample(int(dim*2))
-        self.encoder_level3 = nn.Sequential(*[Block(n_embd=int(dim*4)) for _ in range(num_blocks[2])])
-        self.down3_4 = Downsample(int(dim*4))
-        self.latent     = nn.Sequential(*[Block(n_embd=int(dim*8)) for _ in range(num_blocks[3])])
+        self.down1_2 = Downsample(dim)                     # 120 → 60, 通道: dim → 2*dim
+        self.encoder_level2 = nn.Sequential(*[Block(n_embd=dim*2) for _ in range(num_blocks[1])])
+        self.down2_3 = Downsample(dim*2)                   # 60 → 30, 通道: 2*dim → 4*dim
+        self.encoder_level3 = nn.Sequential(*[Block(n_embd=dim*4) for _ in range(num_blocks[2])])
+        self.down3_4 = Downsample(dim*4)                   # 30 → 15, 通道: 4*dim → 8*dim
+        self.latent = nn.Sequential(*[Block(n_embd=dim*8) for _ in range(num_blocks[3])])
 
-        # ---------- 5. U‑Net 解码器 ----------
-        self.up4_3 = Upsample(int(dim*8))
-        self.reduce_chan_level3 = nn.Conv2d(int(dim*8), int(dim*4), 1, bias=True)
-        self.decoder_level3 = nn.Sequential(*[Block(n_embd=int(dim*4)) for _ in range(num_blocks[2])])
-        self.up3_2 = Upsample(int(dim*4))
-        self.reduce_chan_level2 = nn.Conv2d(int(dim*4), int(dim*2), 1, bias=True)
-        self.decoder_level2 = nn.Sequential(*[Block(n_embd=int(dim*2)) for _ in range(num_blocks[1])])
-        self.up2_1 = Upsample(int(dim*2))
-        self.decoder_level1 = nn.Sequential(*[Block(n_embd=int(dim*2)) for _ in range(num_blocks[0])])
-        self.refinement      = nn.Sequential(*[Block(n_embd=int(dim*2)) for _ in range(num_refinement_blocks)])
+        # ---- 解码器 (上采样3次，并融合跳跃连接) ----
+        self.up4_3 = Upsample(dim*8)                       # 15 → 30, 通道: 8*dim → 4*dim
+        self.reduce_chan_level3 = nn.Conv2d(4*dim + 4*dim, 4*dim, 1)   # 拼接 up(4*dim) + e3(4*dim) → 8*dim → 4*dim
+        self.decoder_level3 = nn.Sequential(*[Block(n_embd=dim*4) for _ in range(num_blocks[2])])
 
-        # ---------- 6. 自适应上采样与输出 ----------
-        if scale & (scale - 1) == 0:   # 2的幂，如 2,4,8
-            up_hr_layers = []
-            for _ in range(int(math.log2(scale))):
-                up_hr_layers += [
-                    nn.Conv2d(int(dim*2), int(dim*2)*4, 3, padding=1, bias=False),
-                    nn.PixelShuffle(2)
-                ]
-            self.up_hr = nn.Sequential(*up_hr_layers)
-            self.output = nn.Sequential(
-                nn.Conv2d(int(dim*2), out_channels, 3, padding=1, bias=True),
-                nn.Sigmoid()
-            )
-        else:                            # 非2的幂，如10
-            self.up_hr = nn.Sequential(
-                nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False),
-                nn.Conv2d(int(dim*2), out_channels, 3, padding=1, bias=True),
-                nn.Sigmoid()
-            )
-            self.output = nn.Identity()   # 上采样已输出最终图像
+        self.up3_2 = Upsample(dim*4)                       # 30 → 60, 通道: 4*dim → 2*dim
+        self.reduce_chan_level2 = nn.Conv2d(2*dim + 2*dim, 2*dim, 1)   # 拼接 up(2*dim) + e2(2*dim) → 4*dim → 2*dim
+        self.decoder_level2 = nn.Sequential(*[Block(n_embd=dim*2) for _ in range(num_blocks[1])])
+
+        self.up2_1 = Upsample(dim*2)                       # 60 → 120, 通道: 2*dim → dim
+        self.reduce_chan_level1 = nn.Conv2d(dim + dim, dim, 1)         # 拼接 up(dim) + e1(dim) → 2*dim → dim
+        self.decoder_level1 = nn.Sequential(*[Block(n_embd=dim) for _ in range(num_blocks[0])])
+
+        self.refinement = nn.Sequential(*[Block(n_embd=dim) for _ in range(num_refinement_blocks)])
+
+        # ---- 最终上采样: 120 -> 480 (4倍) ----
+        self.up_final = nn.Sequential(
+            nn.Conv2d(dim, dim*4, 3, padding=1, bias=False),
+            nn.PixelShuffle(2),                 # dim -> dim, 分辨率*2
+            nn.Conv2d(dim, dim*4, 3, padding=1, bias=False),
+            nn.PixelShuffle(2)                  # dim -> dim, 分辨率*2  最终 120*4=480
+        )
+        # 高分辨率引导融合 (与原始HR残差)
+        self.hr_refine = nn.Sequential(
+            nn.Conv2d(out_channels*2, out_channels, 3, padding=1),
+            nn.Sigmoid()
+        )
+        self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=True)
 
     def forward(self, lr1, hr1, lr2, label=None):
-        # a) 拼接低分输入
-        lr_cat = torch.cat([lr1, lr2], dim=1)
-        fea = self.lr_fuse(lr_cat)
+        # lr1, lr2: (B,3,48,48) , hr1: (B,3,480,480)
+        B = lr1.shape[0]
 
-        # b) 多尺度参考特征
-        f32, f16, f8, f4 = self.ref_extractor(hr1)
-        
-        # ---------- 动态对齐参考特征到编码器各级尺寸 ----------
-        H, W = fea.shape[2], fea.shape[3]
-        f32 = F.interpolate(f32, size=(H, W), mode='bilinear', align_corners=False)
-        f16 = F.interpolate(f16, size=(H//2, W//2), mode='bilinear', align_corners=False)
-        f8  = F.interpolate(f8,  size=(H//4, W//4), mode='bilinear', align_corners=False)
-        f4  = F.interpolate(f4,  size=(H//8, W//8), mode='bilinear', align_corners=False)
+        # 1. LR 上采样到 120×120
+        fea = self.lr_up(lr1)               # (B,dim,120,120)
 
-        # c) 编码器：逐级融合参考特征
-        e1 = self.encoder_level1(self.fuse1(torch.cat([fea, f32], dim=1)))
-        e2 = self.encoder_level2(self.fuse2(torch.cat([self.down1_2(e1), f16], dim=1)))
-        e3 = self.encoder_level3(self.fuse3(torch.cat([self.down2_3(e2), f8], dim=1)))
-        l  = self.latent(self.fuse4(torch.cat([self.down3_4(e3), f4], dim=1)))
+        # 2. 提取参考金字塔 (120,60,30,15)
+        ref_120 = self.ref_extractor[0](hr1)   # (B,dim,120,120)
+        ref_60  = self.ref_extractor[1](hr1)   # (B,dim*2,60,60)
+        ref_30  = self.ref_extractor[2](hr1)   # (B,dim*4,30,30)
+        ref_15  = self.ref_extractor[3](hr1)   # (B,dim*8,15,15)
 
-        # d) 解码器（跳跃连接使用已融合的 e1, e2, e3）
-        d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(l), e3], 1)))
-        d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], 1)))
-        d1 = self.decoder_level1(torch.cat([self.up2_1(d2), e1], 1))
+        # 3. 编码器 + 参考注入
+        # 编码器
+        e1 = self.encoder_level1(self.fuse1(torch.cat([fea, ref_120], dim=1)))   # (B,dim,120,120)
+        e2 = self.encoder_level2(self.fuse2(torch.cat([self.down1_2(e1), ref_60], dim=1)))   # (B,2*dim,60,60)
+        e3 = self.encoder_level3(self.fuse3(torch.cat([self.down2_3(e2), ref_30], dim=1)))   # (B,4*dim,30,30)
+        l = self.latent(self.fuse4(torch.cat([self.down3_4(e3), ref_15], dim=1)))            # (B,8*dim,15,15)
 
-        # e) 精炼与输出
+        # 解码器
+        d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(l), e3], dim=1)))   # (B,4*dim,30,30)
+        d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)))   # (B,2*dim,60,60)
+        d1 = self.decoder_level1(self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)))   # (B,dim,120,120)
         d1 = self.refinement(d1)
-        hr_feat = self.up_hr(d1)
-        out_hr = self.output(hr_feat)
+
+        # 5. 最终上采样到 480×480
+        hr_feat = self.up_final(d1)              # (B,dim,480,480)
+        out = self.output_conv(hr_feat)          # (B,3,480,480)
+
+        # 6. 高分辨率参考引导 (直接使用原始HR)
+        refine_input = torch.cat([out, hr1], dim=1)   # (B,6,480,480)
+        residual = self.hr_refine(refine_input)       # (B,3,480,480)
+        out = out + residual
 
         if label is None:
-            return out_hr
+            return out
         else:
-            return self.loss_fun(out_hr, label)
-
-
-class RefExtractor(nn.Module):
-    def __init__(self, in_ch, dim):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, dim, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, 3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, 3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, 3, stride=2, padding=1),
-        )
-        self.to_f16 = nn.Conv2d(dim, dim*2, 3, stride=2, padding=1)
-        self.to_f8  = nn.Conv2d(dim*2, dim*4, 3, stride=2, padding=1)
-        self.to_f4  = nn.Conv2d(dim*4, dim*8, 3, stride=2, padding=1)
-
-    def forward(self, hr):
-        f32 = self.stem(hr)
-        f16 = F.relu(self.to_f16(f32))
-        f8  = F.relu(self.to_f8(f16))
-        f4  = F.relu(self.to_f4(f8))
-        return f32, f16, f8, f4
+            return self.loss_fun(out, label)
 
 
 # ---------- 测试（使用你的真实数据尺寸）----------
 if __name__ == "__main__":
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    model = Restore_RWKV_Ref(inp_channels=3, out_channels=3, dim=48, scale=10).to(device)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = Restore_RWKV_Ref(inp_channels=3, out_channels=3, dim=48, scale=10).to(
+        device
+    )
 
     # 模拟你的真实输入：LR 48×48, HR 参考 480×480
     lr1 = torch.randn((2, 3, 48, 48)).to(device)
@@ -410,7 +449,7 @@ if __name__ == "__main__":
 
     # 推理模式
     out = model(lr1, hr1, lr2)
-    print(f"输出形状: {out.shape}")   # 应为 [2, 3, 480, 480]
+    print(f"输出形状: {out.shape}")  # 应为 [2, 3, 480, 480]
 
     # 训练模式（需要 label）
     hr2 = torch.randn((2, 3, 480, 480)).to(device)
