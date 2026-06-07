@@ -488,7 +488,6 @@ if __name__ == "__main__":
 
 
 import pytorch_lightning as pl
-from torch.optim.lr_scheduler import ReduceLROnPlateau, LinearLR, SequentialLR
 
 
 class LitRestoreRWKV_Ref(pl.LightningModule):
@@ -505,7 +504,7 @@ class LitRestoreRWKV_Ref(pl.LightningModule):
         loss_fn=nn.L1Loss(),
     ):
         super().__init__()
-        self.save_hyperparameters()  # 自动保存所有超参数
+        self.save_hyperparameters(ignore=["loss_fn"])
 
         # 实例化原始模型
         self.model = Restore_RWKV_Ref(
@@ -547,39 +546,30 @@ class LitRestoreRWKV_Ref(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        # 正常使用 ReduceLROnPlateau，它会在每个 epoch 结束时根据 val_loss 调整学习率
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5, verbose=True
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
-        # Warmup + ReduceLROnPlateau 组合
-        if self.hparams.warmup_steps > 0:
-            # Linear warmup from 0 to lr
-            warmup_scheduler = LinearLR(
-                optimizer,
-                start_factor=0.0,
-                end_factor=1.0,
-                total_iters=self.hparams.warmup_steps,
-            )
-            # Plateau scheduler after warmup
-            plateau_scheduler = ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=5
-            )
-            # Sequential: warmup first, then plateau
-            scheduler = SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, plateau_scheduler],
-                milestones=[self.hparams.warmup_steps],
-            )
-            return [optimizer], [
-                {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                    "monitor": "val_loss",
-                    "frequency": 1,
-                }
-            ]
-        else:
-            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
-            return [optimizer], [
-                {"scheduler": scheduler, "interval": "epoch", "monitor": "val_loss"}
-            ]
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        # 在每次 optimizer step 之前，如果还在 warmup 阶段，手动调整学习率
+        if self._step_count < self.warmup_steps:
+            # 线性 warmup: 从 0 线性增长到 hparams.learning_rate
+            lr_scale = min(1.0, (self._step_count + 1) / self.warmup_steps)
+            for pg in optimizer.param_groups:
+                pg['lr'] = self.hparams.learning_rate * lr_scale
+        # 调用父类方法执行实际的 optimizer step
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        self._step_count += 1
 
     # ---------- 数据加载：需要在训练脚本中传入 DataLoader ----------
     def train_dataloader(self):
