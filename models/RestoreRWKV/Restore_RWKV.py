@@ -402,7 +402,9 @@ class Restore_RWKV_Ref(nn.Module):
             nn.PixelShuffle(2),  # dim -> dim, 分辨率*2  最终 120*4=480
         )
         # 高分辨率引导融合 (与原始HR残差)
-        self.hr_refine = nn.Conv2d(out_channels*2, out_channels, 3, padding=1)  # 无激活
+        self.hr_refine = nn.Conv2d(
+            out_channels * 2, out_channels, 3, padding=1
+        )  # 无激活
         self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=True)
 
     def forward(self, lr1, hr1, lr2, label=None):
@@ -483,3 +485,113 @@ if __name__ == "__main__":
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"可训练参数: {total_params/1e6:.2f} M")
+
+
+import pytorch_lightning as pl
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LinearLR, SequentialLR
+
+
+class LitRestoreRWKV_Ref(pl.LightningModule):
+    def __init__(
+        self,
+        inp_channels=3,
+        out_channels=3,
+        dim=48,
+        num_blocks=[4, 6, 6, 8],
+        num_refinement_blocks=8,
+        scale=10,
+        learning_rate=1e-4,
+        warmup_steps=100,
+        loss_fn=nn.L1Loss(),
+    ):
+        super().__init__()
+        self.save_hyperparameters()  # 自动保存所有超参数
+
+        # 实例化原始模型
+        self.model = Restore_RWKV_Ref(
+            inp_channels=inp_channels,
+            out_channels=out_channels,
+            dim=dim,
+            num_blocks=num_blocks,
+            num_refinement_blocks=num_refinement_blocks,
+            scale=scale,
+            loss_fun=loss_fn,
+        )
+
+        self.criterion = loss_fn
+
+    def forward(self, lr1, hr1, lr2, label=None):
+        # 直接调用原始模型的 forward
+        return self.model(lr1, hr1, lr2, label)
+
+    def training_step(self, batch, batch_idx):
+        lr1, hr1, lr2, hr2 = batch
+        output = self(lr1, hr1, lr2)  # 输出 (B,3,H,W)
+        loss = self.criterion(output, hr2)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        lr1, hr1, lr2, hr2 = batch
+        output = self(lr1, hr1, lr2)
+        loss = self.criterion(output, hr2)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        lr1, hr1, lr2, hr2 = batch
+        output = self(lr1, hr1, lr2)
+        loss = self.criterion(output, hr2)
+        self.log("test_loss", loss, on_step=False, on_epoch=True)
+        return output, hr2  # 用于后续评估
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+
+        # Warmup + ReduceLROnPlateau 组合
+        if self.hparams.warmup_steps > 0:
+            # Linear warmup from 0 to lr
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.0,
+                end_factor=1.0,
+                total_iters=self.hparams.warmup_steps,
+            )
+            # Plateau scheduler after warmup
+            plateau_scheduler = ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=5
+            )
+            # Sequential: warmup first, then plateau
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, plateau_scheduler],
+                milestones=[self.hparams.warmup_steps],
+            )
+            return [optimizer], [
+                {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "monitor": "val_loss",
+                    "frequency": 1,
+                }
+            ]
+        else:
+            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+            return [optimizer], [
+                {"scheduler": scheduler, "interval": "epoch", "monitor": "val_loss"}
+            ]
+
+    # ---------- 数据加载：需要在训练脚本中传入 DataLoader ----------
+    def train_dataloader(self):
+        return self._train_loader
+
+    def val_dataloader(self):
+        return self._val_loader
+
+    def test_dataloader(self):
+        return self._test_loader
+
+    def set_dataloaders(self, train_loader, val_loader, test_loader):
+        self._train_loader = train_loader
+        self._val_loader = val_loader
+        self._test_loader = test_loader
