@@ -2,9 +2,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from RWKV.data.dataset_ref import RefPairedEnviMemmapDataset
 import os
-import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
