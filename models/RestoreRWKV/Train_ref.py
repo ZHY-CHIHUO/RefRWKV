@@ -19,12 +19,12 @@ from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset  # 你的数据集类
 
 # ----------------- 配置 -----------------
 data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
-batch_size = 8
+batch_size = 16
 accumulate_grad_batches = 4  # 梯度累积步数，原 accumulation_steps
 num_epochs = 200
 num_workers = 2
 scale = 10
-patch_size = 480
+patch_size = 160
 
 max_samples = (10000, None, None)  # train 限制2000？实际写了10000
 

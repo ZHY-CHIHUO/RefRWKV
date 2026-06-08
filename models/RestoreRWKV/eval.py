@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
 
 from Restore_RWKV import Restore_RWKV_Ref
 from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset
-from evaluation.eval_pyiqa import IQAEngine   # 修正导入路径
+from RWKV.evaluation.eval_pyiqa import IQAEngine   # 修正导入路径
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Restore_RWKV_Ref on test set")
