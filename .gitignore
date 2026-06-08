@@ -15,7 +15,7 @@ best_restore_rwkv_ref.pth
 # 数据集
 data/*
 RefSR_data/*
-test_results/*
+test_results/
 # 如果你 data/ 里有少量配置文件想提交，可以放开特定文件：
 !data/*.py
 !RefSR_data/*.py
