@@ -26,7 +26,7 @@ num_workers = 2
 scale = 10
 patch_size = 160
 
-max_samples = (10000, None, None)  # train 限制2000？实际写了10000
+max_samples = (10000, None, None)
 
 
 # ----------------- 数据集构建 -----------------
@@ -118,7 +118,7 @@ checkpoint_callback = ModelCheckpoint(
 )
 early_stop_callback = EarlyStopping(monitor="val_loss", patience=10, mode="min")
 lr_monitor = LearningRateMonitor(logging_interval="step")
-logger = TensorBoardLogger("lightning_logs", name="ref_sr_experiment")
+logger = TensorBoardLogger("logs", name="ref_sr_experiment")
 
 # ----------------- Trainer -----------------
 trainer = pl.Trainer(

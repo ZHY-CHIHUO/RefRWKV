@@ -58,6 +58,43 @@ def load_npy_as_tensor(path: str, shape_hint: str = 'hwc') -> torch.Tensor:
         raise ValueError("shape_hint must be 'hwc' or 'chw'")
     return torch.from_numpy(arr).unsqueeze(0).float()
 
+def generate_patch_dataset(img_dir, output_dir):
+    """
+    将 img_dir 中每张图像切出 n_patches 个随机块，保存到 output_dir。
+    """
+    patch_size=128
+    n_patches=20
+    seed=42
+    import random
+    random.seed(seed)
+    img_dir = Path(img_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    img_files = sorted(list(img_dir.glob("*.[jpJP][pnPN]*[gG]")) +
+                       list(img_dir.glob("*.npy")))
+
+    count = 0
+    for img_path in tqdm(img_files, desc=f"Generating patches from {img_dir.name}"):
+        # 读取图像（兼容你已有的 imread）
+        img_np = imread(str(img_path))  # 返回 HWC, [0,1]
+        H, W = img_np.shape[:2]
+
+        # 若图像尺寸小于 patch_size，跳过或缩放（这里跳过）
+        if H < patch_size or W < patch_size:
+            continue
+
+        for _ in range(n_patches):
+            y = random.randint(0, H - patch_size)
+            x = random.randint(0, W - patch_size)
+            patch = img_np[y:y+patch_size, x:x+patch_size, :]
+            # 保存为 PNG
+            patch_img = Image.fromarray((patch * 255).astype(np.uint8))
+            patch_img.save(output_dir / f"{count:07d}.png")
+            count += 1
+
+    print(f"Generated {count} patches in {output_dir}")
+
 # --------------------- 评估引擎 ---------------------
 class IQAEngine:
     def __init__(self, device='cuda', nr_metrics=None, fr_metrics=None, 
@@ -198,6 +235,15 @@ class IQAEngine:
             if self.fid_metric is None:
                 self.fid_metric = pyiqa.create_metric('fid')
             avg_results['fid'] = float(self.fid_metric(str(pred_dir), str(gt_dir)))
+
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp_pred, tempfile.TemporaryDirectory() as tmp_gt:
+                print("Extracting patches for pFID...")
+                generate_patch_dataset(pred_dir, tmp_pred)
+                generate_patch_dataset(gt_dir, tmp_gt)
+
+                pfid_value = float(self.fid_metric(tmp_pred, tmp_gt))
+                avg_results['pfid'] = pfid_value
 
         # 打印与保存
         self._print_and_save(avg_results, out_path, count)
