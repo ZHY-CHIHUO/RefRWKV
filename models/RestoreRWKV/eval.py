@@ -95,19 +95,20 @@ def main():
                 pred_i = pred[i:i+1]
                 gt_i = hr_gt[i:i+1]
 
+                pred_np = pred_i.squeeze(0).cpu().numpy().transpose(1,2,0)
+                gt_np   = gt_i.squeeze(0).cpu().numpy().transpose(1,2,0)
                 # 单张评估，得到指标字典
-                res = engine.evaluate_single(pred_i, gt_i)
+                res = engine.evaluate_single(pred_np, gt_np)
                 for k, v in res.items():
                     total_results[k] += v
                 total_samples += 1
 
                 # 保存图像
                 if args.save_images:
-                    img_np = pred_i.squeeze(0).cpu().numpy().transpose(1,2,0)
-                    img_np = (img_np * 255).clip(0,255).astype(np.uint8)
+                    img_uint8 = (pred_np * 255).clip(0,255).astype(np.uint8)
                     save_path = os.path.join(args.output_dir, f"pred_{batch_idx}_{i}.png")
                     from PIL import Image
-                    Image.fromarray(img_np).save(save_path)
+                    Image.fromarray(img_uint8).save(save_path)
 
     # 平均并输出
     avg_results = {k: v / total_samples for k, v in total_results.items()}
