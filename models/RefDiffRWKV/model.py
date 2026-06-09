@@ -663,17 +663,14 @@ class FinalLayer(nn.Module):
 
 ##########################################################################
 ## lr上采样
-def lr_upsample_bilinear(lr: torch.Tensor, target_size: tuple = (480, 480)):
-    """
-    lr: (B, 3, 48, 48)
-    返回: (B, 3, 480, 480)
-    """
-    return F.interpolate(lr, size=target_size, mode="bilinear", align_corners=False)
+def lr_upsample_bilinear(lr: torch.Tensor, scale: int = 10):
+    _, _, h, w = lr.shape
+    return F.interpolate(
+        lr, size=(h * scale, w * scale), mode="bilinear", align_corners=False
+    )
 
 
 class LRUpsamplerCNN(nn.Module):
-    """轻量 CNN 上采样器：将 48×48 放大到 480×480（10倍）"""
-
     def __init__(self, in_ch=3, out_ch=3, scale_factor=10, hidden_ch=64):
         super().__init__()
         self.scale_factor = scale_factor
@@ -687,16 +684,10 @@ class LRUpsamplerCNN(nn.Module):
         )
 
     def forward(self, x):
-        """
-        x: (B, 3, 48, 48)
-        返回: (B, 3, 480, 480)
-        """
         return self.body(x)
 
 
 class LRUpsamplerPixelShuffle(nn.Module):
-    """用 PixelShuffle 分步上采样 10 倍（2× + 5×）"""
-
     def __init__(self, in_ch=3, out_ch=3, hidden_ch=64):
         super().__init__()
         # 阶段1: 2x 上采样
@@ -714,10 +705,6 @@ class LRUpsamplerPixelShuffle(nn.Module):
         )
 
     def forward(self, x):
-        """
-        x: (B, 3, 48, 48)
-        返回: (B, 3, 480, 480)
-        """
         x = self.stage1(x)  # → (B, 64, 96, 96)
         x = self.stage2(x)  # → (B, 3, 480, 480)
         return x
@@ -752,21 +739,21 @@ class RefDiffRWKV(nn.Module):
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.channels = channels
-        self.patch_resolution = (
-            img_size // patch_size,
-            img_size // patch_size,
-        )  # 默认值
 
         # ---------- LR 上采样器 ----------
-        if upsample_mode == 'bilinear':
-            self.lr_upsampler = lambda x: F.interpolate(
-                x, size=(img_size, img_size), mode='bilinear', align_corners=False
+        if upsample_mode == "bilinear":
+            self.lr_upsampler = lr_upsample_bilinear
+        elif upsample_mode == "cnn":
+            self.lr_upsampler = LRUpsamplerCNN(
+                in_ch=channels,
+                out_ch=channels,
+                scale_factor=10,
+                hidden_ch=64,
             )
-        elif upsample_mode == 'cnn':
-            self.lr_upsampler = LRUpsamplerCNN(in_ch=channels, out_ch=channels,
-                                               scale_factor=img_size // 48, hidden_ch=64)
-        elif upsample_mode == 'pixelshuffle':
-            self.lr_upsampler = LRUpsamplerPixelShuffle(in_ch=channels, out_ch=channels, hidden_ch=64)
+        elif upsample_mode == "pixelshuffle":
+            self.lr_upsampler = LRUpsamplerPixelShuffle(
+                in_ch=channels, out_ch=channels, hidden_ch=64
+            )
         else:
             raise ValueError(f"Unsupported upsample_mode: {upsample_mode}")
 
@@ -921,7 +908,7 @@ class RefDiffRWKV(nn.Module):
         patch_w = W // self.patch_size
 
         # 1. LR 上采样到当前分辨率
-        LR_up = self.lr_upsampler(LR, (H, W))
+        LR_up = self.lr_upsampler(LR)
 
         # 2. Patch Embedding
         main_input = torch.cat([x_t, LR_up], dim=1)
@@ -1061,8 +1048,8 @@ class RefDiffRWKV_PL(pl.LightningModule):
         weight_decay: float = 1e-2,
         beta1: float = 0.9,
         beta2: float = 0.999,
-        warmup_steps: int = 10000,
-        total_steps: int = 500000,
+        warmup_epochs: int = 5,
+        total_epochs: int = 100,
         scheduler: str = "cosine",  # "cosine" 或 "linear"
         num_timesteps: int = 1000,
         **kwargs,
@@ -1073,8 +1060,8 @@ class RefDiffRWKV_PL(pl.LightningModule):
         self.model = model
         self.lr = lr
         self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
         self.scheduler_type = scheduler
         self.num_timesteps = num_timesteps
 
@@ -1090,7 +1077,7 @@ class RefDiffRWKV_PL(pl.LightningModule):
         return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
 
     def _compute_loss(self, batch, stage: str = "train"):
-        hr, lr, ref = batch  # ← 这里接收 Dataset 返回的 (HR, LR, Ref)
+        lr, hr, ref = batch  # ← 这里接收 Dataset 返回的 (HR, LR, Ref)
         B = hr.shape[0]
 
         t = torch.randint(0, self.num_timesteps, (B,), device=self.device)
@@ -1151,36 +1138,38 @@ class RefDiffRWKV_PL(pl.LightningModule):
             eps=1e-8,
         )
 
+        # 根据实际训练 epoch 总数计算调度周期
+        total_epochs = self.trainer.max_epochs if self.trainer else 200
+        warmup_epochs = self.warmup_epochs
+
         if self.scheduler_type == "cosine":
-            scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max=self.total_steps - self.warmup_steps,
-                eta_min=self.lr * 0.01,
-            )
-        else:  # linear warmup + cosine decay
-
-            def lr_lambda(current_step: int):
-                if current_step < self.warmup_steps:
-                    return float(current_step) / float(max(1, self.warmup_steps))
-                progress = float(current_step - self.warmup_steps) / float(
-                    max(1, self.total_steps - self.warmup_steps)
-                )
+            # 先用 LambdaLR 实现线性预热，再用余弦退火
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    return float(epoch + 1) / float(max(1, warmup_epochs))
+                progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
                 return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
+            scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        else:
+            # 线性预热 + 线性衰减（或其它策略）
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    return float(epoch + 1) / float(max(1, warmup_epochs))
+                progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+                return max(0.0, 1.0 - progress)   # 线性衰减到 0（可按需调整）
             scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
+                "interval": "epoch",
                 "frequency": 1,
             },
         }
-
     def on_train_start(self):
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"✅ RefDiffRWKV_PL Training Started!")
         print(f"   Total Parameters: {total_params / 1e6:.2f}M")
         print(f"   Learning Rate: {self.lr}")
-        print(f"   Warmup Steps: {self.warmup_steps}")
+        print(f"   Warmup Epochs: {self.warmup_epochs}")

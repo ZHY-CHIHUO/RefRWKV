@@ -43,7 +43,7 @@ def main():
     # ====================== 训练超参 ======================
     train_config = {
         "lr": 4e-4,
-        "warmup_steps": 100,
+        "warmup_epochs": 5,
         "max_epochs": 200,
         "accumulate_grad_batches": 4,
         "precision": "bf16",
@@ -101,7 +101,7 @@ def main():
     pl_model = RefDiffRWKV_PL(
         model=base_model,
         lr=train_config["lr"],
-        warmup_steps=train_config["warmup_steps"],
+        warmup_epochs=train_config["warmup_epochs"],
         max_epochs=train_config["max_epochs"],
         scheduler="cosine",
     )
@@ -127,7 +127,7 @@ def main():
         precision=train_config["precision"],
         max_epochs=train_config["max_epochs"],
         log_every_n_steps=20,
-        val_check_interval=2000,
+        check_val_every_n_epoch=1,
         gradient_clip_val=1.0,
         accumulate_grad_batches=train_config["accumulate_grad_batches"],
         callbacks=callbacks,
