@@ -12,7 +12,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # ==================== 导入模型和数据集 ====================
-from model import RefDiffRWKV,RefDiffRWKV_PL
+from model import RefDiffRWKV, RefDiffRWKV_PL
 from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset
 
 
@@ -20,7 +20,7 @@ def main():
     # ====================== 模型参数 ======================
     model_config = {
         "img_size": 256,
-        "patch_size": 4,              # ← 模型 PatchEmbed 使用（推荐 4 或 8）
+        "patch_size": 4,              # 模型 PatchEmbed 使用（推荐 4 或 8）
         "embed_dim": 64,
         "enc_blocks": [4, 6, 6],
         "dec_blocks": [6, 6, 4],
@@ -33,7 +33,7 @@ def main():
     # ====================== 数据集参数 ======================
     data_config = {
         "data_root": r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2",
-        "crop_size": 480,
+        "crop_size": 160,
         "scale": 10,
         "max_samples": (1000, None, None),   # train, val, test
         "batch_size": 4,
@@ -88,7 +88,7 @@ def main():
     # ====================== 模型 ======================
     base_model = RefDiffRWKV(
         img_size=model_config["img_size"],
-        patch_size=model_config["patch_size"],   # 模型的 patch_size
+        patch_size=model_config["patch_size"],
         embed_dim=model_config["embed_dim"],
         channels=model_config["channels"],
         enc_blocks=model_config["enc_blocks"],
@@ -102,7 +102,6 @@ def main():
         model=base_model,
         lr=train_config["lr"],
         warmup_epochs=train_config["warmup_epochs"],
-        max_epochs=train_config["max_epochs"],
         scheduler="cosine",
     )
 
@@ -118,7 +117,8 @@ def main():
             mode="min",
             save_last=True,
         ),
-        LearningRateMonitor(logging_interval="step"),
+        # 学习率按 epoch 变化，记录 epoch 级别即可
+        LearningRateMonitor(logging_interval="epoch"),
     ]
 
     trainer = pl.Trainer(

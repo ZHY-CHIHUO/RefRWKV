@@ -1037,21 +1037,18 @@ from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 
 
 class RefDiffRWKV_PL(pl.LightningModule):
-    """
-    PyTorch Lightning 包装器，用于 RefDiffRWKV 的训练、验证和推理
-    """
 
     def __init__(
         self,
-        model: "RefDiffRWKV",  # 传入已实例化的 RefDiffRWKV
+        model,  # RefDiffRWKV 实例
         lr: float = 4e-4,
         weight_decay: float = 1e-2,
         beta1: float = 0.9,
         beta2: float = 0.999,
         warmup_epochs: int = 5,
-        total_epochs: int = 100,
         scheduler: str = "cosine",  # "cosine" 或 "linear"
         num_timesteps: int = 1000,
+        eta_min: float = None,  # 最小学习率因子，默认 lr * 0.01
         **kwargs,
     ):
         super().__init__()
@@ -1061,9 +1058,9 @@ class RefDiffRWKV_PL(pl.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
         self.scheduler_type = scheduler
         self.num_timesteps = num_timesteps
+        self.eta_min = eta_min if eta_min is not None else lr * 0.01
 
     def forward(self, x_t, timesteps, LR, Ref):
         return self.model(x_t, timesteps, LR, Ref)
@@ -1072,30 +1069,35 @@ class RefDiffRWKV_PL(pl.LightningModule):
         """余弦噪声调度"""
         s = 0.008
         T = self.num_timesteps
-        alpha_bar = torch.cos(((t / T + s) / (1 + s)) * math.pi / 2) ** 2
+        alpha_bar = torch.cos(((t.float() / T + s) / (1 + s)) * math.pi / 2) ** 2
         alpha_bar = alpha_bar.view(-1, 1, 1, 1)
         return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
 
     def _compute_loss(self, batch, stage: str = "train"):
-        lr, hr, ref = batch  # ← 这里接收 Dataset 返回的 (HR, LR, Ref)
+        lr, hr, ref = batch  # (LR, HR, Ref) 顺序
         B = hr.shape[0]
 
         t = torch.randint(0, self.num_timesteps, (B,), device=self.device)
         noise = torch.randn_like(hr)
 
-        x_t = self._add_noise(hr, noise, t)  # 对 HR 加噪
-        pred_noise = self.model(x_t, t, lr, ref)  # 模型预测噪声
+        x_t = self._add_noise(hr, noise, t)
+        pred_noise = self.model(x_t, t, lr, ref)
 
         loss = F.mse_loss(pred_noise, noise)
 
-        self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True)
+        self.log(
+            f"{stage}/loss",
+            loss,
+            prog_bar=True,
+            sync_dist=True,
+            on_step=True,
+            on_epoch=True,
+        )
         return loss
 
-    # ====================== Training / Validation ======================
     def training_step(self, batch, batch_idx):
         loss = self._compute_loss(batch, "train")
 
-        # 记录学习率
         if self.trainer.optimizers:
             current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
             self.log("lr", current_lr, prog_bar=True, on_step=True, on_epoch=False)
@@ -1110,7 +1112,6 @@ class RefDiffRWKV_PL(pl.LightningModule):
         loss = self._compute_loss(batch, "test")
         return loss
 
-    # ====================== Epoch End Logging ======================
     def on_train_epoch_end(self):
         if self.trainer.global_rank == 0:
             train_loss = self.trainer.callback_metrics.get("train/loss_epoch", 0.0)
@@ -1128,7 +1129,6 @@ class RefDiffRWKV_PL(pl.LightningModule):
                 f"Epoch {self.current_epoch:04d} | Val Loss: {val_loss:.6f} | LR: {current_lr:.2e}"
             )
 
-    # ====================== Optimizer ======================
     def configure_optimizers(self):
         optimizer = AdamW(
             self.model.parameters(),
@@ -1138,26 +1138,30 @@ class RefDiffRWKV_PL(pl.LightningModule):
             eps=1e-8,
         )
 
-        # 根据实际训练 epoch 总数计算调度周期
+        # 从 Trainer 获取总 epoch 数，若不可用则回退到默认值
         total_epochs = self.trainer.max_epochs if self.trainer else 200
         warmup_epochs = self.warmup_epochs
+        eta_min = self.eta_min
+        scheduler_type = self.scheduler_type
+        init_lr = self.lr
 
-        if self.scheduler_type == "cosine":
-            # 先用 LambdaLR 实现线性预热，再用余弦退火
-            def lr_lambda(epoch):
-                if epoch < warmup_epochs:
-                    return float(epoch + 1) / float(max(1, warmup_epochs))
-                progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
-                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-            scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-        else:
-            # 线性预热 + 线性衰减（或其它策略）
-            def lr_lambda(epoch):
-                if epoch < warmup_epochs:
-                    return float(epoch + 1) / float(max(1, warmup_epochs))
-                progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
-                return max(0.0, 1.0 - progress)   # 线性衰减到 0（可按需调整）
-            scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return float(epoch + 1) / float(max(1, warmup_epochs))
+            progress = float(epoch - warmup_epochs) / float(
+                max(1, total_epochs - warmup_epochs)
+            )
+            if scheduler_type == "cosine":
+                # 余弦退火，终点为 eta_min/init_lr
+                lr_ratio = eta_min / init_lr + (1.0 - eta_min / init_lr) * (
+                    0.5 * (1.0 + math.cos(math.pi * progress))
+                )
+            else:
+                # 线性衰减
+                lr_ratio = 1.0 - (1.0 - eta_min / init_lr) * progress
+            return max(0.0, lr_ratio)
+
+        scheduler = LambdaLR(optimizer, lr_lambda)
 
         return {
             "optimizer": optimizer,
@@ -1167,9 +1171,13 @@ class RefDiffRWKV_PL(pl.LightningModule):
                 "frequency": 1,
             },
         }
+
     def on_train_start(self):
         total_params = sum(p.numel() for p in self.model.parameters())
+        total_epochs = self.trainer.max_epochs if self.trainer else "?"
         print(f"✅ RefDiffRWKV_PL Training Started!")
         print(f"   Total Parameters: {total_params / 1e6:.2f}M")
         print(f"   Learning Rate: {self.lr}")
         print(f"   Warmup Epochs: {self.warmup_epochs}")
+        print(f"   Total Epochs: {total_epochs}")
+        print(f"   Scheduler Type: {self.scheduler_type}")
