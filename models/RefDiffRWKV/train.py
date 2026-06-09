@@ -19,12 +19,12 @@ from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset
 def main():
     # ====================== 模型参数 ======================
     model_config = {
-        "img_size": 480,
-        "patch_size": 8,              # ← 模型 PatchEmbed 使用（推荐 4 或 8）
-        "embed_dim": 192,
-        "enc_blocks": [4, 4, 4],
-        "dec_blocks": [4, 4, 4],
-        "latent_blocks": 6,
+        "img_size": 256,
+        "patch_size": 4,              # ← 模型 PatchEmbed 使用（推荐 4 或 8）
+        "embed_dim": 64,
+        "enc_blocks": [4, 6, 6],
+        "dec_blocks": [6, 6, 4],
+        "latent_blocks": 8,
         "drop_path_rate": 0.1,
         "upsample_mode": "cnn",
         "channels": 3,
@@ -35,16 +35,16 @@ def main():
         "data_root": r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2",
         "crop_size": 480,
         "scale": 10,
-        "max_samples": (2000, 200, None),   # train, val, test
+        "max_samples": (1000, None, None),   # train, val, test
         "batch_size": 4,
-        "num_workers": 8,
+        "num_workers": 2,
     }
 
     # ====================== 训练超参 ======================
     train_config = {
         "lr": 4e-4,
-        "warmup_steps": 10000,
-        "total_steps": 400000,
+        "warmup_steps": 100,
+        "max_epochs": 200,
         "accumulate_grad_batches": 4,
         "precision": "bf16",
     }
@@ -102,7 +102,7 @@ def main():
         model=base_model,
         lr=train_config["lr"],
         warmup_steps=train_config["warmup_steps"],
-        total_steps=train_config["total_steps"],
+        max_epochs=train_config["max_epochs"],
         scheduler="cosine",
     )
 
@@ -117,7 +117,6 @@ def main():
             save_top_k=3,
             mode="min",
             save_last=True,
-            every_n_train_steps=2000,
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
@@ -126,7 +125,7 @@ def main():
         accelerator="gpu",
         devices=1,
         precision=train_config["precision"],
-        max_steps=train_config["total_steps"],
+        max_epochs=train_config["max_epochs"],
         log_every_n_steps=20,
         val_check_interval=2000,
         gradient_clip_val=1.0,

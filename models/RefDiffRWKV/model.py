@@ -744,7 +744,7 @@ class RefDiffRWKV(nn.Module):
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
         learn_sigma: bool = False,
-        upsample_mode: str = "bicubic",  # 'bilinear', 'bicubic'
+        upsample_mode: str = "bicubic",
         **kwargs,
     ):
         super().__init__()
@@ -757,10 +757,18 @@ class RefDiffRWKV(nn.Module):
             img_size // patch_size,
         )  # 默认值
 
-        # LR 上采样器改为动态
-        self.lr_upsampler = lambda x, target_size: F.interpolate(
-            x, size=target_size, mode=upsample_mode, align_corners=False
-        )
+        # ---------- LR 上采样器 ----------
+        if upsample_mode == 'bilinear':
+            self.lr_upsampler = lambda x: F.interpolate(
+                x, size=(img_size, img_size), mode='bilinear', align_corners=False
+            )
+        elif upsample_mode == 'cnn':
+            self.lr_upsampler = LRUpsamplerCNN(in_ch=channels, out_ch=channels,
+                                               scale_factor=img_size // 48, hidden_ch=64)
+        elif upsample_mode == 'pixelshuffle':
+            self.lr_upsampler = LRUpsamplerPixelShuffle(in_ch=channels, out_ch=channels, hidden_ch=64)
+        else:
+            raise ValueError(f"Unsupported upsample_mode: {upsample_mode}")
 
         # Patch Embed（双支路）
         self.patch_embed_main = PatchEmbed(
