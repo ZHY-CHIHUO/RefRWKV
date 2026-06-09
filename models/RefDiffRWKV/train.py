@@ -35,14 +35,14 @@ def main():
         "data_root": r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2",
         "crop_size": 160,
         "scale": 10,
-        "max_samples": (1000, None, None),   # train, val, test
-        "batch_size": 4,
+        "max_samples": (10000, None, None),   # train, val, test
+        "batch_size": 50,
         "num_workers": 2,
     }
 
     # ====================== 训练超参 ======================
     train_config = {
-        "lr": 4e-4,
+        "lr": 5e-4,
         "warmup_epochs": 5,
         "max_epochs": 200,
         "accumulate_grad_batches": 4,
@@ -62,7 +62,7 @@ def main():
     val_ds = RefPNGDataset(
         data_dir=data_config["data_root"],
         mode="val",
-        patch_size=None,                       # 验证使用全图
+        patch_size=160,                       # 验证使用全图
         augment=False,
         max_samples=data_config["max_samples"],
         sample_seed=42,
@@ -111,8 +111,8 @@ def main():
     callbacks = [
         ModelCheckpoint(
             dirpath="checkpoints",
-            filename="refdiff-{epoch:04d}-{valloss:.5f}",
-            monitor="val/loss",
+            filename="refdiff-{epoch:04d}-{val-loss:.5f}",
+            monitor="val-loss",
             save_top_k=3,
             mode="min",
             save_last=True,

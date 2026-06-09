@@ -1086,7 +1086,7 @@ class RefDiffRWKV_PL(pl.LightningModule):
         loss = F.mse_loss(pred_noise, noise)
 
         self.log(
-            f"{stage}/loss",
+            f"{stage}-loss",
             loss,
             prog_bar=True,
             sync_dist=True,
@@ -1114,12 +1114,12 @@ class RefDiffRWKV_PL(pl.LightningModule):
 
     def on_train_epoch_end(self):
         if self.trainer.global_rank == 0:
-            train_loss = self.trainer.callback_metrics.get("train/loss_epoch", 0.0)
+            train_loss = self.trainer.callback_metrics.get("train-loss_epoch", 0.0)
             print(f"Epoch {self.current_epoch:04d} | Train Loss: {train_loss:.6f}")
 
     def on_validation_epoch_end(self):
         if self.trainer.global_rank == 0:
-            val_loss = self.trainer.callback_metrics.get("val/loss", 0.0)
+            val_loss = self.trainer.callback_metrics.get("val-loss", 0.0)
             current_lr = (
                 self.trainer.optimizers[0].param_groups[0]["lr"]
                 if self.trainer.optimizers
