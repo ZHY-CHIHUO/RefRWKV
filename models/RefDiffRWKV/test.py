@@ -89,7 +89,7 @@ def test_x0_recovery(model, test_loader, device, num_timesteps=1000):
 
 def main():
     # 配置
-    model_ckpt = "checkpoints/refdiff-epoch=0009-valloss=0.00000.ckpt"
+    model_ckpt = "checkpoints/last.ckpt"
     data_root = "/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 1

@@ -1074,37 +1074,47 @@ class RefDiffRWKV_PL(pl.LightningModule):
         return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
 
     def _compute_loss(self, batch, stage: str = "train"):
-        """
-        训练/验证/测试的单步 loss 计算
-        - 训练时对低 t 加权
-        - stage: "train" / "val" / "test"
-        """
         lr, hr, ref = batch
         B = hr.shape[0]
 
-        # 均匀采样 t
+        # ===== 仅训练时：以 10% 概率将 Ref 替换为 HR，并标记这些样本 =====
+        if stage == "train":
+            p_replace = 0.1
+            # 为每个样本生成独立掩码 (B,)，True 表示替换
+            mask_replace = torch.rand(B, device=self.device) < p_replace
+            # 将对应 ref 替换为 hr
+            ref = torch.where(mask_replace.view(-1, 1, 1, 1), hr, ref)
+        else:
+            mask_replace = torch.zeros(B, dtype=torch.bool, device=self.device)
+
+        # 均匀采样时间步
         t = torch.randint(0, self.num_timesteps, (B,), device=self.device)
 
-        # 添加噪声
+        # 加噪
         noise = torch.randn_like(hr)
         x_t = self._add_noise(hr, noise, t)
 
-        # 模型预测噪声
+        # 预测噪声
         pred_noise = self.model(x_t, t, lr, ref)
 
-        # 计算 MSE loss，并对低 t 加权
-        loss_map = (pred_noise - noise) ** 2  # shape: (B,C,H,W)
+        # 逐样本平方误差，形状 (B,)
+        loss_per_sample = ((pred_noise - noise) ** 2).mean(dim=[1, 2, 3])
 
-        # 构造权重向量
-        weight = torch.ones_like(t).float()
-        weight[t < 100] = 5.0  # 前100步加5倍权重
-        weight[(t >= 100) & (t < 200)] = 2.0  # 100~199步加2倍权重
-        weight = weight.view(-1, 1, 1, 1)  # 扩展到 (B,1,1,1)
+        # ===== 构造权重 =====
+        weight = torch.ones_like(loss_per_sample)   # 基础权重 1
 
-        # 加权后取平均
-        loss = (loss_map * weight).mean()
+        if stage == "train":
+            # 低 t 加权
+            weight[t < 100] = weight[t < 100] * 5.0
+            weight[(t >= 100) & (t < 200)] = weight[(t >= 100) & (t < 200)] * 2.0
 
-        # 记录日志
+            # 替换样本额外乘以 2
+            weight[mask_replace] = weight[mask_replace] * 2.0
+
+        # 加权平均
+        loss = (loss_per_sample * weight).mean()
+
+        # 日志
         self.log(
             f"{stage}-loss",
             loss,
@@ -1113,7 +1123,6 @@ class RefDiffRWKV_PL(pl.LightningModule):
             on_step=True,
             on_epoch=True,
         )
-
         return loss
 
     def training_step(self, batch, batch_idx):
