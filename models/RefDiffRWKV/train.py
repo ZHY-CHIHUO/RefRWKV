@@ -111,7 +111,7 @@ def main():
     callbacks = [
         ModelCheckpoint(
             dirpath="checkpoints",
-            filename="refdiff-{epoch:04d}-{val/loss:.5f}",
+            filename="refdiff-{epoch:04d}-{valloss:.5f}",
             monitor="val/loss",
             save_top_k=3,
             mode="min",
