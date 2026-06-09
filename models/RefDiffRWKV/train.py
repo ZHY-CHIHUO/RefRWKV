@@ -2,13 +2,18 @@
 # train.py
 import sys
 from pathlib import Path
+
 # 添加项目根目录到 sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-import torch
+import torch, os
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    LearningRateMonitor,
+    EarlyStopping,
+)
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # ==================== 导入模型和数据集 ====================
@@ -20,7 +25,7 @@ def main():
     # ====================== 模型参数 ======================
     model_config = {
         "img_size": 256,
-        "patch_size": 4,              # 模型 PatchEmbed 使用（推荐 4 或 8）
+        "patch_size": 4,  # 模型 PatchEmbed 使用（推荐 4 或 8）
         "embed_dim": 64,
         "enc_blocks": [4, 6, 6],
         "dec_blocks": [6, 6, 4],
@@ -35,7 +40,7 @@ def main():
         "data_root": r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2",
         "crop_size": 160,
         "scale": 10,
-        "max_samples": (10000, None, None),   # train, val, test
+        "max_samples": (10000, None, None),  # train, val, test
         "batch_size": 50,
         "num_workers": 2,
     }
@@ -53,8 +58,9 @@ def main():
     train_ds = RefPNGDataset(
         data_dir=data_config["data_root"],
         mode="train",
-        patch_size=data_config["crop_size"],   # 数据集裁剪大小
+        patch_size=data_config["crop_size"],  # 数据集裁剪大小
         augment=True,
+        augment_ref=True,
         max_samples=data_config["max_samples"],
         sample_seed=42,
     )
@@ -62,7 +68,7 @@ def main():
     val_ds = RefPNGDataset(
         data_dir=data_config["data_root"],
         mode="val",
-        patch_size=160,                       # 验证使用全图
+        patch_size=160,  # 验证使用全图
         augment=False,
         max_samples=data_config["max_samples"],
         sample_seed=42,
@@ -109,6 +115,12 @@ def main():
     logger = TensorBoardLogger("logs", name="RefDiffRWKV")
 
     callbacks = [
+        EarlyStopping(
+            monitor="val-loss",
+            patience=15,
+            mode="min",
+            verbose=True,
+        ),
         ModelCheckpoint(
             dirpath="checkpoints",
             filename="refdiff-{epoch:04d}-{val-loss:.5f}",
@@ -141,10 +153,20 @@ def main():
     print(f"   Embed Dim        : {model_config['embed_dim']}")
     print(f"   Batch Size       : {data_config['batch_size']}")
 
+    # 自动查找 last.ckpt
+    ckpt_path = None
+    last_ckpt = os.path.join("checkpoints", "last.ckpt")
+    if os.path.exists(last_ckpt):
+        ckpt_path = last_ckpt
+        print(f"发现上次训练存档，将从 {last_ckpt} 恢复训练")
+    else:
+        print("未找到存档，开始全新训练")
+
     trainer.fit(
         pl_model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
+        ckpt_path=ckpt_path,
     )
 
 

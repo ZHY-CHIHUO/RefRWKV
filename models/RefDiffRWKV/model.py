@@ -1074,17 +1074,37 @@ class RefDiffRWKV_PL(pl.LightningModule):
         return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
 
     def _compute_loss(self, batch, stage: str = "train"):
-        lr, hr, ref = batch  # (LR, HR, Ref) 顺序
+        """
+        训练/验证/测试的单步 loss 计算
+        - 训练时对低 t 加权
+        - stage: "train" / "val" / "test"
+        """
+        lr, hr, ref = batch
         B = hr.shape[0]
 
+        # 均匀采样 t
         t = torch.randint(0, self.num_timesteps, (B,), device=self.device)
-        noise = torch.randn_like(hr)
 
+        # 添加噪声
+        noise = torch.randn_like(hr)
         x_t = self._add_noise(hr, noise, t)
+
+        # 模型预测噪声
         pred_noise = self.model(x_t, t, lr, ref)
 
-        loss = F.mse_loss(pred_noise, noise)
+        # 计算 MSE loss，并对低 t 加权
+        loss_map = (pred_noise - noise) ** 2  # shape: (B,C,H,W)
 
+        # 构造权重向量
+        weight = torch.ones_like(t).float()
+        weight[t < 100] = 5.0  # 前100步加5倍权重
+        weight[(t >= 100) & (t < 200)] = 2.0  # 100~199步加2倍权重
+        weight = weight.view(-1, 1, 1, 1)  # 扩展到 (B,1,1,1)
+
+        # 加权后取平均
+        loss = (loss_map * weight).mean()
+
+        # 记录日志
         self.log(
             f"{stage}-loss",
             loss,
@@ -1093,6 +1113,7 @@ class RefDiffRWKV_PL(pl.LightningModule):
             on_step=True,
             on_epoch=True,
         )
+
         return loss
 
     def training_step(self, batch, batch_idx):
