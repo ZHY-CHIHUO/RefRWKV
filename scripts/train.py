@@ -159,7 +159,6 @@ def main():
         model_sr=model_sr,
         model_diff=model_diff,
         model_enhance=model_enhance,
-        global_semantic=global_semantic,
         train_sr=train_cfg["train_sr"],
         train_diff=train_cfg["train_diff"],
         train_enhance=train_cfg["train_enhance"],

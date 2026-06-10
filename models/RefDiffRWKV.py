@@ -842,6 +842,8 @@ class RefDiffRWKV(nn.Module):
         # 4. 时间条件
         c = self.time_embed(timesteps)
 
+        # 初始化语义变量
+        sem_e1 = sem_e2 = sem_e3 = sem_lat = None
         if self.global_semantic is not None:
             sem_pyramid = self.global_semantic(Ref)
             sem_e1 = sem_pyramid["e1"]
