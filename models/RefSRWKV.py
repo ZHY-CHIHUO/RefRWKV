@@ -407,7 +407,7 @@ class RefSRWKV(nn.Module):
         )  # 无激活
         self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=True)
 
-    def forward(self, lr1, hr1, lr2, label=None):
+    def forward(self, lr1, hr1, label=None):
         # lr1, lr2: (B,3,48,48) , hr1: (B,3,480,480)
         B = lr1.shape[0]
 
@@ -476,7 +476,7 @@ if __name__ == "__main__":
     lr2 = torch.randn((2, 3, 48, 48)).to(device)
 
     # 推理模式
-    out = model(lr1, hr1, lr2)
+    out = model(lr1, hr1)
     print(f"输出形状: {out.shape}")  # 应为 [2, 3, 480, 480]
 
     # 训练模式（需要 label）
