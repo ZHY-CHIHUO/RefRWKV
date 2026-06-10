@@ -50,3 +50,9 @@ train:
   t_enhance_threshold: 250
   loss_sr_weight: 0.1
   loss_enhance_weight: 0.1
+
+# 输出配置
+output:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  result_dir: "results"
