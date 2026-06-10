@@ -123,6 +123,7 @@ def main():
         hidden_rate=model_cfg.get("hidden_rate", 4),
         learn_sigma=model_cfg.get("learn_sigma", False),
         upsample_mode=model_cfg.get("upsample_mode", "cnn"),
+        global_semantic=global_semantic,
     )
 
     # 5.2 RefSRWKV
@@ -157,6 +158,7 @@ def main():
         model_sr=model_sr,
         model_diff=model_diff,
         model_enhance=model_enhance,
+        global_semantic=global_semantic,
         train_sr=train_cfg["train_sr"],
         train_diff=train_cfg["train_diff"],
         train_enhance=train_cfg["train_enhance"],
