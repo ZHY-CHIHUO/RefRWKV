@@ -12,7 +12,7 @@ from PIL import Image
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
 
-from model import RefDiffRWKV, RefDiffRWKV_PL
+from RWKV.models.RefRWKV.RefDiffRWKV import RefDiffRWKV, RefDiffRWKV_PL
 from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset
 
 def add_noise(hr, t, num_timesteps=1000, s=0.008):

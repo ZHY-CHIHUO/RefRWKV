@@ -305,7 +305,7 @@ class Upsample(nn.Module):
         return self.body(x)
 
 
-class Restore_RWKV_Ref(nn.Module):
+class RefSRWKV(nn.Module):
     def __init__(
         self,
         inp_channels=3,
@@ -466,7 +466,7 @@ class Restore_RWKV_Ref(nn.Module):
 # ---------- 测试（使用你的真实数据尺寸）----------
 if __name__ == "__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = Restore_RWKV_Ref(inp_channels=3, out_channels=3, dim=48, scale=10).to(
+    model = RefSRWKV(inp_channels=3, out_channels=3, dim=48, scale=10).to(
         device
     )
 
@@ -488,102 +488,4 @@ if __name__ == "__main__":
     print(f"可训练参数: {total_params/1e6:.2f} M")
 
 
-import pytorch_lightning as pl
 
-
-class LitRestoreRWKV_Ref(pl.LightningModule):
-    def __init__(
-        self,
-        inp_channels=3,
-        out_channels=3,
-        dim=48,
-        num_blocks=[4, 6, 6, 8],
-        num_refinement_blocks=8,
-        scale=10,
-        learning_rate=1e-4,
-        warmup_steps=100,
-        loss_fn=nn.L1Loss(),
-    ):
-        super().__init__()
-        self.save_hyperparameters(ignore=["loss_fn"])
-
-        # 实例化原始模型
-        self.model = Restore_RWKV_Ref(
-            inp_channels=inp_channels,
-            out_channels=out_channels,
-            dim=dim,
-            num_blocks=num_blocks,
-            num_refinement_blocks=num_refinement_blocks,
-            scale=scale,
-            loss_fun=loss_fn,
-        )
-
-        self.criterion = loss_fn
-
-        self._step_count = 0 
-
-    def forward(self, lr1, hr1, lr2, label=None):
-        # 直接调用原始模型的 forward
-        return self.model(lr1, hr1, lr2, label)
-
-    def training_step(self, batch, batch_idx):
-        lr1, hr1, lr2, hr2 = batch
-        output = self(lr1, hr1, lr2)  # 输出 (B,3,H,W)
-        loss = self.criterion(output, hr2)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        lr1, hr1, lr2, hr2 = batch
-        output = self(lr1, hr1, lr2)
-        loss = self.criterion(output, hr2)
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        return loss
-
-    def test_step(self, batch, batch_idx):
-        lr1, hr1, lr2, hr2 = batch
-        output = self(lr1, hr1, lr2)
-        loss = self.criterion(output, hr2)
-        self.log("test_loss", loss, on_step=False, on_epoch=True)
-        return output, hr2  # 用于后续评估
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        # 正常使用 ReduceLROnPlateau，它会在每个 epoch 结束时根据 val_loss 调整学习率
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
-        # warmup：当步数小于 warmup_steps 时，线性增加学习率
-        if self._step_count < self.hparams.warmup_steps:
-            lr_scale = min(1.0, (self._step_count + 1) / self.hparams.warmup_steps)
-            for pg in optimizer.param_groups:
-                pg['lr'] = self.hparams.learning_rate * lr_scale
-        # 执行实际的优化步骤
-        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
-        self._step_count += 1
-
-    # ---------- 数据加载：需要在训练脚本中传入 DataLoader ----------
-    def train_dataloader(self):
-        return self._train_loader
-
-    def val_dataloader(self):
-        return self._val_loader
-
-    def test_dataloader(self):
-        return self._test_loader
-
-    def set_dataloaders(self, train_loader, val_loader, test_loader):
-        self._train_loader = train_loader
-        self._val_loader = val_loader
-        self._test_loader = test_loader

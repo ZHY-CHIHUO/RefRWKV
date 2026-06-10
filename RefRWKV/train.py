@@ -17,7 +17,7 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # ==================== 导入模型和数据集 ====================
-from model import RefDiffRWKV, RefDiffRWKV_PL
+from RWKV.models.RefRWKV.RefDiffRWKV import RefDiffRWKV, RefDiffRWKV_PL
 from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset
 
 
