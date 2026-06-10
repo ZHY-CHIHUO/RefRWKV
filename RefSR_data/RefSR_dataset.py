@@ -26,7 +26,8 @@ class RefPNGDataset(Dataset):
         scale: HR 到 LR 的缩放倍数（默认 10）
         augment: 是否空间增强（随机翻转、旋转，仅 train 生效）
         augment_ref: 是否对参考图像进行风格增强（仅 train 生效）
-        ref_brightness, ref_contrast, ref_saturation, ref_hue: 对应增强的扰动幅度
+        ref_aug_strengths: 对应增强的扰动幅度
+        ref_aug_probs: 对应增强的触发概率
         ref_gray_prob: 转为灰度的概率
         max_samples: 三元组 (train_num, val_num, test_num)，指定各模式最多样本数
         sample_seed: 随机选取样本的种子
@@ -40,10 +41,9 @@ class RefPNGDataset(Dataset):
         scale: int = 10,
         augment: bool = False,
         augment_ref: bool = False,
-        ref_brightness: float = 0.2,
-        ref_contrast: float = 0.2,
-        ref_saturation: float = 0.2,
-        ref_hue: float = 0.1,
+        # 两个列表：分别控制 [亮度, 对比度, 饱和度, 色调] 的强度和触发概率
+        ref_aug_strengths: list = [0.12, 0.12, 0.12, 0.03],
+        ref_aug_probs: list = [0.5, 0.5, 0.5, 0.5],
         ref_gray_prob: float = 0.2,
         max_samples: tuple = (None, None, None),
         sample_seed: int = 42,
@@ -57,10 +57,8 @@ class RefPNGDataset(Dataset):
         self.lr_patch_size = None if patch_size is None else patch_size // scale
 
         # 风格增强参数
-        self.ref_brightness = ref_brightness
-        self.ref_contrast = ref_contrast
-        self.ref_saturation = ref_saturation
-        self.ref_hue = ref_hue
+        self.ref_aug_strengths = ref_aug_strengths
+        self.ref_aug_probs = ref_aug_probs
         self.ref_gray_prob = ref_gray_prob
 
         # 子文件夹
@@ -117,26 +115,25 @@ class RefPNGDataset(Dataset):
         # 1. 随机灰度
         if random.random() < self.ref_gray_prob:
             ref_img = ref_img.convert("L").convert("RGB")
-
-        # 2. 亮度
-        brightness_factor = 1.0 + (random.random() * 2 - 1) * self.ref_brightness
-        ref_img = ImageEnhance.Brightness(ref_img).enhance(brightness_factor)
-
-        # 3. 对比度
-        contrast_factor = 1.0 + (random.random() * 2 - 1) * self.ref_contrast
-        ref_img = ImageEnhance.Contrast(ref_img).enhance(contrast_factor)
-
-        # 4. 饱和度
-        saturation_factor = 1.0 + (random.random() * 2 - 1) * self.ref_saturation
-        ref_img = ImageEnhance.Color(ref_img).enhance(saturation_factor)
-
-        # 5. 色调旋转（HSV 通道）
-        if self.ref_hue > 0:
-            hue_shift = random.uniform(
-                -self.ref_hue, self.ref_hue
-            )  # 范围为 [-hue, hue]
-            ref_img = self._hue_rotate(ref_img, hue_shift)
-
+        else:
+            # 亮度、对比度、饱和度、色调循环
+            # 索引 0:亮度, 1:对比度, 2:饱和度, 3:色调
+            for idx, (strength, prob) in enumerate(zip(self.ref_aug_strengths, self.ref_aug_probs)):
+                if random.random() > prob:
+                    continue
+                if idx == 0:  # 亮度
+                    factor = 1.0 + (random.random() * 2 - 1) * strength
+                    ref_img = ImageEnhance.Brightness(ref_img).enhance(factor)
+                elif idx == 1:  # 对比度
+                    factor = 1.0 + (random.random() * 2 - 1) * strength
+                    ref_img = ImageEnhance.Contrast(ref_img).enhance(factor)
+                elif idx == 2:  # 饱和度
+                    factor = 1.0 + (random.random() * 2 - 1) * strength
+                    ref_img = ImageEnhance.Color(ref_img).enhance(factor)
+                elif idx == 3:  # 色调
+                    if strength > 0:
+                        hue_shift = random.uniform(-strength, strength)
+                        ref_img = self._hue_rotate(ref_img, hue_shift)
         return ref_img
 
     @staticmethod
@@ -255,11 +252,6 @@ def main():
         patch_size=patch_size,
         augment=True,
         augment_ref=True,  # 开启 Ref 风格增强
-        ref_brightness=0.2,
-        ref_contrast=0.2,
-        ref_saturation=0.2,
-        ref_hue=0.1,
-        ref_gray_prob=0.2,
     )
     val_ds = RefPNGDataset(
         data_dir=data_root,

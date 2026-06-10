@@ -709,6 +709,30 @@ class LRUpsamplerPixelShuffle(nn.Module):
         x = self.stage2(x)  # → (B, 3, 480, 480)
         return x
 
+class RefMultiScaleProcessor(nn.Module):
+    """
+    将交互后的 Ref tokens 转换为多尺度 2D 特征图，
+    分别对应 U-Net 编码器输出的 e1, e2, e3 尺度。
+    """
+    def __init__(self, embed_dim, dims):
+        super().__init__()
+        d1, d2, d3 = dims
+        self.proj1 = nn.Conv2d(embed_dim, d1, 1)
+        self.down1 = Downsample(d1)           # 输出通道 d2 或自行适配
+        self.proj2 = nn.Conv2d(d2, d2, 1)     # 下采样后可能通道已是 d2，可选
+        self.down2 = Downsample(d2)
+        self.proj3 = nn.Conv2d(d3, d3, 1)
+
+    def forward(self, ref_tokens, H, W):
+        # ref_tokens: (B, N, C)
+        B, _, C = ref_tokens.shape
+        x = ref_tokens.transpose(1, 2).reshape(B, C, H, W)
+        f1 = self.proj1(x)                    # (B, d1, H, W)
+        f2 = self.down1(f1)                   # (B, d2, H/2, W/2)
+        f2 = self.proj2(f2)                   # 确保通道对齐
+        f3 = self.down2(f2)                   # (B, d3, H/4, W/4)
+        f3 = self.proj3(f3)
+        return f1, f2, f3
 
 ##########################################################################
 ## RefDiffRWKV
@@ -731,7 +755,7 @@ class RefDiffRWKV(nn.Module):
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
         learn_sigma: bool = False,
-        upsample_mode: str = "bicubic",
+        upsample_mode: str = "bilinear",  # 可选 "bilinear", "cnn", "pixelshuffle"
         **kwargs,
     ):
         super().__init__()
@@ -842,6 +866,12 @@ class RefDiffRWKV(nn.Module):
             ]
         )
 
+        # 输入：main 特征 + 对应尺度 Ref 特征（通道数均为 dim * mult）
+        # 输出：融合后通道数减半（还原为该尺度标准通道数）
+        self.fuse_e1 = nn.Conv2d(dim * 2, dim, 1)       # cat(e1, rf1) -> dim
+        self.fuse_e2 = nn.Conv2d(dim * 4, dim * 2, 1)   # cat(e2, rf2) -> dim*2
+        self.fuse_e3 = nn.Conv2d(dim * 8, dim * 4, 1)   # cat(e3, rf3) -> dim*4
+
         # 跳跃连接通道调整
         self.reduce_chan3 = nn.Conv2d(dim * 8, dim * 4, 1)
         self.reduce_chan2 = nn.Conv2d(dim * 4, dim * 2, 1)
@@ -855,6 +885,12 @@ class RefDiffRWKV(nn.Module):
 
         # 跨图融合
         self.fuse_att = BiWKV_Linear(embed_dim)
+
+        # ---------- Ref 多尺度处理器（处理交互后的 Ref tokens）----------
+        self.ref_ms_processor = RefMultiScaleProcessor(
+            embed_dim=embed_dim,
+            dims=(dim, dim * 2, dim * 4)   # 对应 e1, e2, e3 的通道数
+        )
 
         self.initialize_weights()
 
@@ -893,8 +929,9 @@ class RefDiffRWKV(nn.Module):
         B, N, C = main_tokens.shape
         interleaved = torch.stack([main_tokens, ref_tokens], dim=2).reshape(B, 2 * N, C)
         interleaved = self.fuse_att(interleaved)
-        main_tokens = interleaved[:, 0::2, :]
-        return main_tokens
+        main_out = interleaved[:, 0::2, :]
+        ref_out  = interleaved[:, 1::2, :]
+        return main_out, ref_out
 
     def forward(self, x_t, timesteps, LR, Ref):
         B, _, H, W = x_t.shape
@@ -926,29 +963,35 @@ class RefDiffRWKV(nn.Module):
         c = self.time_embed(timesteps)
 
         # 5. 跨图融合
-        main_tokens = self.cross_fusion(main_tokens, ref_tokens)
+        main_tokens, ref_tokens = self.cross_fusion(main_tokens, ref_tokens)
 
-        # 6. 转为特征图（动态分辨率）
+        # 6. 多尺度特征提取
+        rf1, rf2, rf3 = self.ref_ms_processor(ref_tokens, patch_h, patch_w)
+
+        # 7. 转为特征图（动态分辨率）
         x = main_tokens.transpose(1, 2).reshape(B, self.embed_dim, patch_h, patch_w)
 
         # ====================== U-Net 主干 ======================
         c1 = self.proj_c_enc1(c)
         for blk in self.enc1:
             x = blk(x, c1)
-        e1 = x
-        x = self.down1(x)
+        e1_raw = x
+        e1 = self.fuse_e1(torch.cat([e1_raw, rf1], dim=1))
+        x = self.down1(e1)
 
         c2 = self.proj_c_enc2(c)
         for blk in self.enc2:
             x = blk(x, c2)
-        e2 = x
-        x = self.down2(x)
+        e2_raw = x
+        e2 = self.fuse_e2(torch.cat([e2_raw, rf2], dim=1))
+        x = self.down2(e2)
 
         c3 = self.proj_c_enc3(c)
         for blk in self.enc3:
             x = blk(x, c3)
-        e3 = x
-        x = self.down3(x)
+        e3_raw = x
+        e3 = self.fuse_e3(torch.cat([e3_raw, rf3], dim=1))
+        x = self.down3(e3)
 
         c_latent = self.proj_c_latent(c)
         for blk in self.latent:
@@ -996,7 +1039,7 @@ class RefDiffRWKV(nn.Module):
             drop_path_rate=getattr(args, "drop_path_rate", 0.1),
             hidden_rate=getattr(args, "hidden_rate", 4),
             learn_sigma=getattr(args, "learn_sigma", False),
-            upsample_mode=getattr(args, "upsample_mode", "bicubic"),
+            upsample_mode=getattr(args, "upsample_mode", "bilinear"),
         )
 
 
@@ -1065,64 +1108,46 @@ class RefDiffRWKV_PL(pl.LightningModule):
     def forward(self, x_t, timesteps, LR, Ref):
         return self.model(x_t, timesteps, LR, Ref)
 
-    def _add_noise(self, x0: torch.Tensor, noise: torch.Tensor, t: torch.Tensor):
-        """余弦噪声调度"""
+    def _add_noise(self, x0, noise, t):
         s = 0.008
         T = self.num_timesteps
         alpha_bar = torch.cos(((t.float() / T + s) / (1 + s)) * math.pi / 2) ** 2
         alpha_bar = alpha_bar.view(-1, 1, 1, 1)
-        return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
+        x_t = torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
+        return x_t, noise, alpha_bar   # 返回 alpha_bar
 
     def _compute_loss(self, batch, stage: str = "train"):
         lr, hr, ref = batch
         B = hr.shape[0]
 
-        # ===== 仅训练时：以 10% 概率将 Ref 替换为 HR，并标记这些样本 =====
         if stage == "train":
             p_replace = 0.1
-            # 为每个样本生成独立掩码 (B,)，True 表示替换
             mask_replace = torch.rand(B, device=self.device) < p_replace
-            # 将对应 ref 替换为 hr
             ref = torch.where(mask_replace.view(-1, 1, 1, 1), hr, ref)
         else:
             mask_replace = torch.zeros(B, dtype=torch.bool, device=self.device)
 
-        # 均匀采样时间步
-        t = torch.randint(0, self.num_timesteps, (B,), device=self.device)
-
-        # 加噪
+        t = torch.randint(1, self.num_timesteps, (B,), device=self.device)
         noise = torch.randn_like(hr)
-        x_t = self._add_noise(hr, noise, t)
+        x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
 
-        # 预测噪声
         pred_noise = self.model(x_t, t, lr, ref)
-
-        # 逐样本平方误差，形状 (B,)
         loss_per_sample = ((pred_noise - noise) ** 2).mean(dim=[1, 2, 3])
 
-        # ===== 构造权重 =====
-        weight = torch.ones_like(loss_per_sample)   # 基础权重 1
-
         if stage == "train":
-            # 低 t 加权
-            weight[t < 100] = weight[t < 100] * 5.0
-            weight[(t >= 100) & (t < 200)] = weight[(t >= 100) & (t < 200)] * 2.0
-
-            # 替换样本额外乘以 2
+            alpha_bar_flat = alpha_bar.view(B)
+            snr = alpha_bar_flat / (1 - alpha_bar_flat + 1e-8)
+            weight = snr ** 0.5
+            weight = weight / weight.mean()
+            weight = weight.clone()
             weight[mask_replace] = weight[mask_replace] * 2.0
+        else:
+            weight = torch.ones(B, device=self.device)
 
-        # 加权平均
         loss = (loss_per_sample * weight).mean()
 
-        # 日志
-        self.log(
-            f"{stage}-loss",
-            loss,
-            prog_bar=True,
-            sync_dist=True,
-            on_step=True,
-            on_epoch=True,
-        )
+        self.log(f"{stage}-loss", loss, prog_bar=True, sync_dist=True,
+                on_step=True, on_epoch=True)
         return loss
 
     def training_step(self, batch, batch_idx):

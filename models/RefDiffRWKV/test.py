@@ -25,7 +25,9 @@ def add_noise(hr, t, num_timesteps=1000, s=0.008):
 
 def test_fixed_t_mse(model, test_loader, device, num_timesteps=1000):
     """测试2: 固定 t 的 noise MSE 曲线"""
-    t_list = [0, 50, 100, 200, 400, 600, 800, 999]
+    t_list = list(range(0, 1000, 10))  # 0, 10, 20, ..., 990
+    # 如果你希望包含 999 作为终点，可以补充：
+    t_list.append(999)
     mse_dict = {t: 0.0 for t in t_list}
     count_dict = {t: 0 for t in t_list}
 
