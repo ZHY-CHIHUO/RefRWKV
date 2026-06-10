@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
+
 class RefRWKV_PL(pl.LightningModule):
     """
     集成 RefSRWKV (Better Start) + RefDiffRWKV (主扩散) + EnRWKV (增强) 的 Lightning 模块。
@@ -14,31 +15,30 @@ class RefRWKV_PL(pl.LightningModule):
 
     def __init__(
         self,
-        model_sr: nn.Module,          # RefSRWKV 实例：用于 Better Start 的超分模型
-        model_diff: nn.Module,        # RefDiffRWKV 实例：主扩散模型
-        model_enhance: nn.Module,     # EnRWKV 实例：最终增强模型
-        global_semantic: nn.Module,   # 传入全局语义模块
+        model_sr: nn.Module,  # RefSRWKV 实例：用于 Better Start 的超分模型
+        model_diff: nn.Module,  # RefDiffRWKV 实例：主扩散模型
+        model_enhance: nn.Module,  # EnRWKV 实例：最终增强模型
+        global_semantic: nn.Module,  # 传入全局语义模块
         # 训练开关
-        train_sr: bool = True,        # 是否训练超分模型（RefSRWKV）
-        train_diff: bool = True,      # 是否训练扩散模型（RefDiffRWKV）
-        train_enhance: bool = True,   # 是否训练增强模型（EnRWKV）
-
+        train_sr: bool = True,  # 是否训练超分模型（RefSRWKV）
+        train_diff: bool = True,  # 是否训练扩散模型（RefDiffRWKV）
+        train_enhance: bool = True,  # 是否训练增强模型（EnRWKV）
         t_enhance_threshold: int = 250,  # 增强损失只对 t < 此阈值的样本计算，避免噪声太大时训练
         # 扩散参数
-        num_timesteps: int = 1000,    # 扩散总步数
+        num_timesteps: int = 1000,  # 扩散总步数
         # 学习率（可单独指定）
-        lr_sr: float = 1e-4,          # 超分模型的学习率
-        lr_diff: float = 4e-4,        # 扩散模型的学习率
-        lr_enhance: float = 1e-4,     # 增强模型的学习率
-        weight_decay: float = 1e-2,   # AdamW 的权重衰减
-        beta1: float = 0.9,           # Adam 的 beta1
-        beta2: float = 0.999,         # Adam 的 beta2
-        warmup_epochs: int = 5,       # 学习率预热轮数
-        scheduler: str = "cosine",    # 调度器类型："cosine" 或 "linear"
-        eta_min: float = None,        # 余弦退火的最小学习率比例，若为 None 则默认 lr * 0.01
+        lr_sr: float = 1e-4,  # 超分模型的学习率
+        lr_diff: float = 4e-4,  # 扩散模型的学习率
+        lr_enhance: float = 1e-4,  # 增强模型的学习率
+        weight_decay: float = 1e-2,  # AdamW 的权重衰减
+        beta1: float = 0.9,  # Adam 的 beta1
+        beta2: float = 0.999,  # Adam 的 beta2
+        warmup_epochs: int = 5,  # 学习率预热轮数
+        scheduler: str = "cosine",  # 调度器类型："cosine" 或 "linear"
+        eta_min: float = None,  # 余弦退火的最小学习率比例，若为 None 则默认 lr * 0.01
         # 损失权重
-        loss_sr_weight: float = 0.1,        # 超分损失在总损失中的权重
-        loss_enhance_weight: float = 0.1,   # 增强损失在总损失中的权重
+        loss_sr_weight: float = 0.1,  # 超分损失在总损失中的权重
+        loss_enhance_weight: float = 0.1,  # 增强损失在总损失中的权重
         **kwargs,
     ):
         super().__init__()
@@ -123,7 +123,9 @@ class RefRWKV_PL(pl.LightningModule):
             if small_t_mask.any():
                 with torch.no_grad():
                     alpha_bar_t = alpha_bar.view(-1, 1, 1, 1)
-                    pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
+                    pred_x0 = (
+                        x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise
+                    ) / torch.sqrt(alpha_bar_t)
                     pred_x0 = torch.clamp(pred_x0, -1, 1)
 
                 # 只对 t 较小的样本计算增强损失
@@ -133,13 +135,33 @@ class RefRWKV_PL(pl.LightningModule):
                 loss_enhance = 0.0  # 如果没有小 t 样本，当前 batch 的增强损失为 0
 
         # ------------------ 4. 总损失 ------------------
-        total_loss = loss_diff + self.loss_sr_weight * loss_sr + self.loss_enhance_weight * loss_enhance
+        total_loss = (
+            loss_diff
+            + self.loss_sr_weight * loss_sr
+            + self.loss_enhance_weight * loss_enhance
+        )
 
         # 日志记录
-        self.log(f"{stage}-loss_sr", loss_sr, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"{stage}-loss_diff", loss_diff, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"{stage}-loss_enhance", loss_enhance, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"{stage}-loss_total", total_loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(
+            f"{stage}-loss_sr", loss_sr, prog_bar=True, on_step=True, on_epoch=True
+        )
+        self.log(
+            f"{stage}-loss_diff", loss_diff, prog_bar=True, on_step=True, on_epoch=True
+        )
+        self.log(
+            f"{stage}-loss_enhance",
+            loss_enhance,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+        )
+        self.log(
+            f"{stage}-loss_total",
+            total_loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+        )
 
         return total_loss
 
@@ -156,16 +178,24 @@ class RefRWKV_PL(pl.LightningModule):
         # 为不同模块设置不同学习率
         param_groups = []
         if self.train_sr:
-            param_groups.append({'params': self.model_sr.parameters(), 'lr': self.lr_sr})
+            param_groups.append(
+                {"params": self.model_sr.parameters(), "lr": self.lr_sr}
+            )
         if self.train_diff:
-            param_groups.append({'params': self.model_diff.parameters(), 'lr': self.lr_diff})
+            param_groups.append(
+                {"params": self.model_diff.parameters(), "lr": self.lr_diff}
+            )
         if self.train_enhance:
-            param_groups.append({'params': self.model_enhance.parameters(), 'lr': self.lr_enhance})
+            param_groups.append(
+                {"params": self.model_enhance.parameters(), "lr": self.lr_enhance}
+            )
 
         # 如果全局语义模块存在且其 STA 部分未冻结（可训练），则加入优化器
         if self.global_semantic is not None:
             # 全局语义中的 DiNOv2 已冻结，但 STA 和 proj 参数可训练
-            param_groups.append({'params': self.global_semantic.parameters(), 'lr': self.lr_diff})
+            param_groups.append(
+                {"params": self.global_semantic.parameters(), "lr": self.lr_diff}
+            )
 
         optimizer = AdamW(
             param_groups,
@@ -185,7 +215,9 @@ class RefRWKV_PL(pl.LightningModule):
         def lr_lambda(epoch):
             if epoch < warmup_epochs:
                 return float(epoch + 1) / float(max(1, warmup_epochs))
-            progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+            progress = float(epoch - warmup_epochs) / float(
+                max(1, total_epochs - warmup_epochs)
+            )
             if scheduler_type == "cosine":
                 lr_ratio = eta_min / init_lr + (1.0 - eta_min / init_lr) * (
                     0.5 * (1.0 + math.cos(math.pi * progress))

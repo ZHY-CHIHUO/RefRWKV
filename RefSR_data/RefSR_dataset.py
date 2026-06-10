@@ -118,7 +118,9 @@ class RefPNGDataset(Dataset):
         else:
             # 亮度、对比度、饱和度、色调循环
             # 索引 0:亮度, 1:对比度, 2:饱和度, 3:色调
-            for idx, (strength, prob) in enumerate(zip(self.ref_aug_strengths, self.ref_aug_probs)):
+            for idx, (strength, prob) in enumerate(
+                zip(self.ref_aug_strengths, self.ref_aug_probs)
+            ):
                 if random.random() > prob:
                     continue
                 if idx == 0:  # 亮度

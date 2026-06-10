@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import sys
 from pathlib import Path
+
 # 添加项目根目录到 sys.path
 root_dir = str(Path(__file__).parent.parent)  # 从 models/ 向上到 RefRWKV/
 sys.path.insert(0, root_dir)

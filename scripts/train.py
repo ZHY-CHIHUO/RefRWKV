@@ -26,14 +26,18 @@ from RefRWKV.RefSR_data.RefSR_dataset import RefPNGDataset
 
 
 def load_config(config_path):
-    with open(config_path, 'r', encoding='utf-8') as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/train_config.yaml",
-                        help="Path to YAML config file")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/train_config.yaml",
+        help="Path to YAML config file",
+    )
     args = parser.parse_args()
 
     # ========== 1. 加载配置文件 ==========
@@ -44,10 +48,8 @@ def main():
     checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints")
     log_dir = output_cfg.get("log_dir", "logs")
 
-
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-
 
     # ========== 3. 数据集参数 ==========
     data_cfg = cfg["data"]
@@ -64,7 +66,9 @@ def main():
         "data_dir": data_cfg["root"],
         "patch_size": data_cfg.get("patch_size"),  # 可以是 None
         "scale": data_cfg.get("scale", 10),
-        "ref_aug_strengths": data_cfg.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
+        "ref_aug_strengths": data_cfg.get(
+            "ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]
+        ),
         "ref_aug_probs": data_cfg.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
         "ref_gray_prob": data_cfg.get("ref_gray_prob", 0.2),
         "max_samples": max_samples_tuple,
@@ -77,15 +81,12 @@ def main():
         mode="train",
         augment=data_cfg.get("augment", True),
         augment_ref=data_cfg.get("augment_ref"),
-        **dataset_kwargs
+        **dataset_kwargs,
     )
 
     # Val dataset
     val_ds = RefPNGDataset(
-        mode="val",
-        augment=False,
-        augment_ref=False,
-        **dataset_kwargs
+        mode="val", augment=False, augment_ref=False, **dataset_kwargs
     )
 
     train_loader = DataLoader(
@@ -109,6 +110,13 @@ def main():
     model_cfg = cfg.get("model", {})
     sr_cfg = cfg.get("sr", {})
     enhance_cfg = cfg.get("enhance", {})
+
+    # 创建全局语义模块
+    global_semantic = GlobalSemanticModule(
+        target_dim=cfg["model"].get("embed_dim", 64),
+        num_tokens=32,
+        use_rwkv=True,
+    )
 
     # 5.1 RefDiffRWKV
     model_diff = RefDiffRWKV(
@@ -143,13 +151,6 @@ def main():
         dim=enhance_cfg.get("dim", 48),
         num_blocks=enhance_cfg.get("num_blocks", [4, 6, 6, 8]),
         num_refinement_blocks=enhance_cfg.get("num_refinement_blocks", 4),
-    )
-
-    # 创建全局语义模块
-    global_semantic = GlobalSemanticModule(
-        target_dim=cfg["model"].get("embed_dim", 64),
-        num_tokens=32,
-        use_rwkv=True,
     )
 
     # ========== 6. Lightning 模块 ==========
