@@ -14,28 +14,30 @@ class RefRWKV_PL(pl.LightningModule):
 
     def __init__(
         self,
-        model_sr: nn.Module,
-        model_diff: nn.Module,
-        model_enhance: nn.Module,
+        model_sr: nn.Module,          # RefSRWKV 实例：用于 Better Start 的超分模型
+        model_diff: nn.Module,        # RefDiffRWKV 实例：主扩散模型
+        model_enhance: nn.Module,     # EnRWKV 实例：最终增强模型
         # 训练开关
-        train_sr: bool = True,
-        train_diff: bool = True,
-        train_enhance: bool = True,
+        train_sr: bool = True,        # 是否训练超分模型（RefSRWKV）
+        train_diff: bool = True,      # 是否训练扩散模型（RefDiffRWKV）
+        train_enhance: bool = True,   # 是否训练增强模型（EnRWKV）
+
+        t_enhance_threshold: int = 250,  # 增强损失只对 t < 此阈值的样本计算，避免噪声太大时训练
         # 扩散参数
-        num_timesteps: int = 1000,
+        num_timesteps: int = 1000,    # 扩散总步数
         # 学习率（可单独指定）
-        lr_sr: float = 1e-4,
-        lr_diff: float = 4e-4,
-        lr_enhance: float = 1e-4,
-        weight_decay: float = 1e-2,
-        beta1: float = 0.9,
-        beta2: float = 0.999,
-        warmup_epochs: int = 5,
-        scheduler: str = "cosine",
-        eta_min: float = None,
+        lr_sr: float = 1e-4,          # 超分模型的学习率
+        lr_diff: float = 4e-4,        # 扩散模型的学习率
+        lr_enhance: float = 1e-4,     # 增强模型的学习率
+        weight_decay: float = 1e-2,   # AdamW 的权重衰减
+        beta1: float = 0.9,           # Adam 的 beta1
+        beta2: float = 0.999,         # Adam 的 beta2
+        warmup_epochs: int = 5,       # 学习率预热轮数
+        scheduler: str = "cosine",    # 调度器类型："cosine" 或 "linear"
+        eta_min: float = None,        # 余弦退火的最小学习率比例，若为 None 则默认 lr * 0.01
         # 损失权重
-        loss_sr_weight: float = 0.1,        # 超分损失权重
-        loss_enhance_weight: float = 0.1,   # 增强损失权重
+        loss_sr_weight: float = 0.1,        # 超分损失在总损失中的权重
+        loss_enhance_weight: float = 0.1,   # 增强损失在总损失中的权重
         **kwargs,
     ):
         super().__init__()
@@ -44,7 +46,7 @@ class RefRWKV_PL(pl.LightningModule):
         self.model_sr = model_sr
         self.model_diff = model_diff
         self.model_enhance = model_enhance
-
+        self.t_enhance_threshold = t_enhance_threshold
         self.train_sr = train_sr
         self.train_diff = train_diff
         self.train_enhance = train_enhance
@@ -99,9 +101,8 @@ class RefRWKV_PL(pl.LightningModule):
         # ------------------ 1. 超分损失 (RefSRWKV) ------------------
         loss_sr = 0.0
         if self.train_sr:
-            # 使用 LR, Ref 生成初始超分图像 I_start
-            I_start = self.model_sr(lr, ref, label=None)  # 假设 forward 接受 (lr, ref)
-            loss_sr = F.l1_loss(I_start, hr)  # 可与 HR 直接计算 L1 损失
+            I_start = self.model_sr(lr, ref, label=None)
+            loss_sr = F.l1_loss(I_start, hr)
 
         # ------------------ 2. 扩散损失 (RefDiffRWKV) ------------------
         t = torch.randint(1, self.num_timesteps, (B,), device=device)
@@ -113,15 +114,18 @@ class RefRWKV_PL(pl.LightningModule):
         # ------------------ 3. 增强损失 (EnRWKV) ------------------
         loss_enhance = 0.0
         if self.train_enhance:
-            # 使用扩散模型预测的噪声计算一步去噪后的图像 pred_x0
-            with torch.no_grad():
-                alpha_bar_t = alpha_bar.view(-1, 1, 1, 1)
-                pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
-                pred_x0 = torch.clamp(pred_x0, -1, 1)  # 确保在合法范围
+            small_t_mask = t < self.t_enhance_threshold
+            if small_t_mask.any():
+                with torch.no_grad():
+                    alpha_bar_t = alpha_bar.view(-1, 1, 1, 1)
+                    pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
+                    pred_x0 = torch.clamp(pred_x0, -1, 1)
 
-            # 将 pred_x0 作为增强模型的输入（也可同时传入 ref 或其它条件）
-            refined = self.model_enhance(pred_x0, label=None)  # 输入为单图像
-            loss_enhance = F.l1_loss(refined, hr)
+                # 只对 t 较小的样本计算增强损失
+                refined = self.model_enhance(pred_x0[small_t_mask], label=None)
+                loss_enhance = F.l1_loss(refined, hr[small_t_mask])
+            else:
+                loss_enhance = 0.0  # 如果没有小 t 样本，当前 batch 的增强损失为 0
 
         # ------------------ 4. 总损失 ------------------
         total_loss = loss_diff + self.loss_sr_weight * loss_sr + self.loss_enhance_weight * loss_enhance
