@@ -17,6 +17,7 @@ class RefRWKV_PL(pl.LightningModule):
         model_sr: nn.Module,          # RefSRWKV 实例：用于 Better Start 的超分模型
         model_diff: nn.Module,        # RefDiffRWKV 实例：主扩散模型
         model_enhance: nn.Module,     # EnRWKV 实例：最终增强模型
+        global_semantic: nn.Module,   # 传入全局语义模块
         # 训练开关
         train_sr: bool = True,        # 是否训练超分模型（RefSRWKV）
         train_diff: bool = True,      # 是否训练扩散模型（RefDiffRWKV）
@@ -46,6 +47,7 @@ class RefRWKV_PL(pl.LightningModule):
         self.model_sr = model_sr
         self.model_diff = model_diff
         self.model_enhance = model_enhance
+        self.global_semantic = global_semantic
         self.t_enhance_threshold = t_enhance_threshold
         self.train_sr = train_sr
         self.train_diff = train_diff
@@ -53,6 +55,9 @@ class RefRWKV_PL(pl.LightningModule):
         self.num_timesteps = num_timesteps
         self.loss_sr_weight = loss_sr_weight
         self.loss_enhance_weight = loss_enhance_weight
+
+        if self.global_semantic is not None:
+            self.model_diff.global_semantic = self.global_semantic
 
         # 设置各模块是否可训练
         self._set_requires_grad()
@@ -156,6 +161,11 @@ class RefRWKV_PL(pl.LightningModule):
             param_groups.append({'params': self.model_diff.parameters(), 'lr': self.lr_diff})
         if self.train_enhance:
             param_groups.append({'params': self.model_enhance.parameters(), 'lr': self.lr_enhance})
+
+        # 如果全局语义模块存在且其 STA 部分未冻结（可训练），则加入优化器
+        if self.global_semantic is not None:
+            # 全局语义中的 DiNOv2 已冻结，但 STA 和 proj 参数可训练
+            param_groups.append({'params': self.global_semantic.parameters(), 'lr': self.lr_diff})
 
         optimizer = AdamW(
             param_groups,

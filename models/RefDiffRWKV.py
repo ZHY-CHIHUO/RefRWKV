@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from einops import rearrange
 import sys
 from pathlib import Path
+
 # 添加项目根目录到 sys.path
 root_dir = str(Path(__file__).parent.parent)  # 从 models/ 向上到 RefRWKV/
 sys.path.insert(0, root_dir)
@@ -189,13 +190,7 @@ def modulate(x, shift, scale):
 
 class BiBlock(nn.Module):
     """
-    用于 Bi-DiffRWKV 的基础构建块（支持扩散条件注入）。
-
-    特性：
-    - 输入/输出为二维特征图 (B, C, H, W)，直接适配 U-Net 的上下采样结构。
-    - 内部使用双向 WKV + OmniShift 进行空间混合和通道混合。
-    - 通过 adaLN 机制接收时间步条件 c，动态调制注意力与 FFN 分支。
-    - 支持随机深度 (DropPath) 和可选的跳跃连接 (skip connection)。
+    用于 Bi-DiffRWKV 的基础构建块（支持扩散条件注入 + 语义 Cross-Attention）。
     """
 
     def __init__(
@@ -204,44 +199,50 @@ class BiBlock(nn.Module):
         hidden_rate: int = 4,
         drop_path: float = 0.0,
         use_adaLN: bool = True,
+        use_cross_attn: bool = True,  # 是否启用语义 Cross-Attention
+        num_heads: int = 8,  # 交叉注意力头数
     ):
         super().__init__()
 
-        # 层归一化
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-        # 空间混合（双向 WKV + OmniShift）
         self.att = VRWKV_SpatialMix(n_embd)
-
-        # 通道混合（FFN + OmniShift）
         self.ffn = VRWKV_ChannelMix(n_embd, hidden_rate=hidden_rate)
 
-        # 随机深度
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         # 条件调制层（adaLN）
         self.use_adaLN = use_adaLN
         if use_adaLN:
-            # 输出 6 个调制参数：att 的 shift/scale/gate，ffn 的 shift/scale/gate
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
                 nn.Linear(n_embd, 6 * n_embd, bias=True),
             )
-            # 零初始化（扩散模型训练稳定性的关键）
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
         else:
-            # 若无外部条件，退化为简单的可学习缩放系数（与原 Restore‑RWKV 兼容）
             self.gamma1 = nn.Parameter(torch.ones(n_embd))
             self.gamma2 = nn.Parameter(torch.ones(n_embd))
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor = None):
-        """
-        x: 输入特征图 (B, C, H, W)
-        c: 条件向量 (B, C) ，若 use_adaLN=True 则必须提供，否则可为 None
-        返回: 输出特征图 (B, C, H, W)
-        """
+        # ========== 新增：语义 Cross-Attention ==========
+        self.use_cross_attn = use_cross_attn
+        if use_cross_attn:
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=n_embd,
+                num_heads=num_heads,
+                batch_first=True,
+            )
+            self.cross_norm = nn.LayerNorm(n_embd)
+            # 可学习的缩放因子（初始化为 1）
+            self.cross_scale = nn.Parameter(torch.ones(1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor = None,
+        sem_tokens: torch.Tensor = None,  # 新增：语义 Token
+    ):
         B, C, H, W = x.shape
         resolution = (H, W)
 
@@ -252,7 +253,6 @@ class BiBlock(nn.Module):
                 self.adaLN_modulation(c).chunk(6, dim=1)
             )
         else:
-            # 简单缩放模式
             gate_att = self.gamma1
             gate_ffn = self.gamma2
             shift_att = scale_att = shift_ffn = scale_ffn = 0.0
@@ -261,14 +261,29 @@ class BiBlock(nn.Module):
         # 1. 转为序列并归一化 + 调制
         x_flat = rearrange(x, "b c h w -> b (h w) c")
         x_flat = modulate(self.ln1(x_flat), shift_att, scale_att)
-        # 2. 双向 WKV 空间混合
+
+        # ========== 关键修改：在 WKV 之前加入语义 Cross-Attention ==========
+        if self.use_cross_attn and sem_tokens is not None:
+            # 对当前特征做归一化，然后作为 Query
+            x_flat_norm = self.cross_norm(x_flat)
+            attn_out, _ = self.cross_attn(
+                x_flat_norm,
+                sem_tokens,  # Key
+                sem_tokens,  # Value
+            )
+            # 残差连接，并乘以可学习缩放因子
+            x_flat = x_flat + self.cross_scale * attn_out
+        # ================================================================
+
+        # 2. 双向 WKV 空间混合（语义信息已注入）
         x_flat = self.att(x_flat, resolution)
+
         # 3. 门控 + 残差
         x_flat = gate_att.unsqueeze(1) * x_flat
         x_flat = rearrange(x_flat, "b (h w) c -> b c h w", h=H, w=W)
         x = x + self.drop_path(x_flat)
 
-        # ---------- FFN 分支 ----------
+        # ---------- FFN 分支（保持不变） ----------
         x_flat = rearrange(x, "b c h w -> b (h w) c")
         x_flat = modulate(self.ln2(x_flat), shift_ffn, scale_ffn)
         x_flat = self.ffn(x_flat, resolution)
@@ -572,17 +587,19 @@ class LRUpsamplerPixelShuffle(nn.Module):
         x = self.stage2(x)  # → (B, 3, 480, 480)
         return x
 
+
 class RefMultiScaleProcessor(nn.Module):
     """
     将交互后的 Ref tokens 转换为多尺度 2D 特征图，
     分别对应 U-Net 编码器输出的 e1, e2, e3 尺度。
     """
+
     def __init__(self, embed_dim, dims):
         super().__init__()
         d1, d2, d3 = dims
         self.proj1 = nn.Conv2d(embed_dim, d1, 1)
-        self.down1 = Downsample(d1)           # 输出通道 d2 或自行适配
-        self.proj2 = nn.Conv2d(d2, d2, 1)     # 下采样后可能通道已是 d2，可选
+        self.down1 = Downsample(d1)  # 输出通道 d2 或自行适配
+        self.proj2 = nn.Conv2d(d2, d2, 1)  # 下采样后可能通道已是 d2，可选
         self.down2 = Downsample(d2)
         self.proj3 = nn.Conv2d(d3, d3, 1)
 
@@ -590,12 +607,13 @@ class RefMultiScaleProcessor(nn.Module):
         # ref_tokens: (B, N, C)
         B, _, C = ref_tokens.shape
         x = ref_tokens.transpose(1, 2).reshape(B, C, H, W)
-        f1 = self.proj1(x)                    # (B, d1, H, W)
-        f2 = self.down1(f1)                   # (B, d2, H/2, W/2)
-        f2 = self.proj2(f2)                   # 确保通道对齐
-        f3 = self.down2(f2)                   # (B, d3, H/4, W/4)
+        f1 = self.proj1(x)  # (B, d1, H, W)
+        f2 = self.down1(f1)  # (B, d2, H/2, W/2)
+        f2 = self.proj2(f2)  # 确保通道对齐
+        f3 = self.down2(f2)  # (B, d3, H/4, W/4)
         f3 = self.proj3(f3)
         return f1, f2, f3
+
 
 ##########################################################################
 ## RefDiffRWKV
@@ -619,6 +637,7 @@ class RefDiffRWKV(nn.Module):
         hidden_rate: int = 4,
         learn_sigma: bool = False,
         upsample_mode: str = "bilinear",  # 可选 "bilinear", "cnn", "pixelshuffle"
+        global_semantic: nn.Module = None,
         **kwargs,
     ):
         super().__init__()
@@ -626,6 +645,7 @@ class RefDiffRWKV(nn.Module):
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.channels = channels
+        self.global_semantic = global_semantic
 
         # ---------- LR 上采样器 ----------
         if upsample_mode == "bilinear":
@@ -654,9 +674,6 @@ class RefDiffRWKV(nn.Module):
 
         # 时间嵌入
         self.time_embed = TimestepEmbedder(embed_dim)
-
-        # 位置编码不再固定为 Parameter，改为动态生成
-        # self.pos_embed = nn.Parameter(...)  # 已移除
 
         # U-Net 结构
         dim = embed_dim
@@ -731,9 +748,9 @@ class RefDiffRWKV(nn.Module):
 
         # 输入：main 特征 + 对应尺度 Ref 特征（通道数均为 dim * mult）
         # 输出：融合后通道数减半（还原为该尺度标准通道数）
-        self.fuse_e1 = nn.Conv2d(dim * 2, dim, 1)       # cat(e1, rf1) -> dim
-        self.fuse_e2 = nn.Conv2d(dim * 4, dim * 2, 1)   # cat(e2, rf2) -> dim*2
-        self.fuse_e3 = nn.Conv2d(dim * 8, dim * 4, 1)   # cat(e3, rf3) -> dim*4
+        self.fuse_e1 = nn.Conv2d(dim * 2, dim, 1)  # cat(e1, rf1) -> dim
+        self.fuse_e2 = nn.Conv2d(dim * 4, dim * 2, 1)  # cat(e2, rf2) -> dim*2
+        self.fuse_e3 = nn.Conv2d(dim * 8, dim * 4, 1)  # cat(e3, rf3) -> dim*4
 
         # 跳跃连接通道调整
         self.reduce_chan3 = nn.Conv2d(dim * 8, dim * 4, 1)
@@ -752,7 +769,7 @@ class RefDiffRWKV(nn.Module):
         # ---------- Ref 多尺度处理器（处理交互后的 Ref tokens）----------
         self.ref_ms_processor = RefMultiScaleProcessor(
             embed_dim=embed_dim,
-            dims=(dim, dim * 2, dim * 4)   # 对应 e1, e2, e3 的通道数
+            dims=(dim, dim * 2, dim * 4),  # 对应 e1, e2, e3 的通道数
         )
 
         self.initialize_weights()
@@ -793,7 +810,7 @@ class RefDiffRWKV(nn.Module):
         interleaved = torch.stack([main_tokens, ref_tokens], dim=2).reshape(B, 2 * N, C)
         interleaved = self.fuse_att(interleaved)
         main_out = interleaved[:, 0::2, :]
-        ref_out  = interleaved[:, 1::2, :]
+        ref_out = interleaved[:, 1::2, :]
         return main_out, ref_out
 
     def forward(self, x_t, timesteps, LR, Ref):
@@ -825,6 +842,13 @@ class RefDiffRWKV(nn.Module):
         # 4. 时间条件
         c = self.time_embed(timesteps)
 
+        if self.global_semantic is not None:
+            sem_pyramid = self.global_semantic(Ref)
+            sem_e1 = sem_pyramid["e1"]
+            sem_e2 = sem_pyramid["e2"]
+            sem_e3 = sem_pyramid["e3"]
+            sem_lat = sem_pyramid["latent"]
+
         # 5. 跨图融合
         main_tokens, ref_tokens = self.cross_fusion(main_tokens, ref_tokens)
 
@@ -837,28 +861,28 @@ class RefDiffRWKV(nn.Module):
         # ====================== U-Net 主干 ======================
         c1 = self.proj_c_enc1(c)
         for blk in self.enc1:
-            x = blk(x, c1)
+            x = blk(x, c1, sem_e1)
         e1_raw = x
         e1 = self.fuse_e1(torch.cat([e1_raw, rf1], dim=1))
         x = self.down1(e1)
 
         c2 = self.proj_c_enc2(c)
         for blk in self.enc2:
-            x = blk(x, c2)
+            x = blk(x, c2, sem_e2)
         e2_raw = x
         e2 = self.fuse_e2(torch.cat([e2_raw, rf2], dim=1))
         x = self.down2(e2)
 
         c3 = self.proj_c_enc3(c)
         for blk in self.enc3:
-            x = blk(x, c3)
+            x = blk(x, c3, sem_e3)
         e3_raw = x
         e3 = self.fuse_e3(torch.cat([e3_raw, rf3], dim=1))
         x = self.down3(e3)
 
         c_latent = self.proj_c_latent(c)
         for blk in self.latent:
-            x = blk(x, c_latent)
+            x = blk(x, c_latent, sem_lat)
 
         # 解码器
         x = self.up3(x)
@@ -866,21 +890,21 @@ class RefDiffRWKV(nn.Module):
         x = self.reduce_chan3(x)
         c_d3 = self.proj_c_dec3(c)
         for blk in self.dec3:
-            x = blk(x, c_d3)
+            x = blk(x, c_d3, sem_e3)
 
         x = self.up2(x)
         x = torch.cat([x, e2], dim=1)
         x = self.reduce_chan2(x)
         c_d2 = self.proj_c_dec2(c)
         for blk in self.dec2:
-            x = blk(x, c_d2)
+            x = blk(x, c_d2, sem_e2)
 
         x = self.up1(x)
         x = torch.cat([x, e1], dim=1)
         x = self.reduce_chan1(x)
         c_d1 = self.proj_c_dec1(c)
         for blk in self.dec1:
-            x = blk(x, c_d1)
+            x = blk(x, c_d1, sem_e1)
 
         # 7. 输出
         x_flat = rearrange(x, "b c h w -> b (h w) c")
@@ -935,8 +959,3 @@ def refdiffrwkv_l(**kwargs):
         latent_blocks=12,
         **kwargs,
     )
-
-
-
-
-

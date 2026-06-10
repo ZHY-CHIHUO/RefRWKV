@@ -20,7 +20,7 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # ==================== 导入模型和数据集 ====================
-from RefRWKV.models import RefSRWKV, RefDiffRWKV, EnRWKV
+from RefRWKV.models import RefSRWKV, RefDiffRWKV, EnRWKV, GlobalSemanticModule
 from RefRWKV import RefRWKV_PL
 from RefRWKV.RefSR_data.RefSR_dataset import RefPNGDataset
 
@@ -142,6 +142,13 @@ def main():
         dim=enhance_cfg.get("dim", 48),
         num_blocks=enhance_cfg.get("num_blocks", [4, 6, 6, 8]),
         num_refinement_blocks=enhance_cfg.get("num_refinement_blocks", 4),
+    )
+
+    # 创建全局语义模块
+    global_semantic = GlobalSemanticModule(
+        target_dim=cfg["model"].get("embed_dim", 64),
+        num_tokens=32,
+        use_rwkv=True,
     )
 
     # ========== 6. Lightning 模块 ==========
