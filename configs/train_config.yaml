@@ -1,0 +1,52 @@
+# configs/train_config.yaml
+
+# 模型参数
+model:
+  img_size: 256
+  patch_size: 4
+  embed_dim: 64
+  enc_blocks: [4, 6, 6]
+  dec_blocks: [6, 6, 4]
+  latent_blocks: 8
+  drop_path_rate: 0.1
+  upsample_mode: "cnn"
+  channels: 3
+
+# 超分模型参数
+sr:
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 8
+
+# 增强模型参数
+enhance:
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+
+# 数据集参数
+data:
+  root: "/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
+  crop_size: 160
+  scale: 10
+  max_samples_train: 10000
+  max_samples_val: null
+  max_samples_test: null
+  batch_size: 50
+  num_workers: 2
+
+# 训练参数
+train:
+  lr_sr: 1e-4
+  lr_diff: 4e-4
+  lr_enhance: 1e-4
+  warmup_epochs: 5
+  max_epochs: 200
+  accumulate_grad_batches: 4
+  precision: "bf16"
+  train_sr: true
+  train_diff: true
+  train_enhance: true
+  t_enhance_threshold: 250
+  loss_sr_weight: 0.1
+  loss_enhance_weight: 0.1

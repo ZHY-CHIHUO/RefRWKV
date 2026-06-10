@@ -10,7 +10,7 @@ from PIL import Image
 
 # 添加项目根目录
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from RWKV.models.RefRWKV.RefDiffRWKV import RefDiffRWKV, RefDiffRWKV_PL
 from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset
