@@ -1,25 +1,33 @@
 # configs/train_config.yaml
 
 # 模型参数
+# ========== RefDiffRWKV 参数（主扩散模型） ==========
 model:
   img_size: 256
   patch_size: 4
   embed_dim: 64
+  channels: 3
   enc_blocks: [4, 6, 6]
   dec_blocks: [6, 6, 4]
   latent_blocks: 8
   drop_path_rate: 0.1
+  hidden_rate: 4
+  learn_sigma: false
   upsample_mode: "cnn"
-  channels: 3
 
-# 超分模型参数
+# ========== RefSRWKV 参数（Better Start 超分模型） ==========
 sr:
+  inp_channels: 3
+  out_channels: 3
   dim: 48
   num_blocks: [4, 6, 6, 8]
   num_refinement_blocks: 8
+  scale: 10
 
-# 增强模型参数
+# ========== EnRWKV 参数（增强模型） ==========
 enhance:
+  inp_channels: 3
+  out_channels: 3
   dim: 48
   num_blocks: [4, 6, 6, 8]
   num_refinement_blocks: 4
@@ -27,8 +35,14 @@ enhance:
 # 数据集参数
 data:
   root: "/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
-  crop_size: 160
+  mode: "train"
+  patch_size: 160
   scale: 10
+  augment: true
+  augment_ref: true
+  ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
+  ref_aug_probs:    [0.5, 0.5, 0.5, 0.5]
+  ref_gray_prob: 0.2
   max_samples_train: 10000
   max_samples_val: null
   max_samples_test: null
@@ -55,4 +69,3 @@ train:
 output:
   checkpoint_dir: "checkpoints"
   log_dir: "logs"
-  result_dir: "results"

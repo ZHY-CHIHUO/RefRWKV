@@ -43,40 +43,49 @@ def main():
     output_cfg = cfg.get("output", {})
     checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints")
     log_dir = output_cfg.get("log_dir", "logs")
-    result_dir = output_cfg.get("result_dir", "results")   # 供 test/inference 使用
+
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(result_dir, exist_ok=True)
 
-    print(f"✅ 输出目录已创建/确认:")
-    print(f"   Checkpoints: {checkpoint_dir}")
-    print(f"   Logs       : {log_dir}")
-    print(f"   Results    : {result_dir}")
 
-    # ========== 3. 数据集 ==========
+    # ========== 3. 数据集参数 ==========
     data_cfg = cfg["data"]
-    train_ds = RefPNGDataset(
-        data_dir=data_cfg["root"],
-        mode="train",
-        patch_size=data_cfg["crop_size"],
-        augment=True,
-        augment_ref=True,
-        max_samples=(data_cfg["max_samples_train"],
-                     data_cfg["max_samples_val"],
-                     data_cfg["max_samples_test"]),
-        sample_seed=42,
+
+    # 构建 max_samples 元组
+    max_samples_tuple = (
+        data_cfg.get("max_samples_train"),
+        data_cfg.get("max_samples_val"),
+        data_cfg.get("max_samples_test"),
     )
 
+    # 公共参数
+    dataset_kwargs = {
+        "data_dir": data_cfg["root"],
+        "patch_size": data_cfg.get("patch_size"),  # 可以是 None
+        "scale": data_cfg.get("scale", 10),
+        "ref_aug_strengths": data_cfg.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
+        "ref_aug_probs": data_cfg.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
+        "ref_gray_prob": data_cfg.get("ref_gray_prob", 0.2),
+        "max_samples": max_samples_tuple,
+        "sample_seed": 42,
+    }
+
+    # ========== 4. 数据集 ==========
+    # Train dataset
+    train_ds = RefPNGDataset(
+        mode="train",
+        augment=data_cfg.get("augment", True),
+        augment_ref=data_cfg.get("augment_ref"),
+        **dataset_kwargs
+    )
+
+    # Val dataset
     val_ds = RefPNGDataset(
-        data_dir=data_cfg["root"],
         mode="val",
-        patch_size=160,
         augment=False,
-        max_samples=(data_cfg["max_samples_train"],
-                     data_cfg["max_samples_val"],
-                     data_cfg["max_samples_test"]),
-        sample_seed=42,
+        augment_ref=False,
+        **dataset_kwargs
     )
 
     train_loader = DataLoader(
@@ -96,41 +105,46 @@ def main():
         pin_memory=True,
     )
 
-    # ========== 4. 模型实例化 ==========
-    model_cfg = cfg["model"]
-    sr_cfg = cfg["sr"]
-    enhance_cfg = cfg["enhance"]
+    # ========== 5. 实例化三个模型 ==========
+    model_cfg = cfg.get("model", {})
+    sr_cfg = cfg.get("sr", {})
+    enhance_cfg = cfg.get("enhance", {})
 
-    model_sr = RefSRWKV(
-        inp_channels=model_cfg["channels"],
-        out_channels=model_cfg["channels"],
-        dim=sr_cfg["dim"],
-        num_blocks=sr_cfg["num_blocks"],
-        num_refinement_blocks=sr_cfg["num_refinement_blocks"],
-        scale=data_cfg["scale"],
-    )
-
+    # 5.1 RefDiffRWKV
     model_diff = RefDiffRWKV(
-        img_size=model_cfg["img_size"],
-        patch_size=model_cfg["patch_size"],
-        embed_dim=model_cfg["embed_dim"],
-        channels=model_cfg["channels"],
-        enc_blocks=model_cfg["enc_blocks"],
-        dec_blocks=model_cfg["dec_blocks"],
-        latent_blocks=model_cfg["latent_blocks"],
-        drop_path_rate=model_cfg["drop_path_rate"],
-        upsample_mode=model_cfg["upsample_mode"],
+        img_size=model_cfg.get("img_size", 256),
+        patch_size=model_cfg.get("patch_size", 4),
+        embed_dim=model_cfg.get("embed_dim", 64),
+        channels=model_cfg.get("channels", 3),
+        enc_blocks=model_cfg.get("enc_blocks", [4, 6, 6]),
+        dec_blocks=model_cfg.get("dec_blocks", [6, 6, 4]),
+        latent_blocks=model_cfg.get("latent_blocks", 8),
+        drop_path_rate=model_cfg.get("drop_path_rate", 0.1),
+        hidden_rate=model_cfg.get("hidden_rate", 4),
+        learn_sigma=model_cfg.get("learn_sigma", False),
+        upsample_mode=model_cfg.get("upsample_mode", "cnn"),
     )
 
+    # 5.2 RefSRWKV
+    model_sr = RefSRWKV(
+        inp_channels=sr_cfg.get("inp_channels", 3),
+        out_channels=sr_cfg.get("out_channels", 3),
+        dim=sr_cfg.get("dim", 48),
+        num_blocks=sr_cfg.get("num_blocks", [4, 6, 6, 8]),
+        num_refinement_blocks=sr_cfg.get("num_refinement_blocks", 8),
+        scale=sr_cfg.get("scale", 10),
+    )
+
+    # 5.3 EnRWKV
     model_enhance = EnRWKV(
-        inp_channels=model_cfg["channels"],
-        out_channels=model_cfg["channels"],
-        dim=enhance_cfg["dim"],
-        num_blocks=enhance_cfg["num_blocks"],
-        num_refinement_blocks=enhance_cfg["num_refinement_blocks"],
+        inp_channels=enhance_cfg.get("inp_channels", 3),
+        out_channels=enhance_cfg.get("out_channels", 3),
+        dim=enhance_cfg.get("dim", 48),
+        num_blocks=enhance_cfg.get("num_blocks", [4, 6, 6, 8]),
+        num_refinement_blocks=enhance_cfg.get("num_refinement_blocks", 4),
     )
 
-    # ========== 5. Lightning 模块 ==========
+    # ========== 6. Lightning 模块 ==========
     train_cfg = cfg["train"]
     pl_model = RefRWKV_PL(
         model_sr=model_sr,
@@ -154,7 +168,7 @@ def main():
         loss_enhance_weight=train_cfg["loss_enhance_weight"],
     )
 
-    # ========== 6. Trainer 配置 ==========
+    # ========== 7. Trainer 配置 ==========
     logger = TensorBoardLogger(log_dir, name="RefRWKV")
 
     callbacks = [
@@ -165,7 +179,7 @@ def main():
             verbose=True,
         ),
         ModelCheckpoint(
-            dirpath=checkpoint_dir,          # 从配置文件读取
+            dirpath=checkpoint_dir,
             filename="refrwkv-{epoch:04d}-{val-loss_total:.5f}",
             monitor="val-loss_total",
             save_top_k=3,
@@ -194,7 +208,7 @@ def main():
     print(f"   Max Epochs: {train_cfg['max_epochs']}")
     print(f"   Batch Size: {data_cfg['batch_size']}")
 
-    # ========== 7. 检查是否有上次的检查点 ==========
+    # ========== 8. 检查点恢复 ==========
     last_ckpt = os.path.join(checkpoint_dir, "last.ckpt")
     ckpt_path = last_ckpt if os.path.exists(last_ckpt) else None
 
