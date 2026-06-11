@@ -83,7 +83,7 @@ def main():
     # Train dataset
     train_ds = RefLMDBDataset(
         mode="train",
-        augment=data_cfg.get("augment", True),
+        augment=data_cfg.get("augment"),
         augment_ref=data_cfg.get("augment_ref"),
         **dataset_kwargs,
     )

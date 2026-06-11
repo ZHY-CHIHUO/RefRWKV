@@ -20,6 +20,8 @@ test_results/
 !data/*.py
 !RefSR_data/*.py
 
+configs/*
+
 # CUDA 编译产物
 *.o
 *.so
