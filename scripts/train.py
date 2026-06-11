@@ -18,10 +18,14 @@ from pytorch_lightning.callbacks import (
     EarlyStopping,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
+torch.set_float32_matmul_precision('high')
 
 # ==================== 导入模型和数据集 ====================
-from RefRWKV.models import RefSRWKV, RefDiffRWKV, EnRWKV, GlobalSemanticModule
-from RefRWKV import RefRWKV_PL
+from RefRWKV.models.RefSRWKV import RefSRWKV
+from RefRWKV.models.RefDiffRWKV import RefDiffRWKV
+from RefRWKV.models.EnRWKV import EnRWKV
+from RefRWKV.models.GlobalSemanticModule import GlobalSemanticModule
+from RefRWKV.RefRWKV_PL import RefRWKV_PL
 from RefRWKV.RefSR_data.RefSR_dataset import RefPNGDataset
 
 
@@ -113,9 +117,7 @@ def main():
 
     # 创建全局语义模块
     global_semantic = GlobalSemanticModule(
-        target_dim=cfg["model"].get("embed_dim", 64),
-        num_tokens=32,
-        use_rwkv=True,
+        base_dim=cfg["model"].get("embed_dim", 64),
     )
 
     # 5.1 RefDiffRWKV

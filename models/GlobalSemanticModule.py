@@ -75,7 +75,7 @@ class RWKV_SemanticAggregator(nn.Module):
         return semantic_tokens
 
 
-# Semantic Pyramid
+# Semantic Pyramid (基础版本，输出固定的 dim)
 class RWKV_SemanticPyramid(nn.Module):
     """32 → 16 → 8 → 4 Tokens 多尺度 Semantic Pyramid"""
 
@@ -98,17 +98,17 @@ class RWKV_SemanticPyramid(nn.Module):
         return {"e1": sem32, "e2": sem16, "e3": sem8, "latent": sem4}
 
 
-# Global Semantic Module
+# Global Semantic Module (支持多维度输出)
 class GlobalSemanticModule(nn.Module):
     """
     全局语义提取器
-    DINOv2 → 投影 → RWKV Semantic Pyramid
+    DINOv2 → 投影 → RWKV Semantic Pyramid → 可选的维度投影
     """
 
     def __init__(
         self,
         dinov2_model_name: str = "facebook/dinov2-base",
-        target_dim: int = 64,
+        base_dim: int = 64,  # 基础维度（金字塔内部使用）
         hidden_rate: int = 4,
         freeze_dinov2: bool = True,
     ):
@@ -119,13 +119,29 @@ class GlobalSemanticModule(nn.Module):
             for param in self.dinov2.parameters():
                 param.requires_grad = False
 
-        # 2. 投影
-        self.proj = nn.Linear(768, target_dim)
+        # 2. 投影到基础维度
+        self.proj = nn.Linear(768, base_dim)
 
-        # 3. RWKV Semantic Pyramid
+        # 3. RWKV Semantic Pyramid (内部使用 base_dim)
         self.semantic_pyramid = RWKV_SemanticPyramid(
-            dim=target_dim, hidden_rate=hidden_rate
+            dim=base_dim, hidden_rate=hidden_rate
         )
+
+        # 4. 为每个层级添加可选的维度投影
+        self.target_dims = {
+            "e1": base_dim,
+            "e2": base_dim * 2,
+            "e3": base_dim * 4,
+            "latent": base_dim * 8,
+        }
+        self.level_proj = nn.ModuleDict()
+        for level in ["e1", "e2", "e3", "latent"]:
+            out_dim = self.target_dims.get(level, base_dim)
+            if out_dim != base_dim:
+                self.level_proj[level] = nn.Linear(base_dim, out_dim)
+            else:
+                # 不需要投影，但为了统一处理，保留一个空的Identity层
+                self.level_proj[level] = nn.Identity()
 
     def forward(self, ref_img: torch.Tensor):
         # Resize
@@ -139,21 +155,29 @@ class GlobalSemanticModule(nn.Module):
             outputs = self.dinov2(ref_small)
             features = outputs.last_hidden_state[:, 1:, :]  # remove cls token
 
-        # 投影
+        # 投影到基础维度
         features = self.proj(features)
 
-        # RWKV Semantic Pyramid
-        sem_pyramid = self.semantic_pyramid(features)
+        # 获得基础金字塔
+        base_pyramid = self.semantic_pyramid(features)
 
-        return sem_pyramid
+        # 对各层进行维度投影
+        output_pyramid = {}
+        for level in ["e1", "e2", "e3", "latent"]:
+            tokens = base_pyramid[level]
+            output_pyramid[level] = self.level_proj[level](tokens)
+
+        return output_pyramid
 
 
 # 测试
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GlobalSemanticModule(target_dim=64).to(device).eval()
+    # 指定目标维度
+    target_dims = {"e1": 64, "e2": 128, "e3": 256, "latent": 512}
+    model = GlobalSemanticModule(base_dim=64, target_dims=target_dims).to(device).eval()
     dummy_ref = torch.randn(2, 3, 480, 480).to(device)
     with torch.no_grad():
-        sem_pyramid = model(dummy_ref)
-    print({k: v.shape for k, v in sem_pyramid.items()})
-    # 输出 e1:(2,32,64), e2:(2,16,64), e3:(2,8,64), latent:(2,4,64)
+        output = model(dummy_ref)
+    for k, v in output.items():
+        print(f"{k}: {v.shape}")

@@ -677,6 +677,7 @@ class RefDiffRWKV(nn.Module):
 
         # U-Net 结构
         dim = embed_dim
+
         self.proj_c_enc1 = nn.Linear(embed_dim, dim)
         self.proj_c_enc2 = nn.Linear(embed_dim, dim * 2)
         self.proj_c_enc3 = nn.Linear(embed_dim, dim * 4)

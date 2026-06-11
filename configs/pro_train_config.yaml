@@ -1,15 +1,16 @@
-# configs/train_config.yaml
+# configs/pro_train_config.yaml
+# python scripts/train.py --config configs/pro_train_config.yaml
 
 # 模型参数
 # ========== RefDiffRWKV 参数（主扩散模型） ==========
 model:
   img_size: 256
   patch_size: 4
-  embed_dim: 64
+  embed_dim: 
   channels: 3
-  enc_blocks: [4, 6, 6]
-  dec_blocks: [6, 6, 4]
-  latent_blocks: 8
+  enc_blocks: [6, 8, 8]
+  dec_blocks: [8, 8, 6]
+  latent_blocks: 12
   drop_path_rate: 0.1
   hidden_rate: 4
   learn_sigma: false
@@ -19,8 +20,8 @@ model:
 sr:
   inp_channels: 3
   out_channels: 3
-  dim: 48
-  num_blocks: [4, 6, 6, 8]
+  dim: 60
+  num_blocks: [6, 8, 8, 10]
   num_refinement_blocks: 8
   scale: 10
 
@@ -28,13 +29,13 @@ sr:
 enhance:
   inp_channels: 3
   out_channels: 3
-  dim: 48
-  num_blocks: [4, 6, 6, 8]
+  dim: 60
+  num_blocks: [6, 8, 8, 10]
   num_refinement_blocks: 4
 
 # 数据集参数
 data:
-  root: "/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
+  root: "/home/zhy/PROJECT/RefRWKV/RefSR_data/ALL_2"
   mode: "train"
   patch_size: 160
   scale: 10
@@ -43,17 +44,17 @@ data:
   ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
   ref_aug_probs:    [0.5, 0.5, 0.5, 0.5]
   ref_gray_prob: 0.2
-  max_samples_train: 10000
+  max_samples_train: 1000
   max_samples_val: null
   max_samples_test: null
-  batch_size: 50
+  batch_size: 4
   num_workers: 2
 
 # 训练参数
 train:
-  lr_sr: 1e-4
-  lr_diff: 4e-4
-  lr_enhance: 1e-4
+  lr_sr: 0.0001
+  lr_diff: 0.0005
+  lr_enhance: 0.0001
   warmup_epochs: 5
   max_epochs: 200
   accumulate_grad_batches: 4

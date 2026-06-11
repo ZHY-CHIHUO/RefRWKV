@@ -9,7 +9,7 @@ from torch.utils.cpp_extension import load
 
 wkv_cuda = load(
     name="bi_wkv",
-    sources=["./cuda/bi_wkv.cpp", "./cuda/bi_wkv_kernel.cu"],
+    sources=["./models/cuda/bi_wkv.cpp", "./models/cuda/bi_wkv_kernel.cu"],
     verbose=True,
     extra_cuda_cflags=[
         "-res-usage",
