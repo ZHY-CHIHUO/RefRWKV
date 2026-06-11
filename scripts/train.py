@@ -26,7 +26,7 @@ from RefRWKV.models.RefDiffRWKV import RefDiffRWKV
 from RefRWKV.models.EnRWKV import EnRWKV
 from RefRWKV.models.GlobalSemanticModule import GlobalSemanticModule
 from RefRWKV.RefRWKV_PL import RefRWKV_PL
-from RefRWKV.RefSR_data.RefSR_dataset import RefPNGDataset
+from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
 
 
 def load_config(config_path):
@@ -81,7 +81,7 @@ def main():
 
     # ========== 4. 数据集 ==========
     # Train dataset
-    train_ds = RefPNGDataset(
+    train_ds = RefLMDBDataset(
         mode="train",
         augment=data_cfg.get("augment", True),
         augment_ref=data_cfg.get("augment_ref"),
@@ -89,7 +89,7 @@ def main():
     )
 
     # Val dataset
-    val_ds = RefPNGDataset(
+    val_ds = RefLMDBDataset(
         mode="val", augment=False, augment_ref=False, **dataset_kwargs
     )
 
