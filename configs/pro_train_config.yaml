@@ -22,7 +22,7 @@ sr:
   out_channels: 3
   dim: 60
   num_blocks: [6, 8, 8, 10]
-  num_refinement_blocks: 8
+  num_refinement_blocks: 6
   scale: 10
 
 # ========== EnRWKV 参数（增强模型） ==========
@@ -31,7 +31,7 @@ enhance:
   out_channels: 3
   dim: 60
   num_blocks: [6, 8, 8, 10]
-  num_refinement_blocks: 4
+  num_refinement_blocks: 6
 
 # 数据集参数
 data:

@@ -105,11 +105,14 @@ class RefRWKV_PL(pl.LightningModule):
             loss_sr = F.l1_loss(I_start, hr)
 
         # ------------------ 2. 扩散损失 (RefDiffRWKV) ------------------
-        t = torch.randint(1, self.num_timesteps, (B,), device=device)
-        noise = torch.randn_like(hr)
-        x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
-        pred_noise = self.model_diff(x_t, t, lr, ref)
-        loss_diff = ((pred_noise - noise) ** 2).mean()
+        loss_diff = 0.0
+        if self.train_diff:
+            t = torch.randint(1, self.num_timesteps, (B,), device=device)
+            noise = torch.randn_like(hr)
+            x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
+            pred_noise = self.model_diff(x_t, t, lr, ref)
+            pred_noise = torch.clamp(pred_noise, -5.0, 5.0)
+            loss_diff = ((pred_noise - noise) ** 2).mean()
 
         # ------------------ 3. 增强损失 (EnRWKV) ------------------
         loss_enhance = 0.0

@@ -107,7 +107,7 @@ class RefPNGDataset(Dataset):
 
     def _load_image(self, path):
         img = Image.open(path).convert("RGB")
-        return np.array(img, dtype=np.float32) / 255.0
+        return (np.array(img, dtype=np.float32) / 127.5) - 1.0
 
     # ---------- 参考图风格增强 ----------
     def _augment_ref(self, ref_img: Image.Image) -> Image.Image:
@@ -155,30 +155,26 @@ class RefPNGDataset(Dataset):
 
     # ---------- 随机裁剪 ----------
     def _random_crop(self, lr, hr, ref):
-        th_lr = self.patch_size // self.scale
-        tw_lr = self.patch_size // self.scale
-
-        H_lr, W_lr = lr.shape[:2]
         H_hr, W_hr = hr.shape[:2]
+        H_lr, W_lr = lr.shape[:2]
 
+        # 确保图像尺寸不小于目标 patch
         if H_hr < self.patch_size or W_hr < self.patch_size:
-            raise ValueError(
-                f"HR image {H_hr}×{W_hr} smaller than patch {self.patch_size}"
-            )
-        if H_lr < th_lr or W_lr < tw_lr:
-            raise ValueError(
-                f"LR image {H_lr}×{W_lr} smaller than required LR patch {th_lr}×{tw_lr}"
-            )
+            raise ValueError(f"HR image {H_hr}×{W_hr} smaller than patch {self.patch_size}")
+        if H_lr < self.lr_patch_size or W_lr < self.lr_patch_size:
+            raise ValueError(f"LR image {H_lr}×{W_lr} smaller than LR patch {self.lr_patch_size}")
 
-        y_lr = random.randint(0, H_lr - th_lr)
-        x_lr = random.randint(0, W_lr - tw_lr)
+        # 在 HR 上随机选择起始点（保证 patch 不越界）
+        y_hr = random.randint(0, H_hr - self.patch_size)
+        x_hr = random.randint(0, W_hr - self.patch_size)
 
-        y_hr = y_lr * self.scale
-        x_hr = x_lr * self.scale
+        # 对应的 LR 坐标（整除 scale，无需额外检查，因为 LR 尺寸已校验）
+        y_lr = y_hr // self.scale
+        x_lr = x_hr // self.scale
 
-        lr_crop = lr[y_lr : y_lr + th_lr, x_lr : x_lr + tw_lr]
-        hr_crop = hr[y_hr : y_hr + self.patch_size, x_hr : x_hr + self.patch_size]
-        ref_crop = ref[y_hr : y_hr + self.patch_size, x_hr : x_hr + self.patch_size]
+        lr_crop = lr[y_lr:y_lr + self.lr_patch_size, x_lr:x_lr + self.lr_patch_size]
+        hr_crop = hr[y_hr:y_hr + self.patch_size, x_hr:x_hr + self.patch_size]
+        ref_crop = ref[y_hr:y_hr + self.patch_size, x_hr:x_hr + self.patch_size]
 
         return lr_crop, hr_crop, ref_crop
 
@@ -213,7 +209,7 @@ class RefPNGDataset(Dataset):
         ref_pil = Image.open(self.ref_dir / f"{name}.png").convert("RGB")
         if self.augment_ref:
             ref_pil = self._augment_ref(ref_pil)
-        ref = np.array(ref_pil, dtype=np.float32) / 255.0
+        ref = (np.array(ref_pil, dtype=np.float32) / 127.5) - 1.0
 
         # 随机裁剪（若需要）
         if self.patch_size is not None:
@@ -241,9 +237,9 @@ class RefPNGDataset(Dataset):
 def main():
     from torch.utils.data import DataLoader
 
-    data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
+    data_root = r"RefRWKV/RefSR_data/ALL_2"
     max_samples = (1000, 200, None)
-    patch_size = 128
+    patch_size = 160
     batch_size = 4
 
     train_ds = RefPNGDataset(

@@ -455,7 +455,7 @@ class RefSRWKV(nn.Module):
         refine_input = torch.cat([out, hr1], dim=1)  # (B,6,480,480)
         residual = self.hr_refine(refine_input)  # (B,3,480,480)
         out = out + residual
-        out = torch.clamp(out, 0., 1.)
+        out = torch.clamp(out, -1., 1.)
 
         if label is None:
             return out
