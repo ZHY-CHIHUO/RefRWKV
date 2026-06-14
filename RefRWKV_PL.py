@@ -22,6 +22,8 @@ class RefRWKV_PL(pl.LightningModule):
         train_sr: bool = True,  # 是否训练超分模型（RefSRWKV）
         train_diff: bool = True,  # 是否训练扩散模型（RefDiffRWKV）
         train_enhance: bool = True,  # 是否训练增强模型（EnRWKV）
+        # ref丢失概率
+        cfg_drop_prob: float = 0.1,
         t_enhance_threshold: int = 250,  # 增强损失只对 t < 此阈值的样本计算，避免噪声太大时训练
         # 扩散参数
         num_timesteps: int = 1000,  # 扩散总步数
@@ -46,6 +48,7 @@ class RefRWKV_PL(pl.LightningModule):
         self.model_sr = model_sr
         self.model_diff = model_diff
         self.model_enhance = model_enhance
+        self.cfg_drop_prob = cfg_drop_prob
         self.t_enhance_threshold = t_enhance_threshold
         self.train_sr = train_sr
         self.train_diff = train_diff
@@ -76,6 +79,20 @@ class RefRWKV_PL(pl.LightningModule):
             param.requires_grad = self.train_diff
         for param in self.model_enhance.parameters():
             param.requires_grad = self.train_enhance
+
+    def set_train_flags(self, train_sr=None, train_diff=None, train_enhance=None):
+        if train_sr is not None:
+            self.train_sr = train_sr
+            for p in self.model_sr.parameters():
+                p.requires_grad = train_sr
+        if train_diff is not None:
+            self.train_diff = train_diff
+            for p in self.model_diff.parameters():
+                p.requires_grad = train_diff
+        if train_enhance is not None:
+            self.train_enhance = train_enhance
+            for p in self.model_enhance.parameters():
+                p.requires_grad = train_enhance
 
     def _add_noise(self, x0, noise, t):
         """添加噪声的余弦调度 (同原代码)"""
@@ -111,22 +128,20 @@ class RefRWKV_PL(pl.LightningModule):
             noise = torch.randn_like(hr)
             x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
 
-            # ✅ CFG：随机丢弃条件（10%~15% 概率）
-            cfg_drop_prob = 0.1  # 可设为超参
-            if torch.rand(1).item() < cfg_drop_prob:
-                # 丢弃条件：lr 和 ref 都置零（或用可学习的空嵌入）
-                lr_cond = torch.zeros_like(lr)
-                ref_cond = torch.zeros_like(ref)
+            # ✅ CFG：仅训练时，逐样本随机丢弃 Ref（纹理条件），LR 始终保留
+            if self.training:
+                drop_mask = torch.rand(B, device=device) < self.cfg_drop_prob  # (B,) 逐样本
+                drop_mask_exp = drop_mask.view(B, 1, 1, 1)
+                ref_cond = torch.where(drop_mask_exp, torch.zeros_like(ref), ref)
             else:
-                lr_cond = lr
                 ref_cond = ref
+
+            lr_cond = lr  # LR 结构条件始终保留
 
             pred_noise = self.model_diff(x_t, t, lr_cond, ref_cond)
             snr = alpha_bar / (1 - alpha_bar)
             gamma = 5.0
-            loss_weight = torch.minimum(
-                snr, torch.full_like(snr, gamma)
-            )  # 直接用 min(SNR, γ)
+            loss_weight = torch.minimum(snr, torch.full_like(snr, gamma))
             loss_diff = (loss_weight * ((pred_noise - noise) ** 2)).mean()
 
         # ---------- 3. 增强损失 (EnRWKV) ----------

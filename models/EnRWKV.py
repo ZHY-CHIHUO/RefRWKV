@@ -60,8 +60,8 @@ class EnRWKV(nn.Module):
 
     def __init__(
         self,
-        inp_channels=1,  # 输入图像通道数（默认灰度图1）
-        out_channels=1,  # 输出图像通道数
+        inp_channels=3,  # 输入图像通道数
+        out_channels=3,  # 输出图像通道数
         dim=48,  # 第一层特征通道数（基础宽度）
         num_blocks=[4, 6, 6, 8],  # 各编码/解码级的 Block 数量，依次为 level1 ~ level4
         num_refinement_blocks=4,  # 解码器末尾额外添加的细化 Block 数量
@@ -139,6 +139,16 @@ class EnRWKV(nn.Module):
             int(dim * 2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=True
         )
 
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+
     def forward(self, inp_img, label=None):
         """
         前向传播。
@@ -200,3 +210,4 @@ class EnRWKV(nn.Module):
             return out
         else:
             return self.loss_fun(out, label)
+

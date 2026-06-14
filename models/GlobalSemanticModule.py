@@ -102,70 +102,81 @@ class RWKV_SemanticPyramid(nn.Module):
 class GlobalSemanticModule(nn.Module):
     """
     全局语义提取器
-    DINOv2 → 投影 → RWKV Semantic Pyramid → 可选的维度投影
+    DINOv2 → 投影 → RWKV Semantic Pyramid → U-Net 层级维度投影
+
+    参数:
+        dinov2_model_name: DINOv2 模型名（自动读取 hidden_size）
+        base_dim:          金字塔内部的工作维度
+        unet_dim:          U-Net 第一层的 embed_dim（后续层自动 ×1, ×2, ×4, ×8）
+        hidden_rate:       RWKV FFN 隐藏层倍率
+        freeze_dinov2:     是否冻结 DINOv2
     """
 
     def __init__(
         self,
         dinov2_model_name: str = "facebook/dinov2-base",
-        base_dim: int = 64,  # 基础维度（金字塔内部使用）
+        base_dim: int = 64,
+        unet_dim: int = 384,
         hidden_rate: int = 4,
         freeze_dinov2: bool = True,
     ):
         super().__init__()
-        # 1. DINOv2 Backbone
+        self.freeze_dinov2 = freeze_dinov2
+
+        # 1. DINOv2 Backbone（自动检测 hidden_size）
         self.dinov2 = AutoModel.from_pretrained(dinov2_model_name)
+        dino_dim = self.dinov2.config.hidden_size  # 768 for base, 384 for small, ...
         if freeze_dinov2:
             for param in self.dinov2.parameters():
                 param.requires_grad = False
 
         # 2. 投影到基础维度
-        self.proj = nn.Linear(768, base_dim)
+        self.proj = nn.Linear(dino_dim, base_dim)  # ← 不再写死 768
 
-        # 3. RWKV Semantic Pyramid (内部使用 base_dim)
+        # 3. RWKV Semantic Pyramid
         self.semantic_pyramid = RWKV_SemanticPyramid(
             dim=base_dim, hidden_rate=hidden_rate
         )
 
-        # 4. 为每个层级添加可选的维度投影
-        self.target_dims = {
-            "e1": base_dim,
-            "e2": base_dim * 2,
-            "e3": base_dim * 4,
-            "latent": base_dim * 8,
+        # 4. 投影到 U-Net 各层实际维度
+        #    金字塔输出全是 (B, N, base_dim)
+        #    → 分别投影到 enc1(×1), enc2(×2), enc3(×4), latent(×8) 的通道数
+        dim_map = {
+            "e1":     unet_dim,
+            "e2":     unet_dim * 2,
+            "e3":     unet_dim * 4,
+            "latent": unet_dim * 8,
         }
         self.level_proj = nn.ModuleDict()
-        for level in ["e1", "e2", "e3", "latent"]:
-            out_dim = self.target_dims.get(level, base_dim)
-            if out_dim != base_dim:
-                self.level_proj[level] = nn.Linear(base_dim, out_dim)
+        for level, target_dim in dim_map.items():
+            if target_dim != base_dim:
+                self.level_proj[level] = nn.Linear(base_dim, target_dim)
             else:
-                # 不需要投影，但为了统一处理，保留一个空的Identity层
-                self.level_proj[level] = nn.Identity()
+                self.level_proj[level] = None  # 无需投影
 
     def forward(self, ref_img: torch.Tensor):
-        # Resize
+        # Resize 到 DINOv2 的固定输入尺寸
         if ref_img.shape[-2:] != (224, 224):
             ref_small = F.interpolate(ref_img, size=(224, 224), mode="bilinear")
         else:
             ref_small = ref_img
 
-        # DINO Features
-        with torch.no_grad():
+        # DINOv2 特征（根据 freeze 状态决定是否追踪梯度）
+        ctx = torch.no_grad() if self.freeze_dinov2 else torch.enable_grad()
+        with ctx:
             outputs = self.dinov2(ref_small)
-            features = outputs.last_hidden_state[:, 1:, :]  # remove cls token
+            features = outputs.last_hidden_state[:, 1:, :]  # (B, 256, dino_dim)
 
-        # 投影到基础维度
-        features = self.proj(features)
-
-        # 获得基础金字塔
+        # 投影 → 金字塔
+        features = self.proj(features)                       # (B, 256, base_dim)
         base_pyramid = self.semantic_pyramid(features)
 
-        # 对各层进行维度投影
+        # 层级维度投影
         output_pyramid = {}
         for level in ["e1", "e2", "e3", "latent"]:
-            tokens = base_pyramid[level]
-            output_pyramid[level] = self.level_proj[level](tokens)
+            tokens = base_pyramid[level]                     # (B, N, base_dim)
+            proj = self.level_proj[level]
+            output_pyramid[level] = proj(tokens) if proj is not None else tokens
 
         return output_pyramid
 
