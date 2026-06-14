@@ -101,30 +101,45 @@ class RefRWKV_PL(pl.LightningModule):
         # ---------- 1. 超分损失 (RefSRWKV) ----------
         loss_sr = torch.tensor(0.0, device=device)
         if self.train_sr:
-            I_start = self.model_sr(lr, ref, label=None)
+            I_start = self.model_sr(lr, ref)
             loss_sr = F.l1_loss(I_start, hr)
 
-        # ---------- 2. 扩散损失 (RefDiffRWKV) ----------
+        # ---------- 2. 扩散损失 (RefDiffRWKV) + CFG ----------
         loss_diff = torch.tensor(0.0, device=device)
         if self.train_diff:
             t = torch.randint(1, self.num_timesteps, (B,), device=device)
             noise = torch.randn_like(hr)
             x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
-            pred_noise = self.model_diff(x_t, t, lr, ref)
-            snr = alpha_bar / (1 - alpha_bar)           # shape: (B,)
+
+            # ✅ CFG：随机丢弃条件（10%~15% 概率）
+            cfg_drop_prob = 0.1  # 可设为超参
+            if torch.rand(1).item() < cfg_drop_prob:
+                # 丢弃条件：lr 和 ref 都置零（或用可学习的空嵌入）
+                lr_cond = torch.zeros_like(lr)
+                ref_cond = torch.zeros_like(ref)
+            else:
+                lr_cond = lr
+                ref_cond = ref
+
+            pred_noise = self.model_diff(x_t, t, lr_cond, ref_cond)
+            snr = alpha_bar / (1 - alpha_bar)
             gamma = 5.0
-            loss_weight = torch.minimum(snr, torch.full_like(snr, gamma))   # 直接用 min(SNR, γ)
+            loss_weight = torch.minimum(
+                snr, torch.full_like(snr, gamma)
+            )  # 直接用 min(SNR, γ)
             loss_diff = (loss_weight * ((pred_noise - noise) ** 2)).mean()
-
-
 
         # ---------- 3. 增强损失 (EnRWKV) ----------
         loss_enhance = torch.tensor(0.0, device=device)
         if self.train_enhance:
             # 增强训练时，限制 t 范围，确保每个 batch 都有有效样本
-            t_enhance = torch.randint(1, self.t_enhance_threshold + 1, (B,), device=device)
+            t_enhance = torch.randint(
+                1, self.t_enhance_threshold + 1, (B,), device=device
+            )
             noise_enhance = torch.randn_like(hr)
-            x_t_enhance, noise_enhance, alpha_bar_enhance = self._add_noise(hr, noise_enhance, t_enhance)
+            x_t_enhance, noise_enhance, alpha_bar_enhance = self._add_noise(
+                hr, noise_enhance, t_enhance
+            )
 
             with torch.no_grad():
                 pred_noise_enhance = self.model_diff(x_t_enhance, t_enhance, lr, ref)
@@ -140,13 +155,33 @@ class RefRWKV_PL(pl.LightningModule):
             loss_enhance = F.l1_loss(refined, hr)
 
         # ---------- 4. 总损失 ----------
-        total_loss = loss_diff + self.loss_sr_weight * loss_sr + self.loss_enhance_weight * loss_enhance
+        total_loss = (
+            loss_diff
+            + self.loss_sr_weight * loss_sr
+            + self.loss_enhance_weight * loss_enhance
+        )
 
         # 日志记录
-        self.log(f"{stage}-loss_sr", loss_sr, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"{stage}-loss_diff", loss_diff, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"{stage}-loss_enhance", loss_enhance, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"{stage}-loss_total", total_loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(
+            f"{stage}-loss_sr", loss_sr, prog_bar=True, on_step=True, on_epoch=True
+        )
+        self.log(
+            f"{stage}-loss_diff", loss_diff, prog_bar=True, on_step=True, on_epoch=True
+        )
+        self.log(
+            f"{stage}-loss_enhance",
+            loss_enhance,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+        )
+        self.log(
+            f"{stage}-loss_total",
+            total_loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+        )
 
         return total_loss
 
