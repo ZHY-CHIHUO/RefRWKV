@@ -1,151 +1,337 @@
 #!/usr/bin/env python
-# test_noise_mse_x0.py
+# -*- coding: utf-8 -*-
+"""
+RefRWKV 测试脚本
+Better Start (RefSRWKV) → SDEdit 扩散去噪 → EnRWKV 增强 → IQA 评估
+"""
+
+import argparse
 import os
-import torch
-import torch.nn.functional as F
-from tqdm import tqdm
+import sys
 from pathlib import Path
 import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from PIL import Image
 
-# 添加项目根目录
-import sys
+# 项目路径（根据实际结构调整）
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from RWKV.models.RefRWKV.RefDiffRWKV import RefDiffRWKV, RefDiffRWKV_PL
-from RWKV.RefSR_data.RefSR_dataset import RefPNGDataset
-
-
-def add_noise(hr, t, num_timesteps=1000, s=0.008):
-    """余弦噪声调度"""
-    alpha_bar = (
-        torch.cos(((t.float() / num_timesteps + s) / (1 + s)) * torch.pi / 2) ** 2
-    )
-    alpha_bar = alpha_bar.view(-1, 1, 1, 1)
-    noise = torch.randn_like(hr)
-    x_t = torch.sqrt(alpha_bar) * hr + torch.sqrt(1 - alpha_bar) * noise
-    return x_t, noise, alpha_bar
+from RefRWKV.models.RefSRWKV import RefSRWKV
+from RefRWKV.models.RefDiffRWKV import RefDiffRWKV
+from RefRWKV.models.EnRWKV import EnRWKV
+from RefRWKV.models.GlobalSemanticModule import GlobalSemanticModule
+from RefRWKV.RefRWKV_PL import RefRWKV_PL
+from RefRWKV.RefSR_data.RefPNGDataset import RefPNGDataset
+from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
 
-def test_fixed_t_mse(model, test_loader, device, num_timesteps=1000):
-    """测试2: 固定 t 的 noise MSE 曲线"""
-    t_list = list(range(0, 1000, 10))  # 0, 10, 20, ..., 990
-    # 如果你希望包含 999 作为终点，可以补充：
-    t_list.append(999)
-    mse_dict = {t: 0.0 for t in t_list}
-    count_dict = {t: 0 for t in t_list}
-
-    model.eval()
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing fixed-t noise MSE"):
-            lr, hr, ref = batch
-            lr = lr.to(device, dtype=torch.float32)
-            hr = hr.to(device, dtype=torch.float32)
-            ref = ref.to(device, dtype=torch.float32)
-            B = hr.shape[0]
-
-            for t_val in t_list:
-                t = torch.full((B,), t_val, device=device, dtype=torch.long)
-                x_t, noise, _ = add_noise(hr, t, num_timesteps=num_timesteps)
-                pred_noise = model(x_t, t, lr, ref)
-                loss = F.mse_loss(pred_noise, noise, reduction="mean")
-                mse_dict[t_val] += loss.item() * B
-                count_dict[t_val] += B
-
-    mse_dict = {t: mse_dict[t] / count_dict[t] for t in t_list}
-    print("\nFixed-t Noise MSE:")
-    for t in t_list:
-        print(f"t={t}: MSE={mse_dict[t]:.6f}")
-
-    return mse_dict
+# -------------------- 扩散工具函数 --------------------
+def get_diffusion_schedule(num_timesteps, device):
+    """与训练一致的余弦 schedule"""
+    s = 0.008
+    T = num_timesteps
+    t = torch.arange(0, T, device=device, dtype=torch.float32)
+    alpha_bar = torch.cos(((t / T + s) / (1 + s)) * np.pi / 2) ** 2
+    alpha_bar = alpha_bar / alpha_bar[0]
+    betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
+    betas = torch.cat([betas, 1 - alpha_bar[-1:]])
+    betas = torch.clamp(betas, max=0.999)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    return alphas, alpha_bars, betas
 
 
-def test_x0_recovery(model, test_loader, device, num_timesteps=1000):
-    """测试3: x0 预测能力（PSNR/MSE）"""
-    psnr_list = []
-    mse_list = []
-
-    model.eval()
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing x0 recovery"):
-            lr, hr, ref = batch
-            lr = lr.to(device, dtype=torch.float32)
-            hr = hr.to(device, dtype=torch.float32)
-            ref = ref.to(device, dtype=torch.float32)
-            B = hr.shape[0]
-
-            # 随机 t
-            t = torch.randint(0, num_timesteps, (B,), device=device)
-            x_t, noise, alpha_bar = add_noise(hr, t, num_timesteps=num_timesteps)
-            pred_noise = model(x_t, t, lr, ref)
-
-            # 预测 x0
-            pred_x0 = (x_t - torch.sqrt(1 - alpha_bar) * pred_noise) / torch.sqrt(
-                alpha_bar
-            )
-            mse = F.mse_loss(pred_x0, hr, reduction="mean").item()
-            mse_list.append(mse)
-
-            # PSNR
-            mse_pixel = ((pred_x0 - hr) ** 2).mean().item()
-            psnr = 10 * np.log10(1.0 / mse_pixel)
-            psnr_list.append(psnr)
-
-    avg_mse = np.mean(mse_list)
-    avg_psnr = np.mean(psnr_list)
-    print(f"\nX0 Recovery - Avg MSE: {avg_mse:.6f}, Avg PSNR: {avg_psnr:.2f} dB")
-    return avg_mse, avg_psnr
+def add_noise(x0, noise, alpha_bar_t):
+    sqrt_alpha_bar = torch.sqrt(alpha_bar_t)
+    sqrt_one_minus = torch.sqrt(1 - alpha_bar_t)
+    return sqrt_alpha_bar * x0 + sqrt_one_minus * noise
 
 
+@torch.no_grad()
+def sdedit_sample(model_diff, x_start, lr, ref, num_timesteps,
+                  start_step, sampling_steps, device):
+    B = x_start.shape[0]
+    alphas, alpha_bars, betas = get_diffusion_schedule(num_timesteps, device)
+
+    # 1. 加噪到 start_step
+    noise = torch.randn_like(x_start)
+    alpha_bar_start = alpha_bars[start_step].view(-1, 1, 1, 1)
+    x_t = add_noise(x_start, noise, alpha_bar_start)
+
+    # 2. 构建去噪时间步
+    if start_step >= sampling_steps:
+        # linspace 产生从 start_step 到 0 的采样步数+1 个均匀点
+        raw_times = torch.linspace(start_step, 0, sampling_steps + 1,
+                                device=device).long()
+        # 去重 + 翻转得到降序排列（避免 sorted=True 的兼容性问题）
+        times = torch.unique(raw_times).flip(0)
+    else:
+        # start_step < sampling_steps: 逐步下降
+        times = torch.arange(start_step, -1, -1, device=device)
+
+
+    times = times[1:]
+    if times[-1] != 0:
+        times = torch.cat([times, torch.tensor([0], device=device)])
+
+    # 3. 逐步去噪
+    for t in tqdm(times, desc='SDEdit denoising'):
+        t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+        noise_pred = model_diff(x_t, t_batch, lr, ref)
+
+        alpha = alphas[t].view(-1, 1, 1, 1)
+        alpha_bar = alpha_bars[t].view(-1, 1, 1, 1)
+        beta = betas[t].view(-1, 1, 1, 1)
+
+        x_t = (1 / torch.sqrt(alpha)) * (
+            x_t - (1 - alpha) / torch.sqrt(1 - alpha_bar) * noise_pred
+        )
+        if t > 0:
+            noise = torch.randn_like(x_t)
+            x_t = x_t + torch.sqrt(beta) * noise
+    return x_t
+
+
+# -------------------- 主函数 --------------------
 def main():
-    # 配置
-    model_ckpt = "checkpoints/last-v1.ckpt"
-    data_root = "/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 1
+    parser = argparse.ArgumentParser(description='RefRWKV Test')
+    parser.add_argument('--config', type=str, default='configs/test_config.yaml',
+                        help='测试配置文件')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='覆盖配置文件中的 checkpoint 路径')
+    parser.add_argument('--output', type=str, default=None,
+                        help='覆盖输出目录')
+    parser.add_argument('--ntest', type=int, default=None,
+                        help='覆盖测试样本数')
+    parser.add_argument('--save_images', action='store_true', default=None,
+                        help='覆盖是否保存图像')
+    parser.add_argument('--no_save', action='store_true',
+                        help='强制不保存图像')
+    parser.add_argument('--device', type=str, default=None,
+                        help='覆盖设备')
+    parser.add_argument('--sampling_steps', type=int, default=None)
+    parser.add_argument('--diff_start_step', type=int, default=None)
+    parser.add_argument('--use_sr', action='store_true', default=None)
+    parser.add_argument('--no_sr', action='store_true')
+    parser.add_argument('--use_diff', action='store_true', default=None)
+    parser.add_argument('--no_diff', action='store_true')
+    parser.add_argument('--use_enhance', action='store_true', default=None)
+    parser.add_argument('--no_enhance', action='store_true')
+    parser.add_argument('--seed', type=int, default=None)
+    args = parser.parse_args()
 
-    # 加载模型
-    base_model = RefDiffRWKV(
-        img_size=480,
-        patch_size=4,
-        embed_dim=64,
-        enc_blocks=[4, 6, 6],
-        dec_blocks=[6, 6, 4],
-        latent_blocks=8,
-        drop_path_rate=0.0,
-        upsample_mode="cnn",
-        channels=3,
-    )
-    pl_model = RefDiffRWKV_PL.load_from_checkpoint(
-        model_ckpt, model=base_model, strict=False
-    )
-    model = pl_model.model.to(device).float()
-    model.eval()
+    # ---------- 加载配置文件 ----------
+    with open(args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
 
-    # 测试数据集
-    test_dataset = RefPNGDataset(
-        data_dir=data_root,
-        mode="test",
-        patch_size=160,
+    test_cfg = cfg.get('test', {})
+    model_cfg = cfg.get('model', {})
+    sr_cfg = cfg.get('sr', {})
+    enhance_cfg = cfg.get('enhance', {})
+    data_cfg = cfg['data']
+
+    # 命令行参数覆盖配置文件
+    checkpoint = args.checkpoint or test_cfg.get('checkpoint', 'checkpoints/last.ckpt')
+    output_dir = args.output or test_cfg.get('output_dir', 'results/test')
+    device_str = args.device or test_cfg.get('device', 'cuda')
+    save_images = args.save_images if args.save_images is not None else test_cfg.get('save_images', True)
+    if args.no_save:
+        save_images = False
+
+    ntest = args.ntest if args.ntest is not None else test_cfg.get('ntest', None)
+    seed = args.seed if args.seed is not None else test_cfg.get('seed', 42)
+
+    use_sr = test_cfg.get('use_sr', True)
+    if args.use_sr:
+        use_sr = True
+    if args.no_sr:
+        use_sr = False
+
+    use_diff = test_cfg.get('use_diff', True)
+    if args.use_diff:
+        use_diff = True
+    if args.no_diff:
+        use_diff = False
+
+    use_enhance = test_cfg.get('use_enhance', True)
+    if args.use_enhance:
+        use_enhance = True
+    if args.no_enhance:
+        use_enhance = False
+
+    sampling_steps = args.sampling_steps if args.sampling_steps is not None else test_cfg.get('sampling_steps', 50)
+    diff_start_step = args.diff_start_step if args.diff_start_step is not None else test_cfg.get('diff_start_step', 200)
+    num_timesteps = test_cfg.get('num_timesteps', 1000)
+
+    # ---------- 随机种子 ----------
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # ---------- 构建模型 ----------
+    global_semantic = GlobalSemanticModule(base_dim=model_cfg.get('embed_dim', 64))
+
+    model_diff = RefDiffRWKV(
+        img_size=model_cfg.get('img_size', 256),
+        patch_size=model_cfg.get('patch_size', 4),
+        embed_dim=model_cfg.get('embed_dim', 64),
+        channels=model_cfg.get('channels', 3),
+        enc_blocks=model_cfg.get('enc_blocks', [4, 6, 6]),
+        dec_blocks=model_cfg.get('dec_blocks', [6, 6, 4]),
+        latent_blocks=model_cfg.get('latent_blocks', 8),
+        drop_path_rate=model_cfg.get('drop_path_rate', 0.1),
+        hidden_rate=model_cfg.get('hidden_rate', 4),
+        learn_sigma=model_cfg.get('learn_sigma', False),
+        upsample_mode=model_cfg.get('upsample_mode', 'cnn'),
+        global_semantic=global_semantic,
+    )
+    model_sr = RefSRWKV(
+        inp_channels=sr_cfg.get('inp_channels', 3),
+        out_channels=sr_cfg.get('out_channels', 3),
+        dim=sr_cfg.get('dim', 48),
+        num_blocks=sr_cfg.get('num_blocks', [4, 6, 6, 8]),
+        num_refinement_blocks=sr_cfg.get('num_refinement_blocks', 8),
+        scale=sr_cfg.get('scale', 10),
+    )
+    model_enhance = EnRWKV(
+        inp_channels=enhance_cfg.get('inp_channels', 3),
+        out_channels=enhance_cfg.get('out_channels', 3),
+        dim=enhance_cfg.get('dim', 48),
+        num_blocks=enhance_cfg.get('num_blocks', [4, 6, 6, 8]),
+        num_refinement_blocks=enhance_cfg.get('num_refinement_blocks', 4),
+    )
+
+    pl_model = RefRWKV_PL.load_from_checkpoint(
+        checkpoint,
+        model_sr=model_sr,
+        model_diff=model_diff,
+        model_enhance=model_enhance,
+        strict=False,
+    )
+    device = torch.device(device_str)
+    pl_model.to(device)
+    pl_model.eval()
+
+    # 如果配置未显式指定开关，且 checkpoint 中有训练标志，可回退到 checkpoint 配置（这里直接使用我们的变量，用户可控）
+    # 若用户想依据训练开关自动决定，可自行添加逻辑；此处保持显式可控
+
+    # ---------- 测试数据集 ----------
+    test_ds = RefPNGDataset(
+        mode='test',
+        data_dir=data_cfg['root'],
+        patch_size=data_cfg.get('patch_size'),   # 测试时设为 None 可处理全图
+        scale=data_cfg.get('scale', 10),
+        ref_aug_strengths=data_cfg.get('ref_aug_strengths', [0.12, 0.12, 0.12, 0.03]),
+        ref_aug_probs=data_cfg.get('ref_aug_probs', [0.5, 0.5, 0.5, 0.5]),
+        ref_gray_prob=data_cfg.get('ref_gray_prob', 0.2),
+        max_samples=(data_cfg.get('max_samples_train'),
+                     data_cfg.get('max_samples_val'),
+                     data_cfg.get('max_samples_test')),
+        sample_seed=seed,
         augment=False,
-        max_samples=(None, None, 100),
-        sample_seed=42,
+        augment_ref=False,
     )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=batch_size,
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=data_cfg.get('batch_size', 1),
         shuffle=False,
-        num_workers=2,
+        num_workers=data_cfg.get('num_workers', 4),
         pin_memory=True,
     )
 
-    # 测试2: 固定 t 的 noise MSE
-    test_fixed_t_mse(model, test_loader, device)
+    # 输出目录
+    out_dir = Path(output_dir)
+    img_dir = out_dir / 'images'
+    gt_dir = out_dir / 'gt'
+    sr_dir = out_dir / 'sr'
+    if save_images:
+        img_dir.mkdir(parents=True, exist_ok=True)
+        gt_dir.mkdir(parents=True, exist_ok=True)
+        sr_dir.mkdir(parents=True, exist_ok=True) 
 
-    # 测试3: x0 recovery
-    test_x0_recovery(model, test_loader, device)
+    img_size = model_cfg.get('img_size', 256)
+    diff_start_step = min(diff_start_step, num_timesteps - 1)
+
+    print(f"Configuration summary:")
+    print(f"  Checkpoint: {checkpoint}")
+    print(f"  Output dir: {output_dir}")
+    print(f"  Device: {device_str}")
+    print(f"  SR={use_sr}, Diffusion={use_diff}, Enhance={use_enhance}")
+    print(f"  SDEdit: start_step={diff_start_step}, sampling_steps={sampling_steps}")
+    print(f"  N test: {ntest}, Save images: {save_images}")
+
+    # ---------- 推理 ----------
+    idx = 0
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc='Testing'):
+            lr, hr, ref = batch
+            lr = lr.to(device)
+            hr = hr.to(device)
+            ref = ref.to(device)
+
+            if ntest is not None and idx >= ntest:
+                break
+
+            # Step 1: RefSRWKV 超分
+            if use_sr:
+                I_start = pl_model.model_sr(lr, ref, label=None)
+            else:
+                I_start = F.interpolate(lr, size=(img_size, img_size),
+                                        mode='bicubic', align_corners=False)
+            
+            if save_images:                
+                I_start_save = (I_start + 1.0) / 2.0                
+                I_start_save = torch.clamp(I_start_save, 0.0, 1.0)                
+                sr_np = (I_start_save[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)                
+                Image.fromarray(sr_np).save(sr_dir / f"{idx:05d}.png")
+
+            # Step 2: 扩散去噪
+            if use_diff and sampling_steps > 0:
+                I_out = sdedit_sample(
+                    pl_model.model_diff,
+                    I_start, lr, ref,
+                    num_timesteps, diff_start_step, sampling_steps, device,
+                )
+            else:
+                I_out = I_start
+
+            # Step 3: 增强
+            if use_enhance:
+                I_out = pl_model.model_enhance(I_out, label=None)
+
+            # 回到 [0,1]
+            I_out = (I_out + 1.0) / 2.0
+            I_out = torch.clamp(I_out, 0.0, 1.0)
+
+            # 保存
+            if save_images:
+                out_np = (I_out[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                Image.fromarray(out_np).save(img_dir / f"{idx:05d}.png")
+                gt_np = (hr[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                Image.fromarray(gt_np).save(gt_dir / f"{idx:05d}.png")
+
+            idx += 1
+
+    print(f"Done. Processed {idx} images.")
+
+    # ---------- IQA 评估 ----------
+    if save_images and idx > 0 and test_cfg.get('iqa_enabled', True):
+        print("Starting IQA evaluation...")
+        engine = IQAEngine(device=device_str)
+        engine.evaluate_folder(
+            pred_dir=str(img_dir),
+            gt_dir=str(gt_dir) if gt_dir.exists() else None,
+            ntest=None,
+            out_path=str(out_dir),
+        )
+    elif not save_images:
+        print("Images not saved, skipping IQA. Use --save_images or enable in config.")
+    else:
+        print("No images processed, skipping IQA.")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

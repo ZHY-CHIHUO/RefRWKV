@@ -28,6 +28,8 @@ from RefRWKV.models.GlobalSemanticModule import GlobalSemanticModule
 from RefRWKV.RefRWKV_PL import RefRWKV_PL
 from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 
 def load_config(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
@@ -99,7 +101,7 @@ def main():
         shuffle=True,
         num_workers=data_cfg["num_workers"],
         pin_memory=True,
-        persistent_workers=True,
+        # persistent_workers=True,
     )
 
     val_loader = DataLoader(
@@ -185,7 +187,7 @@ def main():
     callbacks = [
         EarlyStopping(
             monitor="val-loss_total",
-            patience=15,
+            patience=5,
             mode="min",
             verbose=True,
         ),
@@ -220,7 +222,7 @@ def main():
     print(f"   Batch Size: {data_cfg['batch_size']}")
 
     # ========== 8. 检查点恢复 ==========
-    last_ckpt = os.path.join(checkpoint_dir, "last.ckpt")
+    last_ckpt = os.path.join(checkpoint_dir, "last-v1.ckpt")
     ckpt_path = last_ckpt if os.path.exists(last_ckpt) else None
 
     if ckpt_path:
@@ -234,6 +236,17 @@ def main():
         val_dataloaders=val_loader,
         ckpt_path=ckpt_path,
     )
+
+    # last_ckpt = os.path.join(checkpoint_dir, "last.ckpt")
+    # if os.path.exists(last_ckpt):
+    #     print(f"加载模型权重（不恢复优化器）从: {last_ckpt}")
+    #     checkpoint = torch.load(last_ckpt, map_location='cpu')
+    #     pl_model.load_state_dict(checkpoint['state_dict'], strict=False)
+    #     pl_model.model_sr.cpu()
+    #     # 不再传递 ckpt_path
+    #     trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    # else:
+    #     trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 
 if __name__ == "__main__":

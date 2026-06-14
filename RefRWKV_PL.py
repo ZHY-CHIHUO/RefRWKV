@@ -98,68 +98,55 @@ class RefRWKV_PL(pl.LightningModule):
         B = hr.shape[0]
         device = hr.device
 
-        # ------------------ 1. 超分损失 (RefSRWKV) ------------------
-        loss_sr = 0.0
+        # ---------- 1. 超分损失 (RefSRWKV) ----------
+        loss_sr = torch.tensor(0.0, device=device)
         if self.train_sr:
             I_start = self.model_sr(lr, ref, label=None)
             loss_sr = F.l1_loss(I_start, hr)
 
-        # ------------------ 2. 扩散损失 (RefDiffRWKV) ------------------
-        loss_diff = 0.0
+        # ---------- 2. 扩散损失 (RefDiffRWKV) ----------
+        loss_diff = torch.tensor(0.0, device=device)
         if self.train_diff:
             t = torch.randint(1, self.num_timesteps, (B,), device=device)
             noise = torch.randn_like(hr)
             x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
             pred_noise = self.model_diff(x_t, t, lr, ref)
-            pred_noise = torch.clamp(pred_noise, -5.0, 5.0)
-            loss_diff = ((pred_noise - noise) ** 2).mean()
+            snr = alpha_bar / (1 - alpha_bar)           # shape: (B,)
+            gamma = 5.0
+            loss_weight = torch.minimum(snr, torch.full_like(snr, gamma))   # 直接用 min(SNR, γ)
+            loss_diff = (loss_weight * ((pred_noise - noise) ** 2)).mean()
 
-        # ------------------ 3. 增强损失 (EnRWKV) ------------------
-        loss_enhance = 0.0
+
+
+        # ---------- 3. 增强损失 (EnRWKV) ----------
+        loss_enhance = torch.tensor(0.0, device=device)
         if self.train_enhance:
-            small_t_mask = t < self.t_enhance_threshold
-            if small_t_mask.any():
-                with torch.no_grad():
-                    alpha_bar_t = alpha_bar.view(-1, 1, 1, 1)
-                    pred_x0 = (
-                        x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise
-                    ) / torch.sqrt(alpha_bar_t)
-                    pred_x0 = torch.clamp(pred_x0, -1, 1)
+            # 增强训练时，限制 t 范围，确保每个 batch 都有有效样本
+            t_enhance = torch.randint(1, self.t_enhance_threshold + 1, (B,), device=device)
+            noise_enhance = torch.randn_like(hr)
+            x_t_enhance, noise_enhance, alpha_bar_enhance = self._add_noise(hr, noise_enhance, t_enhance)
 
-                # 只对 t 较小的样本计算增强损失
-                refined = self.model_enhance(pred_x0[small_t_mask], label=None)
-                loss_enhance = F.l1_loss(refined, hr[small_t_mask])
-            else:
-                loss_enhance = 0.0  # 如果没有小 t 样本，当前 batch 的增强损失为 0
+            with torch.no_grad():
+                pred_noise_enhance = self.model_diff(x_t_enhance, t_enhance, lr, ref)
+                pred_noise_enhance = torch.clamp(pred_noise_enhance, -5.0, 5.0)
 
-        # ------------------ 4. 总损失 ------------------
-        total_loss = (
-            loss_diff
-            + self.loss_sr_weight * loss_sr
-            + self.loss_enhance_weight * loss_enhance
-        )
+                alpha_bar_t = alpha_bar_enhance.view(-1, 1, 1, 1)
+                pred_x0 = (
+                    x_t_enhance - torch.sqrt(1 - alpha_bar_t) * pred_noise_enhance
+                ) / torch.sqrt(alpha_bar_t)
+                pred_x0 = torch.clamp(pred_x0, -1, 1)
+
+            refined = self.model_enhance(pred_x0, label=None)
+            loss_enhance = F.l1_loss(refined, hr)
+
+        # ---------- 4. 总损失 ----------
+        total_loss = loss_diff + self.loss_sr_weight * loss_sr + self.loss_enhance_weight * loss_enhance
 
         # 日志记录
-        self.log(
-            f"{stage}-loss_sr", loss_sr, prog_bar=True, on_step=True, on_epoch=True
-        )
-        self.log(
-            f"{stage}-loss_diff", loss_diff, prog_bar=True, on_step=True, on_epoch=True
-        )
-        self.log(
-            f"{stage}-loss_enhance",
-            loss_enhance,
-            prog_bar=True,
-            on_step=True,
-            on_epoch=True,
-        )
-        self.log(
-            f"{stage}-loss_total",
-            total_loss,
-            prog_bar=True,
-            on_step=True,
-            on_epoch=True,
-        )
+        self.log(f"{stage}-loss_sr", loss_sr, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(f"{stage}-loss_diff", loss_diff, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(f"{stage}-loss_enhance", loss_enhance, prog_bar=True, on_step=True, on_epoch=True)
+        self.log(f"{stage}-loss_total", total_loss, prog_bar=True, on_step=True, on_epoch=True)
 
         return total_loss
 
