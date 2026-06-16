@@ -4,6 +4,7 @@ import sys
 import argparse
 import yaml
 import os
+import shutil
 from pathlib import Path
 
 # 添加项目根目录到 sys.path
@@ -18,7 +19,8 @@ from pytorch_lightning.callbacks import (
     EarlyStopping,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
-torch.set_float32_matmul_precision('high')
+
+torch.set_float32_matmul_precision("high")
 
 # ==================== 导入模型和数据集 ====================
 from RefRWKV.models.RefSRWKV import RefSRWKV
@@ -56,7 +58,7 @@ def main():
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-
+    shutil.copy2(args.config, os.path.join(checkpoint_dir, "train_config.yaml"))
     # ========== 3. 数据集参数 ==========
     data_cfg = cfg["data"]
 
@@ -119,12 +121,13 @@ def main():
 
     # 创建全局语义模块
     global_semantic = GlobalSemanticModule(
-        base_dim=cfg["model"].get("embed_dim", 64),
+        base_dim=64,  # 金字塔内部工作维度
+        unet_dim=model_cfg.get("embed_dim", 384),  # U-Net 第一层维度
+        freeze_dinov2=True,
     )
 
     # 5.1 RefDiffRWKV
     model_diff = RefDiffRWKV(
-        img_size=model_cfg.get("img_size", 256),
         patch_size=model_cfg.get("patch_size", 4),
         embed_dim=model_cfg.get("embed_dim", 64),
         channels=model_cfg.get("channels", 3),
@@ -136,6 +139,7 @@ def main():
         learn_sigma=model_cfg.get("learn_sigma", False),
         upsample_mode=model_cfg.get("upsample_mode", "cnn"),
         global_semantic=global_semantic,
+        use_checkpoint=model_cfg.get("use_checkpoint", True),
     )
 
     # 5.2 RefSRWKV
@@ -166,8 +170,9 @@ def main():
         train_sr=train_cfg["train_sr"],
         train_diff=train_cfg["train_diff"],
         train_enhance=train_cfg["train_enhance"],
+        cfg_drop_prob=train_cfg["cfg_drop_prob"],
         t_enhance_threshold=train_cfg["t_enhance_threshold"],
-        num_timesteps=1000,
+        num_timesteps=train_cfg.get("num_timesteps", 1000),
         lr_sr=train_cfg["lr_sr"],
         lr_diff=train_cfg["lr_diff"],
         lr_enhance=train_cfg["lr_enhance"],
@@ -222,7 +227,7 @@ def main():
     print(f"   Batch Size: {data_cfg['batch_size']}")
 
     # ========== 8. 检查点恢复 ==========
-    last_ckpt = os.path.join(checkpoint_dir, "last-v1.ckpt")
+    last_ckpt = os.path.join(checkpoint_dir, "last.ckpt")
     ckpt_path = last_ckpt if os.path.exists(last_ckpt) else None
 
     if ckpt_path:
@@ -236,17 +241,6 @@ def main():
         val_dataloaders=val_loader,
         ckpt_path=ckpt_path,
     )
-
-    # last_ckpt = os.path.join(checkpoint_dir, "last.ckpt")
-    # if os.path.exists(last_ckpt):
-    #     print(f"加载模型权重（不恢复优化器）从: {last_ckpt}")
-    #     checkpoint = torch.load(last_ckpt, map_location='cpu')
-    #     pl_model.load_state_dict(checkpoint['state_dict'], strict=False)
-    #     pl_model.model_sr.cpu()
-    #     # 不再传递 ckpt_path
-    #     trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    # else:
-    #     trainer.fit(pl_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 
 if __name__ == "__main__":

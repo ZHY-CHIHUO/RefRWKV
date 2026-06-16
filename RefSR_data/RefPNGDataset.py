@@ -42,9 +42,9 @@ class RefPNGDataset(Dataset):
         augment: bool = False,
         augment_ref: bool = False,
         # 两个列表：分别控制 [亮度, 对比度, 饱和度, 色调] 的强度和触发概率
-        ref_aug_strengths: list = [0.12, 0.12, 0.12, 0.03],
+        ref_aug_strengths: list = [0.15, 0.15, 0.15, 0.03],
         ref_aug_probs: list = [0.5, 0.5, 0.5, 0.5],
-        ref_gray_prob: float = 0.2,
+        ref_gray_prob: float = 0.3,
         max_samples: tuple = (None, None, None),
         sample_seed: int = 42,
     ):
@@ -238,71 +238,119 @@ class RefPNGDataset(Dataset):
 
 
 # ---------- 测试代码（保留）----------
+# def main():
+#     from torch.utils.data import DataLoader
+
+#     data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
+#     max_samples = (1000, 200, None)
+#     patch_size = 128
+#     batch_size = 4
+
+#     train_ds = RefPNGDataset(
+#         data_dir=data_root,
+#         mode="train",
+#         max_samples=max_samples,
+#         sample_seed=42,
+#         patch_size=patch_size,
+#         augment=True,
+#         augment_ref=True,  # 开启 Ref 风格增强
+#     )
+#     val_ds = RefPNGDataset(
+#         data_dir=data_root,
+#         mode="val",
+#         max_samples=max_samples,
+#         sample_seed=42,
+#         patch_size=None,
+#         augment=False,
+#         augment_ref=False,
+#     )
+#     test_ds = RefPNGDataset(
+#         data_dir=data_root,
+#         mode="test",
+#         max_samples=max_samples,
+#         sample_seed=42,
+#         patch_size=None,
+#         augment=False,
+#         augment_ref=False,
+#     )
+
+#     print(
+#         f"\n数据集大小 —— Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}\n"
+#     )
+
+#     train_loader = DataLoader(
+#         train_ds, batch_size=batch_size, shuffle=True, num_workers=0
+#     )
+#     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+#     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
+
+#     print("===== 训练集 batch 测试 =====")
+#     for lr, hr, ref in train_loader:
+#         print(f"LR  shape: {lr.shape}   min/max: {lr.min():.3f} / {lr.max():.3f}")
+#         print(f"HR  shape: {hr.shape}   min/max: {hr.min():.3f} / {hr.max():.3f}")
+#         print(f"Ref shape: {ref.shape}  min/max: {ref.min():.3f} / {ref.max():.3f}")
+#         assert hr.shape[-2] == hr.shape[-1] == patch_size, "HR patch size mismatch"
+#         assert (
+#             lr.shape[-2] == lr.shape[-1] == patch_size // 10
+#         ), "LR patch size mismatch"
+#         break
+
+#     print("\n===== 验证集样本测试 =====")
+#     for lr, hr, ref in val_loader:
+#         print(f"LR  shape: {lr.shape}")
+#         print(f"HR  shape: {hr.shape}")
+#         print(f"Ref shape: {ref.shape}")
+#         break
+
+#     print("\n所有基本测试通过！")
+
+
 def main():
-    from torch.utils.data import DataLoader
+    import os
+    from pathlib import Path
+    from PIL import Image
 
-    data_root = r"/home/zhy/PROJECT/RWKV/RefSR_data/ALL_2"
-    max_samples = (1000, 200, None)
-    patch_size = 128
-    batch_size = 4
+    # ========== 配置 ==========
+    data_root = r"/home/zhy/PROJECT/RefRWKV/RefSR_data/ALL_2"
+    mode = "train"
+    vis_samples = 20  # 增强次数
+    debug_dir = Path("debug_ref_aug")
 
-    train_ds = RefPNGDataset(
+    # ========== 借 Dataset 的增强逻辑 ==========
+    ds = RefPNGDataset(
         data_dir=data_root,
-        mode="train",
-        max_samples=max_samples,
+        mode=mode,
+        max_samples=(None, None, None),
         sample_seed=42,
-        patch_size=patch_size,
-        augment=True,
-        augment_ref=True,  # 开启 Ref 风格增强
-    )
-    val_ds = RefPNGDataset(
-        data_dir=data_root,
-        mode="val",
-        max_samples=max_samples,
-        sample_seed=42,
-        patch_size=None,
+        patch_size=None,  # 全图模式，方便观察
         augment=False,
-        augment_ref=False,
-    )
-    test_ds = RefPNGDataset(
-        data_dir=data_root,
-        mode="test",
-        max_samples=max_samples,
-        sample_seed=42,
-        patch_size=None,
-        augment=False,
-        augment_ref=False,
+        augment_ref=True,  # 开启增强
     )
 
-    print(
-        f"\n数据集大小 —— Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}\n"
-    )
+    # 找一个样本
+    ref_path = ds.ref_dir / f"{ds.filenames[0]}.png"
+    original = Image.open(ref_path).convert("RGB")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=0
-    )
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
+    # ========== 保存原图 + 20 个增强版本 ==========
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    original.save(debug_dir / "00_original.png")
+    print(f"Original saved.  Size: {original.size}")
 
-    print("===== 训练集 batch 测试 =====")
-    for lr, hr, ref in train_loader:
-        print(f"LR  shape: {lr.shape}   min/max: {lr.min():.3f} / {lr.max():.3f}")
-        print(f"HR  shape: {hr.shape}   min/max: {hr.min():.3f} / {hr.max():.3f}")
-        print(f"Ref shape: {ref.shape}  min/max: {ref.min():.3f} / {ref.max():.3f}")
-        assert hr.shape[-2] == hr.shape[-1] == patch_size, "HR patch size mismatch"
-        assert (
-            lr.shape[-2] == lr.shape[-1] == patch_size // 10
-        ), "LR patch size mismatch"
-        break
+    for i in range(vis_samples):
+        # copy 避免原地修改
+        aug = ds._augment_ref(original.copy())
+        fname = debug_dir / f"{i+1:02d}_aug.png"
+        aug.save(fname)
 
-    print("\n===== 验证集样本测试 =====")
-    for lr, hr, ref in val_loader:
-        print(f"LR  shape: {lr.shape}")
-        print(f"HR  shape: {hr.shape}")
-        print(f"Ref shape: {ref.shape}")
-        break
+        # 顺便打印数值范围
+        arr = np.array(aug, dtype=np.float32) / 255.0
+        print(
+            f"  [{i+1:02d}] {fname.name}  "
+            f"range=[{arr.min():.3f}, {arr.max():.3f}]  "
+            f"mean={arr.mean():.3f}"
+        )
 
-    print("\n所有基本测试通过！")
+    print(f"\nDone. {vis_samples} augmented images saved to: {debug_dir.resolve()}")
 
 
 if __name__ == "__main__":

@@ -379,7 +379,7 @@ class RefSRWKV(nn.Module):
         num_blocks: tuple = (4, 6, 6, 8),
         num_refinement_blocks: int = 8,
         scale: int = 10,
-        drop_path_rate: float = 0.0,
+        drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
     ):
         super().__init__()

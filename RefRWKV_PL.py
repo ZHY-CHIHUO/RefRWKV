@@ -43,8 +43,6 @@ class RefRWKV_PL(pl.LightningModule):
         **kwargs,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["model_sr", "model_diff", "model_enhance"])
-
         self.model_sr = model_sr
         self.model_diff = model_diff
         self.model_enhance = model_enhance
@@ -70,6 +68,7 @@ class RefRWKV_PL(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.scheduler_type = scheduler
         self.eta_min = eta_min if eta_min is not None else lr_diff * 0.01
+        self.save_hyperparameters(ignore=["model_sr", "model_diff", "model_enhance"])
 
     def _set_requires_grad(self):
         """根据训练开关冻结/解冻各模块参数"""
@@ -79,20 +78,6 @@ class RefRWKV_PL(pl.LightningModule):
             param.requires_grad = self.train_diff
         for param in self.model_enhance.parameters():
             param.requires_grad = self.train_enhance
-
-    def set_train_flags(self, train_sr=None, train_diff=None, train_enhance=None):
-        if train_sr is not None:
-            self.train_sr = train_sr
-            for p in self.model_sr.parameters():
-                p.requires_grad = train_sr
-        if train_diff is not None:
-            self.train_diff = train_diff
-            for p in self.model_diff.parameters():
-                p.requires_grad = train_diff
-        if train_enhance is not None:
-            self.train_enhance = train_enhance
-            for p in self.model_enhance.parameters():
-                p.requires_grad = train_enhance
 
     def _add_noise(self, x0, noise, t):
         """添加噪声的余弦调度 (同原代码)"""
@@ -124,13 +109,15 @@ class RefRWKV_PL(pl.LightningModule):
         # ---------- 2. 扩散损失 (RefDiffRWKV) + CFG ----------
         loss_diff = torch.tensor(0.0, device=device)
         if self.train_diff:
-            t = torch.randint(1, self.num_timesteps, (B,), device=device)
+            t = torch.randint(1, self.num_timesteps + 1, (B,), device=device)
             noise = torch.randn_like(hr)
             x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
 
             # ✅ CFG：仅训练时，逐样本随机丢弃 Ref（纹理条件），LR 始终保留
             if self.training:
-                drop_mask = torch.rand(B, device=device) < self.cfg_drop_prob  # (B,) 逐样本
+                drop_mask = (
+                    torch.rand(B, device=device) < self.cfg_drop_prob
+                )  # (B,) 逐样本
                 drop_mask_exp = drop_mask.view(B, 1, 1, 1)
                 ref_cond = torch.where(drop_mask_exp, torch.zeros_like(ref), ref)
             else:
