@@ -42,9 +42,9 @@ class RefPNGDataset(Dataset):
         augment: bool = False,
         augment_ref: bool = False,
         # 两个列表：分别控制 [亮度, 对比度, 饱和度, 色调] 的强度和触发概率
-        ref_aug_strengths: list = [0.15, 0.15, 0.15, 0.03],
+        ref_aug_strengths: list = [0.12, 0.12, 0.12, 0.03],
         ref_aug_probs: list = [0.5, 0.5, 0.5, 0.5],
-        ref_gray_prob: float = 0.3,
+        ref_gray_prob: float = 0.2,
         max_samples: tuple = (None, None, None),
         sample_seed: int = 42,
     ):
@@ -107,7 +107,7 @@ class RefPNGDataset(Dataset):
 
     def _load_image(self, path):
         img = Image.open(path).convert("RGB")
-        return np.array(img, dtype=np.float32) / 255.0
+        return (np.array(img, dtype=np.float32) / 127.5) - 1.0
 
     # ---------- 参考图风格增强 ----------
     def _augment_ref(self, ref_img: Image.Image) -> Image.Image:
@@ -213,7 +213,7 @@ class RefPNGDataset(Dataset):
         ref_pil = Image.open(self.ref_dir / f"{name}.png").convert("RGB")
         if self.augment_ref:
             ref_pil = self._augment_ref(ref_pil)
-        ref = np.array(ref_pil, dtype=np.float32) / 255.0
+        ref = (np.array(ref_pil, dtype=np.float32) / 127.5) - 1.0
 
         # 随机裁剪（若需要）
         if self.patch_size is not None:

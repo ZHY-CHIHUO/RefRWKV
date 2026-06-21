@@ -172,7 +172,7 @@ def train_stage_sr(cfg: dict, train_loader, val_loader):
         out_channels=sr_cfg.get("out_channels", 3),
         dim=sr_cfg.get("dim", 48),
         num_blocks=sr_cfg.get("num_blocks", [4, 6, 6, 8]),
-        num_refinement_blocks=sr_cfg.get("num_refinement_blocks", 8),
+        num_refinement_blocks=sr_cfg.get("num_refinement_blocks", 4),
         scale=sr_cfg.get("scale", 10),
     )
 
@@ -190,8 +190,15 @@ def train_stage_sr(cfg: dict, train_loader, val_loader):
         loss_fn=loss_fn,
     )
 
-    trainer = _make_trainer(cfg, exp_name, checkpoint_dir, log_dir, stage_cfg["max_epochs"])
-    trainer.fit(lit_module, train_loader, val_loader)
+    trainer, full_ckpt_dir = _make_trainer(cfg, exp_name, checkpoint_dir, log_dir, stage_cfg["max_epochs"])
+
+    resume_ckpt = None
+    last_ckpt = os.path.join(full_ckpt_dir, "last.ckpt")
+    if os.path.exists(last_ckpt):
+        resume_ckpt = last_ckpt
+        print(f"🔁 检测到上次训练记录，从 {last_ckpt} 恢复")
+
+    trainer.fit(lit_module, train_loader, val_loader, ckpt_path=resume_ckpt)
     return trainer.checkpoint_callback.best_model_path
 
 
@@ -227,8 +234,16 @@ def train_stage_diff(cfg: dict, train_loader, val_loader):
         eta_min=stage_cfg["learning_rate"] * stage_cfg.get("eta_min_ratio", 0.01),
     )
 
-    trainer = _make_trainer(cfg, exp_name, checkpoint_dir, log_dir, stage_cfg["max_epochs"])
-    trainer.fit(lit_module, train_loader, val_loader)
+    trainer, full_ckpt_dir = _make_trainer(cfg, exp_name, checkpoint_dir, log_dir, stage_cfg["max_epochs"])
+
+    resume_ckpt = None
+    last_ckpt = os.path.join(full_ckpt_dir, "last.ckpt")
+    if os.path.exists(last_ckpt):
+        resume_ckpt = last_ckpt
+        print(f"🔁 检测到上次训练记录，从 {last_ckpt} 恢复")
+
+    trainer.fit(lit_module, train_loader, val_loader, ckpt_path=resume_ckpt)
+
     return trainer.checkpoint_callback.best_model_path
 
 
@@ -277,13 +292,20 @@ def train_stage_enhance(cfg: dict, train_loader, val_loader):
         warmup_epochs=stage_cfg["warmup_epochs"],
     )
 
-    trainer = _make_trainer(cfg, exp_name, checkpoint_dir, log_dir, stage_cfg["max_epochs"])
-    trainer.fit(lit_module, train_loader, val_loader)
+    trainer, full_ckpt_dir = _make_trainer(cfg, exp_name, checkpoint_dir, log_dir, stage_cfg["max_epochs"])
+
+    resume_ckpt = None    
+    last_ckpt = os.path.join(full_ckpt_dir, "last.ckpt")    
+    if os.path.exists(last_ckpt):        
+        resume_ckpt = last_ckpt        
+        print(f"🔁 检测到上次训练记录，从 {last_ckpt} 恢复")
+
+    trainer.fit(lit_module, train_loader, val_loader, ckpt_path=resume_ckpt)    
+    
     return trainer.checkpoint_callback.best_model_path
 
 
 def _make_trainer(cfg: dict, exp_name: str, checkpoint_dir: str, log_dir: str, max_epochs: int):
-    """创建统一的 Trainer。"""
     train_cfg = cfg["train"]
     full_checkpoint_dir = os.path.join(checkpoint_dir, exp_name)
     os.makedirs(full_checkpoint_dir, exist_ok=True)
@@ -308,7 +330,7 @@ def _make_trainer(cfg: dict, exp_name: str, checkpoint_dir: str, log_dir: str, m
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
-    return pl.Trainer(
+    trainer = pl.Trainer(
         accelerator="gpu",
         devices=1,
         precision=train_cfg.get("precision", "bf16-mixed"),
@@ -321,6 +343,8 @@ def _make_trainer(cfg: dict, exp_name: str, checkpoint_dir: str, log_dir: str, m
         logger=logger,
         enable_progress_bar=True,
     )
+
+    return trainer, full_checkpoint_dir
 
 
 # ============================================================
