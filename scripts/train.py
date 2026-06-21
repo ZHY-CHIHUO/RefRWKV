@@ -113,6 +113,8 @@ def build_dataloaders(cfg: dict):
         num_workers=data_cfg["num_workers"],
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=data_cfg.get("prefetch_factor", 4),
     )
 
     val_loader = DataLoader(
