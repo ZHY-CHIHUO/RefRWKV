@@ -349,10 +349,8 @@ class GatedFusion(nn.Module):
             nn.Sigmoid(),
         )
 
-        # 零初始化：训练初期 ref 不参与
-        nn.init.zeros_(self.fuse_conv.weight)
-        # gate 最后一层偏置初始化为负值 → 初始 gate ≈ 0.1，缓慢引入 ref
-        nn.init.constant_(self.gate[-2].bias, -2.0)
+        nn.init.trunc_normal_(self.fuse_conv.weight, std=0.02)
+        nn.init.constant_(self.gate[-2].bias, 0.0)
 
     def forward(self, lr_feat, ref_feat):
         fused = self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1))
@@ -379,7 +377,7 @@ class RefSRWKV(nn.Module):
         num_blocks: tuple = (4, 6, 6, 8),
         num_refinement_blocks: int = 8,
         scale: int = 10,
-        drop_path_rate: float = 0.1,
+        drop_path_rate: float = 0.0,
         hidden_rate: int = 4,
     ):
         super().__init__()
@@ -422,6 +420,12 @@ class RefSRWKV(nn.Module):
         self.fuse2 = GatedFusion(dim * 2)
         self.fuse3 = GatedFusion(dim * 4)
         self.fuse4 = GatedFusion(dim * 8)
+
+        # 按层级差异化 gate 偏置
+        nn.init.constant_(self.fuse1.gate[-2].bias, 1.5)  # 浅层
+        nn.init.constant_(self.fuse2.gate[-2].bias, 0.5)  # 中浅
+        nn.init.constant_(self.fuse3.gate[-2].bias, 0.0)  # 中深
+        nn.init.constant_(self.fuse4.gate[-2].bias, -0.5)  # 深层
 
         # ── DropPath ──
         dp_rates = [
