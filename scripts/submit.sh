@@ -2,3 +2,4 @@
 # scp -r 4090:/mnt .
 # scp [选项] 本地文件路径 用户名@服务器地址:远程目标路径
 # scp -r my_folder/ 4090:/mnt
+# tensorboard --logdir logs
