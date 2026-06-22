@@ -375,9 +375,9 @@ class RefSRWKV(nn.Module):
         out_channels: int = 3,
         dim: int = 48,
         num_blocks: tuple = (4, 6, 6, 8),
-        num_refinement_blocks: int = 8,
+        num_refinement_blocks: int = 4,
         scale: int = 10,
-        drop_path_rate: float = 0.0,
+        drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
     ):
         super().__init__()
