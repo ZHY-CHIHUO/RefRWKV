@@ -28,7 +28,7 @@ class RefLMDBDataset(Dataset):
         sample_seed: int = 42,
     ):
         if ref_aug_strengths is None:
-            ref_aug_strengths = [0.12, 0.12, 0.12, 0.03]
+            ref_aug_strengths = [0.15, 0.15, 0.15, 0.03]
         if ref_aug_probs is None:
             ref_aug_probs = [0.5, 0.5, 0.5, 0.5]
 
