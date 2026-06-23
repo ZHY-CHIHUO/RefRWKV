@@ -13,6 +13,7 @@ logs/
 best_restore_rwkv_ref.pth
 
 # 数据集
+results/*
 data/*
 RefSR_data/*
 test_results/
