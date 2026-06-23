@@ -15,6 +15,7 @@ Better Start (RefSRWKV) → SDEdit 扩散去噪 → EnRWKV 增强 → IQA 评估
 import argparse
 import os
 import sys
+import shutil
 from pathlib import Path
 import numpy as np
 import torch
@@ -394,8 +395,9 @@ def main():
                     np.uint8
                 )
                 Image.fromarray(out_np).save(img_dir / f"{idx:05d}.png")
-                gt_np = (hr[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                Image.fromarray(gt_np).save(gt_dir / f"{idx:05d}.png")
+                src_gt_path = Path(data_cfg["root"]) / "test" / "HR" / f"{test_ds.filenames[idx]}.png"
+                shutil.copy(src_gt_path, gt_dir / f"{idx:05d}.png")
+
 
             idx += 1
 
