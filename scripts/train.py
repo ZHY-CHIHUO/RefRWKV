@@ -336,7 +336,7 @@ def _make_trainer(cfg: dict, exp_name: str, checkpoint_dir: str, log_dir: str, m
         precision=train_cfg.get("precision", "bf16-mixed"),
         max_epochs=max_epochs,
         log_every_n_steps=train_cfg.get("log_every_n_steps", 20),
-        check_val_every_n_epoch=train_cfg.get("check_val_every_n_epoch", 1),
+        val_check_interval=train_cfg.get("val_check_interval", 1.0),
         gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
         accumulate_grad_batches=train_cfg.get("accumulate_grad_batches", 1),
         callbacks=callbacks,
