@@ -41,6 +41,9 @@ import torch.nn.functional as F
 from transformers import AutoModel
 import sys
 from pathlib import Path
+import os
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # Add project root to sys.path so we can import RUN_CUDA
 # 将项目根目录加入 sys.path，以便导入 RUN_CUDA（双向 WKV CUDA 算子）
@@ -87,10 +90,10 @@ class RWKV_SemanticAggregator(nn.Module):
         # ── RWKV Time-Mixing 组件 ──
         # Key / Value / Receptance / Output projection
         # 键 / 值 / 接受度 / 输出投影
-        self.input_norm = nn.LayerNorm(dim)        # 输入预归一化 (pre-norm)
+        self.input_norm = nn.LayerNorm(dim)  # 输入预归一化 (pre-norm)
         self.key = nn.Linear(dim, dim, bias=False)
         self.value = nn.Linear(dim, dim, bias=False)
-        self.receptance = nn.Linear(dim, dim, bias=False)   # 门控接受度 (sigmoid gating)
+        self.receptance = nn.Linear(dim, dim, bias=False)  # 门控接受度 (sigmoid gating)
         self.output = nn.Linear(dim, dim, bias=False)
 
         # ── RWKV 衰减参数 ──
@@ -127,21 +130,21 @@ class RWKV_SemanticAggregator(nn.Module):
         B, M, C = ref_features.shape
 
         # Step 1: 构建 Query Token + Position (广播到 batch)
-        q = self.query + self.query_pos      # (1, num_tokens, dim)
-        q = q.expand(B, -1, -1)             # (B, num_tokens, dim)
+        q = self.query + self.query_pos  # (1, num_tokens, dim)
+        q = q.expand(B, -1, -1)  # (B, num_tokens, dim)
 
         # Step 2: 拼接 [Query, Patch]，构成完整输入序列
         # Concatenate: learnable queries first, followed by all patch tokens
         # 序列结构: [q1 q2 ... qN | patch1 patch2 ... patchM]
-        seq = torch.cat([q, ref_features], dim=1)   # (B, num_tokens+M, dim)
+        seq = torch.cat([q, ref_features], dim=1)  # (B, num_tokens+M, dim)
         seq = self.input_norm(seq)
         T = seq.shape[1]
 
         # Step 3: 投影到 K, V, R 空间
         # Project to Key, Value, Receptance spaces
-        k = self.key(seq)                              # (B, T, dim)
-        v0 = self.value(seq)                           # (B, T, dim)
-        r = torch.sigmoid(self.receptance(seq))        # (B, T, dim), 门控 0~1
+        k = self.key(seq)  # (B, T, dim)
+        v0 = self.value(seq)  # (B, T, dim)
+        r = torch.sigmoid(self.receptance(seq))  # (B, T, dim), 门控 0~1
 
         # Step 4: 双向 RWKV 时间混合
         # Bidirectional RWKV time-mixing:
@@ -151,42 +154,39 @@ class RWKV_SemanticAggregator(nn.Module):
 
         # Forward direction (前向扫描)
         v_forward = RUN_CUDA(
-            self.decay / T,    # 衰减按序列长度归一化
-            self.first / T,    # 首位置偏置同样归一化
+            self.decay / T,  # 衰减按序列长度归一化
+            self.first / T,  # 首位置偏置同样归一化
             k,
-            v0
-        )                                                      # (B, T, dim)
+            v0,
+        )  # (B, T, dim)
 
         # Backward direction (反向扫描 → flip → WKV → flip back)
-        k_rev = torch.flip(k, dims=[1])                       # 翻转 key 序列
-        v_rev_input = torch.flip(v0, dims=[1])                # 翻转 value 序列
+        k_rev = torch.flip(k, dims=[1])  # 翻转 key 序列
+        v_rev_input = torch.flip(v0, dims=[1])  # 翻转 value 序列
         v_backward = RUN_CUDA(
-            self.decay / T,
-            self.first / T,
-            k_rev,
-            v_rev_input
-        )                                                      # (B, T, dim)
-        v_backward = torch.flip(v_backward, dims=[1])         # 翻转回原始顺序
+            self.decay / T, self.first / T, k_rev, v_rev_input
+        )  # (B, T, dim)
+        v_backward = torch.flip(v_backward, dims=[1])  # 翻转回原始顺序
 
         # Average forward + backward → 双向感受野
         # 前向+反向取平均，确保每个 Query Token 同时看到左右两侧的 Patch
-        v = 0.5 * (v_forward + v_backward)                     # (B, T, dim)
+        v = 0.5 * (v_forward + v_backward)  # (B, T, dim)
 
         # Step 5: 门控输出
         # Gate with receptance: x = r ⊙ v (element-wise)
-        x = r * v                                              # (B, T, dim)
-        x = self.output(x)                                     # (B, T, dim)
+        x = r * v  # (B, T, dim)
+        x = self.output(x)  # (B, T, dim)
 
         # Step 6: 取出 Query 部分 + Residual + FFN
         # Extract only the first num_tokens (the Query positions)
         # 只取序列前 num_tokens 个位置（Query Token 部分）
         # 丢弃后面的 Patch Token（它们只是上下文，不参与输出）
-        semantic_tokens = x[:, : self.num_tokens, :] + q       # Residual with original query
+        semantic_tokens = x[:, : self.num_tokens, :] + q  # Residual with original query
         semantic_tokens = semantic_tokens + self.ffn(
             self.norm(semantic_tokens)
-        )                                                      # Pre-norm FFN
+        )  # Pre-norm FFN
 
-        return semantic_tokens                                # (B, num_tokens, dim)
+        return semantic_tokens  # (B, num_tokens, dim)
 
 
 class RWKV_SemanticPyramid(nn.Module):
@@ -219,10 +219,10 @@ class RWKV_SemanticPyramid(nn.Module):
         )  # 32 → 16
         self.agg8 = RWKV_SemanticAggregator(
             dim, num_tokens=8, hidden_rate=hidden_rate
-        )   # 16 → 8
+        )  # 16 → 8
         self.agg4 = RWKV_SemanticAggregator(
             dim, num_tokens=4, hidden_rate=hidden_rate
-        )   # 8 → 4
+        )  # 8 → 4
 
     def forward(self, ref_features):
         """
@@ -237,15 +237,15 @@ class RWKV_SemanticPyramid(nn.Module):
                 "latent": (B, 4,  base_dim),
             }
         """
-        sem32 = self.agg32(ref_features)        # 256 → 32 tokens
-        sem16 = self.agg16(sem32)               # 32  → 16 tokens
-        sem8  = self.agg8(sem16)                # 16  → 8  tokens
-        sem4  = self.agg4(sem8)                 # 8   → 4  tokens
+        sem32 = self.agg32(ref_features)  # 256 → 32 tokens
+        sem16 = self.agg16(sem32)  # 32  → 16 tokens
+        sem8 = self.agg8(sem16)  # 16  → 8  tokens
+        sem4 = self.agg4(sem8)  # 8   → 4  tokens
         return {
-            "e1":     sem32,     # 浅层: 32 tokens, 高空间精度
-            "e2":     sem16,     # 中层: 16 tokens
-            "e3":     sem8,      # 深层: 8  tokens
-            "latent": sem4,      # 瓶颈: 4  tokens, 全局语义
+            "e1": sem32,  # 浅层: 32 tokens, 高空间精度
+            "e2": sem16,  # 中层: 16 tokens
+            "e3": sem8,  # 深层: 8  tokens
+            "latent": sem4,  # 瓶颈: 4  tokens, 全局语义
         }
 
 
@@ -292,8 +292,11 @@ class GlobalSemanticModule(nn.Module):
 
         # ── 1. DINOv2 Backbone ──
         # 自动检测 hidden_size，兼容所有 DINOv2 变体
-        self.dinov2 = AutoModel.from_pretrained(dinov2_model_name)
-        dino_dim = self.dinov2.config.hidden_size   # 768 (base) / 384 (small) / ...
+        self.dinov2 = AutoModel.from_pretrained(
+            dinov2_model_name,
+            local_files_only=True,
+        )
+        dino_dim = self.dinov2.config.hidden_size  # 768 (base) / 384 (small) / ...
         if freeze_dinov2:
             # 冻结 DINOv2：只读特征提取，不参与梯度更新
             for param in self.dinov2.parameters():
@@ -321,10 +324,10 @@ class GlobalSemanticModule(nn.Module):
         #   e3:     base_dim → unet_dim×4     (如 64→1280)
         #   latent: base_dim → unet_dim×8     (如 64→2560)
         dim_map = {
-            "e1":     unet_dim,          # down_blocks[0] → 320 ch
-            "e2":     unet_dim * 2,      # down_blocks[1] → 640 ch
-            "e3":     unet_dim * 4,      # down_blocks[2] → 1280 ch
-            "latent": unet_dim * 8,      # mid_block     → 2560 ch (if unet_dim=320)
+            "e1": unet_dim,  # down_blocks[0] → 320 ch
+            "e2": unet_dim * 2,  # down_blocks[1] → 640 ch
+            "e3": unet_dim * 4,  # down_blocks[2] → 1280 ch
+            "latent": unet_dim * 8,  # mid_block     → 2560 ch (if unet_dim=320)
         }
         self.level_proj = nn.ModuleDict()
         for level, target_dim in dim_map.items():
@@ -358,9 +361,7 @@ class GlobalSemanticModule(nn.Module):
         # ── Step 1: Resize to DINOv2 fixed input size ──
         # DINOv2 要求固定 224×224 输入，patch_size=14 → 256 patches
         if ref_img.shape[-2:] != (224, 224):
-            ref_small = F.interpolate(
-                ref_img, size=(224, 224), mode="bilinear"
-            )
+            ref_small = F.interpolate(ref_img, size=(224, 224), mode="bilinear")
         else:
             ref_small = ref_img
 
@@ -374,21 +375,21 @@ class GlobalSemanticModule(nn.Module):
             # last_hidden_state: (B, 257, dino_dim)
             #   [:, 0, :] = CLS token (丢弃)
             #   [:, 1:, :] = 256 Patch tokens (保留)
-            features = outputs.last_hidden_state[:, 1:, :]   # (B, 256, dino_dim)
+            features = outputs.last_hidden_state[:, 1:, :]  # (B, 256, dino_dim)
 
         # ── Step 3: 投影到基础维度 ──
         # DINOv2 dim → base_dim (可训练投影层)
-        features = self.proj(features)                        # (B, 256, base_dim)
+        features = self.proj(features)  # (B, 256, base_dim)
 
         # ── Step 4: RWKV Semantic Pyramid ──
         # 256 → 32 → 16 → 8 → 4 tokens
-        base_pyramid = self.semantic_pyramid(features)        # dict of (B, N, base_dim)
+        base_pyramid = self.semantic_pyramid(features)  # dict of (B, N, base_dim)
 
         # ── Step 5: 投影到 UNet 各层维度 ──
         # 每层从 base_dim 投影到对应 UNet 层的实际通道数
         output_pyramid = {}
         for level in ["e1", "e2", "e3", "latent"]:
-            tokens = base_pyramid[level]                      # (B, N, base_dim)
+            tokens = base_pyramid[level]  # (B, N, base_dim)
             proj = self.level_proj[level]
             output_pyramid[level] = (
                 proj(tokens) if proj is not None else tokens  # 维度匹配时跳过投影
@@ -401,28 +402,33 @@ class GlobalSemanticModule(nn.Module):
 # 测试代码 (Test / Sanity Check)
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    import time
 
-    # 定义一个简单的目标维度映射用于测试
-    # 实际使用时通过 GlobalSemanticModule(unet_dim=...) 自动推导
-    target_dims = {"e1": 64, "e2": 128, "e3": 256, "latent": 512}
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    t0 = time.time()
+    print("Loading DINOv2...")
 
     model = (
-        GlobalSemanticModule(base_dim=64, target_dims=target_dims)
+        GlobalSemanticModule(
+            dinov2_model_name="facebook/dinov2-base",
+            base_dim=64,
+            unet_dim=64,
+        )
         .to(device)
         .eval()
     )
 
-    # 模拟一张 480×480 的参考图像 (batch_size=2)
-    dummy_ref = torch.randn(2, 3, 480, 480).to(device)
+    print(f"DINOv2 loaded in {time.time() - t0:.1f}s")
 
+    dummy_ref = torch.randn(2, 3, 480, 480).to(device)
+    print(f"Running forward...")
+
+    t0 = time.time()
     with torch.no_grad():
         output = model(dummy_ref)
+    print(f"Forward done in {time.time() - t0:.1f}s")
 
-    # 预期输出:
-    # e1: torch.Size([2, 32, 64])    ← 32 tokens × unet_dim
-    # e2: torch.Size([2, 16, 128])   ← 16 tokens × unet_dim×2
-    # e3: torch.Size([2, 8, 256])    ← 8  tokens × unet_dim×4
-    # latent: torch.Size([2, 4, 512]) ← 4  tokens × unet_dim×8
     for k, v in output.items():
         print(f"{k}: {v.shape}")
