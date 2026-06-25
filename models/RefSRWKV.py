@@ -2,13 +2,11 @@
 """
 RefSRWKV (Improved): Reference-based Super-Resolution with RWKV Backbone.
 """
-
-import math
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+import pytorch_lightning as pl
 from torch.utils.cpp_extension import load
 import os
 
@@ -635,6 +633,77 @@ class RefSRWKV(nn.Module):
                 module.reparam_5x5()
         print("✓ RefSRWKV: All OmniShift modules reparameterized for inference.")
         return self
+
+
+class LitRefSRWKV(pl.LightningModule):
+    def __init__(
+        self,
+        model_sr: nn.Module,
+        learning_rate: float = 1e-4,
+        warmup_steps: int = 100,
+        loss_fn: nn.Module = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["model_sr", "loss_fn"])
+
+        self.model_sr = model_sr
+        self.criterion = loss_fn or nn.L1Loss()
+        self._step_count = 0
+
+    def forward(self, lr, ref):
+        return self.model_sr(lr, ref)
+
+    def training_step(self, batch, batch_idx):
+        lr, hr, ref = batch
+        output = self(lr, ref)
+        loss = self.criterion(output, hr)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        lr, hr, ref = batch
+        output = self(lr, ref)
+        loss = self.criterion(output, hr)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        lr, hr, ref = batch
+        output = self(lr, ref)
+        loss = self.criterion(output, hr)
+        self.log("test_loss", loss, on_step=False, on_epoch=True)
+        return output, hr
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        # Step 级 warmup
+        if self._step_count < self.hparams.warmup_steps:
+            lr_scale = min(1.0, (self._step_count + 1) / self.hparams.warmup_steps)
+            for pg in optimizer.param_groups:
+                pg["lr"] = self.hparams.learning_rate * lr_scale
+        if optimizer_closure is not None:
+            optimizer.step(closure=optimizer_closure)
+        else:
+            optimizer.step()
+        self._step_count += 1
+
+    def on_train_start(self):
+        total = sum(p.numel() for p in self.parameters())
+        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M")
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import pytorch_lightning as pl
+from torch.optim import AdamW
 import sys
 from pathlib import Path
 
@@ -210,4 +212,104 @@ class EnRWKV(nn.Module):
             return out
         else:
             return self.loss_fun(out, label)
+
+class LitEnRWKV(pl.LightningModule):
+    def __init__(
+        self,
+        model_enhance: nn.Module,
+        model_diff: nn.Module,
+        num_timesteps: int = 1000,
+        t_threshold: int = 250,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-2,
+        warmup_epochs: int = 5,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["model_enhance", "model_diff"])
+
+        self.model_enhance = model_enhance
+        self.model_diff = model_diff
+        self.num_timesteps = num_timesteps
+        self.t_threshold = t_threshold
+        self.lr = learning_rate
+        self.wd = weight_decay
+        self.warmup_epochs = warmup_epochs
+
+        # 冻结扩散模型
+        for p in self.model_diff.parameters():
+            p.requires_grad = False
+        self.model_diff.eval()
+
+    def _add_noise(self, x0, noise, t):
+        s = 0.008
+        T = self.num_timesteps
+        alpha_bar = torch.cos(((t.float() / T + s) / (1 + s)) * math.pi / 2) ** 2
+        alpha_bar = alpha_bar.view(-1, 1, 1, 1)
+        x_t = torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
+        return x_t, noise, alpha_bar
+
+    def _step(self, batch, stage):
+        lr, hr, ref = batch
+        B = hr.shape[0]
+        device = hr.device
+
+        t = torch.randint(1, self.t_threshold + 1, (B,), device=device)
+        noise = torch.randn_like(hr)
+        x_t, noise, alpha_bar = self._add_noise(hr, noise, t)
+
+        with torch.no_grad():
+            pred_noise = self.model_diff(x_t, t, lr, ref)
+            pred_noise = torch.clamp(pred_noise, -5.0, 5.0)
+            alpha_bar_t = alpha_bar.view(-1, 1, 1, 1)
+            pred_x0 = (
+                x_t - torch.sqrt(1 - alpha_bar_t) * pred_noise
+            ) / torch.sqrt(alpha_bar_t + 1e-8)
+            pred_x0 = torch.clamp(pred_x0, -1, 1)
+
+        refined = self.model_enhance(pred_x0, label=None)
+        loss = F.l1_loss(refined, hr)
+
+        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        return self._step(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        return self._step(batch, "test")
+
+    def configure_optimizers(self):
+        optimizer = AdamW(self.parameters(), lr=self.lr, weight_decay=self.wd)
+        total_epochs = self.trainer.max_epochs if self.trainer else 200
+
+        def lr_lambda(epoch):
+            if epoch < self.warmup_epochs:
+                return float(epoch + 1) / float(max(1, self.warmup_epochs))
+            progress = float(epoch - self.warmup_epochs) / float(
+                max(1, total_epochs - self.warmup_epochs)
+            )
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1},
+        }
+
+    # ----- 强制扩散模型保持 eval 模式 -----
+    def on_train_start(self):
+        self.model_diff.eval()
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"✅ LitEnRWKV 训练开始 | 总参数: {total / 1e6:.2f}M | 可训练: {trainable / 1e6:.2f}M")
+
+    def on_validation_start(self):
+        self.model_diff.eval()
+
+    def on_test_start(self):
+        self.model_diff.eval()
+
 

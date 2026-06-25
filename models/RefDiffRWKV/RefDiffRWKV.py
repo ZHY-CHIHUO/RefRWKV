@@ -12,9 +12,6 @@ RefDiffRWKV.py — Ref 特征提取管线
     # rf2: (B, 768, H/8, W/8)   → SD2 down_blocks[1]
     # rf3: (B, 1536, H/16, W/16) → SD2 down_blocks[2]
 
-Copyright (c) Shanghai AI Lab. All rights reserved.
-RefDiffRWKV 原版版权归上海人工智能实验室所有。
-本文件为精简改编版，仅保留 ref 特征提取管线。
 """
 
 import math

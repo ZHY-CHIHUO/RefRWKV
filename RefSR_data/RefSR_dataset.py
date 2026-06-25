@@ -26,6 +26,9 @@ class RefLMDBDataset(Dataset):
         ref_gray_prob: float = 0.2,
         max_samples: tuple = (None, None, None),
         sample_seed: int = 42,
+        lr_key: str = "lr",
+        hr_key: str = "hr",
+        ref_key: str = "ref",
     ):
         if ref_aug_strengths is None:
             ref_aug_strengths = [0.15, 0.15, 0.15, 0.03]
@@ -43,15 +46,18 @@ class RefLMDBDataset(Dataset):
         self.ref_aug_probs = ref_aug_probs
         self.ref_gray_prob = ref_gray_prob
 
+        self.lr_key = lr_key
+        self.hr_key = hr_key
+        self.ref_key = ref_key
+
         # 打开 LMDB（只读、无锁、无自动读缓冲）
         lmdb_path = os.path.join(data_dir, f"{self.mode}.lmdb")
         self.env = lmdb.open(
-            str(lmdb_path), readonly=True, lock=False,
-            readahead=False, meminit=False
+            str(lmdb_path), readonly=True, lock=False, readahead=False, meminit=False
         )
 
         with self.env.begin() as txn:
-            total_entries = txn.stat()['entries']
+            total_entries = txn.stat()["entries"]
             self.total_samples = total_entries // 3
 
         # 子采样逻辑
@@ -59,16 +65,22 @@ class RefLMDBDataset(Dataset):
         num_to_sample = max_samples[mode_index]
         if num_to_sample is not None:
             if num_to_sample > self.total_samples:
-                print(f"Warning: requested {num_to_sample} but only {self.total_samples} available.")
+                print(
+                    f"Warning: requested {num_to_sample} but only {self.total_samples} available."
+                )
                 num_to_sample = self.total_samples
             rng = random.Random(sample_seed)
             self.indices = rng.sample(range(self.total_samples), num_to_sample)
         else:
             self.indices = list(range(self.total_samples))
 
-        print(f"RefLMDBDataset [{mode}]: {len(self.indices)} / {self.total_samples} samples")
+        print(
+            f"RefLMDBDataset [{mode}]: {len(self.indices)} / {self.total_samples} samples"
+        )
         if patch_size is not None:
-            print(f"  Random crop: HR {patch_size}×{patch_size} → LR {self.lr_patch_size}×{self.lr_patch_size}")
+            print(
+                f"  Random crop: HR {patch_size}×{patch_size} → LR {self.lr_patch_size}×{self.lr_patch_size}"
+            )
         if self.augment:
             print("  Spatial Augmentation: ON (Torch flips/rot90)")
         if self.augment_ref:
@@ -94,9 +106,11 @@ class RefLMDBDataset(Dataset):
         y_lr = y_hr // self.scale
         x_lr = x_hr // self.scale
 
-        lr_crop = lr[:, y_lr:y_lr+self.lr_patch_size, x_lr:x_lr+self.lr_patch_size]
-        hr_crop = hr[:, y_hr:y_hr+self.patch_size, x_hr:x_hr+self.patch_size]
-        ref_crop = ref[:, y_hr:y_hr+self.patch_size, x_hr:x_hr+self.patch_size]
+        lr_crop = lr[
+            :, y_lr : y_lr + self.lr_patch_size, x_lr : x_lr + self.lr_patch_size
+        ]
+        hr_crop = hr[:, y_hr : y_hr + self.patch_size, x_hr : x_hr + self.patch_size]
+        ref_crop = ref[:, y_hr : y_hr + self.patch_size, x_hr : x_hr + self.patch_size]
         return lr_crop, hr_crop, ref_crop
 
     def _augment_tensor(self, lr, hr, ref):
@@ -129,22 +143,24 @@ class RefLMDBDataset(Dataset):
         # 随机灰度
         if torch.rand(1).item() < self.ref_gray_prob:
             ref = TF.rgb_to_grayscale(ref, num_output_channels=1)
-            ref = ref.repeat(3, 1, 1)      # 恢复 3 通道
+            ref = ref.repeat(3, 1, 1)  # 恢复 3 通道
         else:
             # 依次判断亮度、对比度、饱和度、色调
-            for idx, (strength, prob) in enumerate(zip(self.ref_aug_strengths, self.ref_aug_probs)):
+            for idx, (strength, prob) in enumerate(
+                zip(self.ref_aug_strengths, self.ref_aug_probs)
+            ):
                 if torch.rand(1).item() > prob:
                     continue
-                if idx == 0:   # 亮度
+                if idx == 0:  # 亮度
                     factor = 1.0 + (torch.rand(1).item() * 2 - 1) * strength
                     ref = TF.adjust_brightness(ref, factor)
-                elif idx == 1: # 对比度
+                elif idx == 1:  # 对比度
                     factor = 1.0 + (torch.rand(1).item() * 2 - 1) * strength
                     ref = TF.adjust_contrast(ref, factor)
-                elif idx == 2: # 饱和度
+                elif idx == 2:  # 饱和度
                     factor = 1.0 + (torch.rand(1).item() * 2 - 1) * strength
                     ref = TF.adjust_saturation(ref, factor)
-                elif idx == 3: # 色调
+                elif idx == 3:  # 色调
                     if strength > 0:
                         hue_shift = (torch.rand(1).item() * 2 - 1) * strength
                         ref = TF.adjust_hue(ref, hue_shift)
@@ -178,8 +194,11 @@ class RefLMDBDataset(Dataset):
         lr = (lr.float() / 127.5) - 1.0
         hr = (hr.float() / 127.5) - 1.0
 
-        return lr, hr, ref
+        return {
+            self.lr_key: lr,
+            self.hr_key: hr,
+            self.ref_key: ref,
+        }
 
     def __len__(self):
         return len(self.indices)
-

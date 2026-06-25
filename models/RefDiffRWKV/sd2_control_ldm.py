@@ -10,7 +10,7 @@ from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler
 import sys
 from pathlib import Path
 
-_SCRIPT_DIR = str(Path(__file__).parent)             # .../RefDiffRWKV/
+_SCRIPT_DIR = str(Path(__file__).parent)  # .../RefDiffRWKV/
 _PROJECT_ROOT = str(Path(__file__).parent.parent.parent.parent)  # .../PROJECT/
 sys.path.insert(0, _SCRIPT_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
@@ -37,6 +37,7 @@ class SD2ControlLDM(pl.LightningModule):
         sd_model_path: str = "sd2-community/stable-diffusion-2-1-base",
         use_lora: bool = True,
         lora_rank: int = 4,
+        lora_target_modules: Optional[List[str]] = None,
         sd_locked: bool = True,
         # ── RefDiffRWKV ──
         patch_size: int = 4,
@@ -46,6 +47,7 @@ class SD2ControlLDM(pl.LightningModule):
         use_semantic: bool = True,
         dinov2_model_name: str = "facebook/dinov2-base",
         # ── Training ──
+        cfg_drop_prob: float = 0.1,
         learning_rate: float = 1e-4,
         num_train_timesteps: int = 1000,
         beta_start: float = 0.00085,
@@ -65,6 +67,7 @@ class SD2ControlLDM(pl.LightningModule):
         self.ref_key = ref_key
         self.hr_key = hr_key
         self.sd_locked = sd_locked
+        self.cfg_drop_prob = cfg_drop_prob
         self.learning_rate = learning_rate
         self.l_simple_weight = l_simple_weight
         self.sample_steps = sample_steps
@@ -84,7 +87,7 @@ class SD2ControlLDM(pl.LightningModule):
             sd_model_path, subfolder="unet", local_files_only=True
         )
         if use_lora:
-            self._inject_lora(lora_rank)
+            self._inject_lora(lora_rank, lora_target_modules)
         if sd_locked:
             self._freeze_unet_except_attn()
 
@@ -141,14 +144,17 @@ class SD2ControlLDM(pl.LightningModule):
     #  LoRA & 冻结
     # ═══════════════════════════════════════════════════════
 
-    def _inject_lora(self, rank: int):
+    def _inject_lora(self, rank: int, target_modules: list = None):
+        if target_modules is None:
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+
         from peft import LoraConfig
 
         self.unet.add_adapter(
             LoraConfig(
                 r=rank,
                 lora_alpha=rank,
-                target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+                target_modules=target_modules,
                 lora_dropout=0.0,
             )
         )
@@ -212,9 +218,7 @@ class SD2ControlLDM(pl.LightningModule):
     def _extract_ref(self, x_t_pixel, lr, ref):
         # 用索引访问而非解包：extract_ref_features 可能返回 3 或 4 个值
         # (sem_pyramid 在 use_semantic=True 且 ref 非零时作为第 4 个值返回)
-        result = self.ref_model.extract_ref_features(
-            x_t=x_t_pixel, LR=lr, Ref=ref
-        )
+        result = self.ref_model.extract_ref_features(x_t=x_t_pixel, LR=lr, Ref=ref)
         return list(self.ref_adapter(result[0], result[1], result[2]))
 
     # ═══════════════════════════════════════════════════════
@@ -237,9 +241,17 @@ class SD2ControlLDM(pl.LightningModule):
         noise = torch.randn_like(x0)
         x_t = self.noise_scheduler.add_noise(x0, noise, t)
 
+        ref_input = ref.to(self.device)
+        if self.cfg_drop_prob > 0:
+            drop_mask = torch.rand(B, device=self.device) < self.cfg_drop_prob
+            if drop_mask.any():
+                ref_input = ref_input.clone()
+                ref_input[drop_mask] = 0.0
+
         ref_feats = self._extract_ref(
-            self.decode_latent(x_t), lr.to(self.device), ref.to(self.device)
+            self.decode_latent(x_t), lr.to(self.device), ref_input
         )
+
 
         self._ref_features_for_hook = ref_feats
         self._hook_idx = 0
@@ -286,7 +298,7 @@ class SD2ControlLDM(pl.LightningModule):
         self.log("val/loss", F.mse_loss(pred, noise), on_epoch=True)
 
         if batch_idx == 0:
-            self._validate_iqa(batch, lr, ref, hr)
+            self._validate_iqa(lr, ref, hr)
 
     def configure_optimizers(self):
         params = list(self.ref_model.parameters()) + list(self.ref_adapter.parameters())
@@ -300,7 +312,7 @@ class SD2ControlLDM(pl.LightningModule):
     # ═══════════════════════════════════════════════════════
 
     @torch.no_grad()
-    def _validate_iqa(self, batch, lr, ref, hr):
+    def _validate_iqa(self, lr, ref, hr):
         B = hr.shape[0]
         _, _, H, W = self.encode_latent(hr.to(self.device)).shape
 
@@ -331,8 +343,8 @@ class SD2ControlLDM(pl.LightningModule):
         accum = {m: 0.0 for m in self.fr_metrics}
         for i in range(B):
             r = self.iqa.evaluate_single(
-                sr[i].cpu().permute(1, 2, 0).numpy(),
-                hr_norm[i].cpu().permute(1, 2, 0).numpy(),
+                sr[i].cpu().permute(1, 2, 0).float().numpy(),
+                hr_norm[i].cpu().permute(1, 2, 0).float().numpy(),
             )
             for k in accum:
                 accum[k] += r.get(k, 0.0)

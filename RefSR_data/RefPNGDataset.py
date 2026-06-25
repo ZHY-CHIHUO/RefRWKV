@@ -47,6 +47,9 @@ class RefPNGDataset(Dataset):
         ref_gray_prob: float = 0.2,
         max_samples: tuple = (None, None, None),
         sample_seed: int = 42,
+        lr_key: str = "lr",
+        hr_key: str = "hr",
+        ref_key: str = "ref",
     ):
         self.data_dir = Path(data_dir)
         self.mode = mode
@@ -65,6 +68,10 @@ class RefPNGDataset(Dataset):
         self.lr_dir = self.data_dir / mode / "LR"
         self.hr_dir = self.data_dir / mode / "HR"
         self.ref_dir = self.data_dir / mode / "Ref"
+
+        self.lr_key = lr_key
+        self.hr_key = hr_key
+        self.ref_key = ref_key
 
         if not self.lr_dir.exists():
             raise FileNotFoundError(f"LR directory not found: {self.lr_dir}")
@@ -231,7 +238,11 @@ class RefPNGDataset(Dataset):
             hr = np.ascontiguousarray(hr)
             ref = np.ascontiguousarray(ref)
 
-        return torch.from_numpy(lr), torch.from_numpy(hr), torch.from_numpy(ref)
+        return {
+            self.lr_key: torch.from_numpy(lr),
+            self.hr_key: torch.from_numpy(hr),
+            self.ref_key: torch.from_numpy(ref),
+        }
 
     def __len__(self):
         return len(self.filenames)
