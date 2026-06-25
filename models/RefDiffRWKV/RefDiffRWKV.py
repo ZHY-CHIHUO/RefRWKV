@@ -778,11 +778,7 @@ class RefDiffRWKV(nn.Module):
 
         # ── Step 1: LR 上采样到当前分辨率 ──
         # 将低分辨率输入（如 48×48）升采样到与 x_t 相同（如 480×480）
-        LR_up = (
-            self.lr_upsampler(LR)
-            if callable(self.lr_upsampler)
-            else self.lr_upsampler(LR)
-        )
+        LR_up = self.lr_upsampler(LR)
 
         # ── Step 2: Patch Embedding（双支路）──
         # main 支路: concat(noisy_image, LR_up) → 6 通道 → patch tokens

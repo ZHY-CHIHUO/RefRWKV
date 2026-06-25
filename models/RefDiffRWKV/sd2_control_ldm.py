@@ -9,7 +9,12 @@ from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
+
+_SCRIPT_DIR = str(Path(__file__).parent)             # .../RefDiffRWKV/
+_PROJECT_ROOT = str(Path(__file__).parent.parent.parent.parent)  # .../PROJECT/
+sys.path.insert(0, _SCRIPT_DIR)
+sys.path.insert(0, _PROJECT_ROOT)
+
 from RefDiffRWKV import RefDiffRWKV
 from sd2_ref_adapter import RWKV_Ref_Adapter
 from GlobalSemanticModule import GlobalSemanticModule
@@ -25,55 +30,59 @@ class SD2ControlLDM(pl.LightningModule):
     def __init__(
         self,
         # ── Data keys ──
-        lr_key:  str = "lr",
+        lr_key: str = "lr",
         ref_key: str = "ref",
-        hr_key:  str = "hr",
+        hr_key: str = "hr",
         # ── SD ──
         sd_model_path: str = "sd2-community/stable-diffusion-2-1-base",
-        use_lora:  bool = True,
+        use_lora: bool = True,
         lora_rank: int = 4,
         sd_locked: bool = True,
         # ── RefDiffRWKV ──
-        patch_size:    int = 4,
-        embed_dim:     int = 384,
+        patch_size: int = 4,
+        embed_dim: int = 384,
         upsample_mode: str = "bilinear",
         # ── GlobalSemantic ──
         use_semantic: bool = True,
-        dinov2_model: str = "facebook/dinov2-base",
+        dinov2_model_name: str = "facebook/dinov2-base",
         # ── Training ──
-        learning_rate:       float = 1e-4,
-        num_train_timesteps:  int = 1000,
-        beta_start:           float = 0.00085,
-        beta_end:             float = 0.012,
-        beta_schedule:        str = "scaled_linear",
-        prediction_type:      str = "epsilon",
-        l_simple_weight:      float = 1.0,
+        learning_rate: float = 1e-4,
+        num_train_timesteps: int = 1000,
+        beta_start: float = 0.00085,
+        beta_end: float = 0.012,
+        beta_schedule: str = "scaled_linear",
+        prediction_type: str = "epsilon",
+        l_simple_weight: float = 1.0,
         # ── Validation ──
         sample_steps: int = 50,
-        fr_metrics:   Optional[List[str]] = None,
-        iqa_device:   str = "cpu",
+        fr_metrics: Optional[List[str]] = None,
+        iqa_device: str = "cpu",
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.lr_key          = lr_key
-        self.ref_key         = ref_key
-        self.hr_key          = hr_key
-        self.sd_locked       = sd_locked
-        self.learning_rate   = learning_rate
+        self.lr_key = lr_key
+        self.ref_key = ref_key
+        self.hr_key = hr_key
+        self.sd_locked = sd_locked
+        self.learning_rate = learning_rate
         self.l_simple_weight = l_simple_weight
-        self.sample_steps    = sample_steps
-        self.fr_metrics      = fr_metrics or ["psnr", "ssim", "lpips", "dists"]
-        self.iqa_device      = iqa_device
+        self.sample_steps = sample_steps
+        self.fr_metrics = fr_metrics or ["psnr", "ssim", "lpips", "dists"]
+        self.iqa_device = iqa_device
 
         # 1. VAE（冻结）
-        self.vae = AutoencoderKL.from_pretrained(sd_model_path, subfolder="vae")
+        self.vae = AutoencoderKL.from_pretrained(
+            sd_model_path, subfolder="vae", local_files_only=True
+        )
         self.vae.requires_grad_(False)
         self.vae.eval()
         self.vae_scale_factor = self.vae.config.scaling_factor
 
         # 2. UNet + LoRA
-        self.unet = UNet2DConditionModel.from_pretrained(sd_model_path, subfolder="unet")
+        self.unet = UNet2DConditionModel.from_pretrained(
+            sd_model_path, subfolder="unet", local_files_only=True
+        )
         if use_lora:
             self._inject_lora(lora_rank)
         if sd_locked:
@@ -88,32 +97,33 @@ class SD2ControlLDM(pl.LightningModule):
             prediction_type=prediction_type,
         )
 
-        # 4. RefDiffRWKV
+        # 4. GlobalSemantic（先创建，再传给 RefDiffRWKV）
+        if use_semantic:
+            self.global_semantic = GlobalSemanticModule(
+                dinov2_model_name=dinov2_model_name,
+                unet_dim=embed_dim,
+            )
+        else:
+            self.global_semantic = None
+
+        # 5. RefDiffRWKV（构造器直接接收 global_semantic）
         self.ref_model = RefDiffRWKV(
             patch_size=patch_size,
             embed_dim=embed_dim,
             channels=3,
             upsample_mode=upsample_mode,
+            global_semantic=self.global_semantic,
         )
 
-        # 5. Adapter
+        # 6. Adapter
         self.ref_adapter = RWKV_Ref_Adapter(
-            in_dims=(384, 768, 1536),
-            out_dims=(320, 640, 1280),
+            ref_dims=(384, 768, 1536),
+            sd2_dims=(320, 640, 1280),
         )
-
-        # 6. GlobalSemantic
-        if use_semantic:
-            self.global_semantic = GlobalSemanticModule(
-                dinov2_model=dinov2_model,
-                unet_dim=embed_dim,
-            )
-            self.ref_model.global_semantic = self.global_semantic
-        else:
-            self.global_semantic = None
 
         # 7. IQAEngine
         from RefRWKV.evaluation.eval_pyiqa import IQAEngine
+
         self.iqa = IQAEngine(
             device=iqa_device,
             nr_metrics=[],
@@ -133,15 +143,19 @@ class SD2ControlLDM(pl.LightningModule):
 
     def _inject_lora(self, rank: int):
         from peft import LoraConfig
-        self.unet.add_adapter(LoraConfig(
-            r=rank,
-            lora_alpha=rank,
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-            lora_dropout=0.0,
-        ))
+
+        self.unet.add_adapter(
+            LoraConfig(
+                r=rank,
+                lora_alpha=rank,
+                target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+                lora_dropout=0.0,
+            )
+        )
         try:
             from diffusers.utils.peft_utils import set_weights_and_activate_adapters
-            set_weights_and_activate_adapters(self.unet)
+
+            set_weights_and_activate_adapters(self.unet, ["default"], [1.0])
         except (ImportError, AttributeError):
             pass
 
@@ -157,7 +171,8 @@ class SD2ControlLDM(pl.LightningModule):
     def _setup_unet_hooks(self):
         self._hooks = [
             self.unet.down_blocks[i].register_forward_hook(self._ref_injection_hook)
-            for i in [0, 1, 2] if i < len(self.unet.down_blocks)
+            for i in [0, 1, 2]
+            if i < len(self.unet.down_blocks)
         ]
 
     def _ref_injection_hook(self, module, input, output):
@@ -187,30 +202,37 @@ class SD2ControlLDM(pl.LightningModule):
 
     def _empty_context(self, B, device):
         return torch.zeros(
-            B, 77, self.unet.config.cross_attention_dim,
-            device=device, dtype=torch.float32,
+            B,
+            77,
+            self.unet.config.cross_attention_dim,
+            device=device,
+            dtype=torch.float32,
         )
 
     def _extract_ref(self, x_t_pixel, lr, ref):
-        rf1, rf2, rf3 = self.ref_model.extract_ref_features(
+        # 用索引访问而非解包：extract_ref_features 可能返回 3 或 4 个值
+        # (sem_pyramid 在 use_semantic=True 且 ref 非零时作为第 4 个值返回)
+        result = self.ref_model.extract_ref_features(
             x_t=x_t_pixel, LR=lr, Ref=ref
         )
-        return list(self.ref_adapter(rf1, rf2, rf3))
+        return list(self.ref_adapter(result[0], result[1], result[2]))
 
     # ═══════════════════════════════════════════════════════
     #  Training
     # ═══════════════════════════════════════════════════════
 
     def training_step(self, batch, batch_idx):
-        lr  = batch[self.lr_key].float()
+        lr = batch[self.lr_key].float()
         ref = batch[self.ref_key].float()
-        hr  = batch[self.hr_key].float()
+        hr = batch[self.hr_key].float()
 
         x0 = self.encode_latent(hr.to(self.device))
         B = x0.shape[0]
         t = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (B,), device=self.device,
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (B,),
+            device=self.device,
         ).long()
         noise = torch.randn_like(x0)
         x_t = self.noise_scheduler.add_noise(x0, noise, t)
@@ -222,7 +244,8 @@ class SD2ControlLDM(pl.LightningModule):
         self._ref_features_for_hook = ref_feats
         self._hook_idx = 0
         pred = self.unet(
-            x_t, t,
+            x_t,
+            t,
             encoder_hidden_states=self._empty_context(B, self.device),
         ).sample
         self._ref_features_for_hook = None
@@ -232,15 +255,17 @@ class SD2ControlLDM(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        lr  = batch[self.lr_key].float()
+        lr = batch[self.lr_key].float()
         ref = batch[self.ref_key].float()
-        hr  = batch[self.hr_key].float()
+        hr = batch[self.hr_key].float()
 
         x0 = self.encode_latent(hr.to(self.device))
         B = x0.shape[0]
         t = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (B,), device=self.device,
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (B,),
+            device=self.device,
         ).long()
         noise = torch.randn_like(x0)
         x_t = self.noise_scheduler.add_noise(x0, noise, t)
@@ -252,7 +277,8 @@ class SD2ControlLDM(pl.LightningModule):
         self._ref_features_for_hook = ref_feats
         self._hook_idx = 0
         pred = self.unet(
-            x_t, t,
+            x_t,
+            t,
             encoder_hidden_states=self._empty_context(B, self.device),
         ).sample
         self._ref_features_for_hook = None
@@ -263,10 +289,7 @@ class SD2ControlLDM(pl.LightningModule):
             self._validate_iqa(batch, lr, ref, hr)
 
     def configure_optimizers(self):
-        params = (
-            list(self.ref_model.parameters())
-            + list(self.ref_adapter.parameters())
-        )
+        params = list(self.ref_model.parameters()) + list(self.ref_adapter.parameters())
         if self.global_semantic is not None:
             params += list(self.global_semantic.parameters())
         params += [p for p in self.unet.parameters() if p.requires_grad]
@@ -294,14 +317,15 @@ class SD2ControlLDM(pl.LightningModule):
             self._ref_features_for_hook = ref_feats
             self._hook_idx = 0
             pred = self.unet(
-                latents, t_b,
+                latents,
+                t_b,
                 encoder_hidden_states=self._empty_context(B, self.device),
             ).sample
             self._ref_features_for_hook = None
             latents = self.noise_scheduler.step(pred, ts, latents).prev_sample
 
         sr = ((self.decode_latent(latents) + 1) / 2).clamp(0, 1)
-        hr_norm = ((hr.to(self.device) + 1) / 2)
+        hr_norm = (hr.to(self.device) + 1) / 2
         self.unet.train()
 
         accum = {m: 0.0 for m in self.fr_metrics}
@@ -322,7 +346,7 @@ class SD2ControlLDM(pl.LightningModule):
     @torch.no_grad()
     def inference(self, lr, ref, steps=None, seed=42):
         steps = steps or self.sample_steps
-        lr  = lr.to(self.device).float()
+        lr = lr.to(self.device).float()
         ref = ref.to(self.device).float()
 
         th, tw = lr.shape[2] * 10, lr.shape[3] * 10
@@ -334,8 +358,12 @@ class SD2ControlLDM(pl.LightningModule):
         g = torch.Generator(device=self.device).manual_seed(seed)
         self.unet.eval()
         latents = torch.randn(
-            1, 4, th // 8, tw // 8,
-            generator=g, device=self.device,
+            1,
+            4,
+            th // 8,
+            tw // 8,
+            generator=g,
+            device=self.device,
         )
         self.noise_scheduler.set_timesteps(steps)
 
@@ -346,7 +374,8 @@ class SD2ControlLDM(pl.LightningModule):
             self._ref_features_for_hook = ref_feats
             self._hook_idx = 0
             pred = self.unet(
-                latents, t_b,
+                latents,
+                t_b,
                 encoder_hidden_states=self._empty_context(1, self.device),
             ).sample
             self._ref_features_for_hook = None
@@ -365,8 +394,12 @@ if __name__ == "__main__":
 
     model = SD2ControlLDM(
         sd_model_path="sd2-community/stable-diffusion-2-1-base",
-        use_lora=True, lora_rank=4, sd_locked=True,
-        use_semantic=True, learning_rate=1e-4, sample_steps=20,
+        use_lora=True,
+        lora_rank=4,
+        sd_locked=True,
+        use_semantic=True,
+        learning_rate=1e-4,
+        sample_steps=20,
     ).to(device)
 
     total = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -374,9 +407,9 @@ if __name__ == "__main__":
 
     B, H, W = 2, 480, 480
     batch = {
-        "lr":  torch.randn(B, 3, 48, 48, device=device),
+        "lr": torch.randn(B, 3, 48, 48, device=device),
         "ref": torch.randn(B, 3, H, W, device=device),
-        "hr":  torch.randn(B, 3, H, W, device=device),
+        "hr": torch.randn(B, 3, H, W, device=device),
     }
     loss = model.training_step(batch, 0)
     print(f"Loss: {loss.item():.4f}")
