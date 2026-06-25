@@ -29,9 +29,9 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from RefRWKV.models.RefSRWKV import RefSRWKV
-from RefRWKV.models.RefDiffRWKV import RefDiffRWKV
+from RefRWKV.models.RefDiffRWKV.RefDiffRWKV import RefDiffRWKV
 from RefRWKV.models.EnRWKV import EnRWKV
-from RefRWKV.models.GlobalSemanticModule import GlobalSemanticModule
+from RefRWKV.models.RefDiffRWKV.GlobalSemanticModule import GlobalSemanticModule
 from RefRWKV.RefSR_data.RefPNGDataset import RefPNGDataset
 from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 

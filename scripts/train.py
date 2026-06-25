@@ -30,9 +30,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==================== 导入模型和数据集 ====================
 from RefRWKV.models.RefSRWKV import RefSRWKV
-from RefRWKV.models.RefDiffRWKV import RefDiffRWKV
+from RefRWKV.models.RefDiffRWKV.RefDiffRWKV import RefDiffRWKV
 from RefRWKV.models.EnRWKV import EnRWKV
-from RefRWKV.models.GlobalSemanticModule import GlobalSemanticModule
+from RefRWKV.models.RefDiffRWKV.GlobalSemanticModule import GlobalSemanticModule
 from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
 from RefRWKV.RefRWKV_PL import LitRefSRWKV, LitRefDiffRWKV, LitEnRWKV
 

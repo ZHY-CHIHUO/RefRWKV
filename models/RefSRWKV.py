@@ -10,13 +10,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.utils.cpp_extension import load
+import os
+
+_cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 
 # ═══════════════════════════════════════════════════════════════
 # CUDA WKV (unchanged — keep your working kernel)
 # ═══════════════════════════════════════════════════════════════
 wkv_cuda = load(
     name="bi_wkv",
-    sources=["./models/cuda/bi_wkv.cpp", "./models/cuda/bi_wkv_kernel.cu"],
+    sources=[
+        os.path.join(_cuda_dir, "bi_wkv.cpp"),
+        os.path.join(_cuda_dir, "bi_wkv_kernel.cu"),
+    ],
     verbose=True,
     extra_cuda_cflags=[
         "-res-usage",
