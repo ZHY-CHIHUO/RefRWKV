@@ -86,6 +86,7 @@ class SD2ControlLDM(pl.LightningModule):
         self.unet = UNet2DConditionModel.from_pretrained(
             sd_model_path, subfolder="unet", local_files_only=True
         )
+        self.unet.enable_gradient_checkpointing()
         if use_lora:
             self._inject_lora(lora_rank, lora_target_modules)
         if sd_locked:
@@ -335,16 +336,23 @@ class SD2ControlLDM(pl.LightningModule):
             ).sample
             self._ref_features_for_hook = None
             latents = self.noise_scheduler.step(pred, ts, latents).prev_sample
+            
+            # ← 每步清理中间变量
+            del x_t_pixel, ref_feats, pred
+            torch.cuda.empty_cache()
 
         sr = ((self.decode_latent(latents) + 1) / 2).clamp(0, 1)
+        del latents
+        torch.cuda.empty_cache()
+        
         hr_norm = (hr.to(self.device) + 1) / 2
         self.unet.train()
 
         accum = {m: 0.0 for m in self.fr_metrics}
         for i in range(B):
             r = self.iqa.evaluate_single(
-                sr[i].cpu().permute(1, 2, 0).float().numpy(),
-                hr_norm[i].cpu().permute(1, 2, 0).float().numpy(),
+                sr[i].cpu().float().permute(1, 2, 0).numpy(),
+                hr_norm[i].cpu().float().permute(1, 2, 0).numpy(),
             )
             for k in accum:
                 accum[k] += r.get(k, 0.0)
