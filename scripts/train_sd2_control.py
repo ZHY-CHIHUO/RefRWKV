@@ -298,14 +298,18 @@ def main():
 
     # 复制配置文件到 checkpoint 目录
     output_cfg = cfg.get("output", {})
-    checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints/sd2_control")
-    log_dir = output_cfg.get("log_dir", "logs/sd2_control")
+    checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints")
+    log_dir = output_cfg.get("log_dir", "logs")
+    experiment_name = output_cfg.get("experiment_name", "")
+
+    # 拼上实验名
+    if experiment_name:
+        checkpoint_dir = os.path.join(checkpoint_dir, experiment_name)
+
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     shutil.copy2(args.config, os.path.join(checkpoint_dir, "train_config.yaml"))
 
-    # 删除了原来 build_dataloaders + 打印摘要的代码
-    # DataLoader 只在 train() 内部创建一次
 
     best_ckpt, best_score = train(cfg, resume_ckpt=args.resume)
 
