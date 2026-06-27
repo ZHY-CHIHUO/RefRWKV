@@ -250,9 +250,8 @@ class SD2ControlLDM(pl.LightningModule):
                 ref_input[drop_mask] = 0.0
 
         ref_feats = self._extract_ref(
-            self.decode_latent(x_t), lr.to(self.device), ref_input
+            self.decode_latent(x_t).clamp(-1, 1), lr.to(self.device), ref_input
         )
-
 
         self._ref_features_for_hook = ref_feats
         self._hook_idx = 0
@@ -284,7 +283,7 @@ class SD2ControlLDM(pl.LightningModule):
         x_t = self.noise_scheduler.add_noise(x0, noise, t)
 
         ref_feats = self._extract_ref(
-            self.decode_latent(x_t), lr.to(self.device), ref.to(self.device)
+            self.decode_latent(x_t).clamp(-1, 1), lr.to(self.device), ref.to(self.device)
         )
 
         self._ref_features_for_hook = ref_feats
@@ -323,7 +322,7 @@ class SD2ControlLDM(pl.LightningModule):
 
         for ts in self.noise_scheduler.timesteps:
             t_b = torch.full((B,), ts, device=self.device).long()
-            x_t_pixel = self.decode_latent(latents)
+            x_t_pixel = self.decode_latent(latents).clamp(-1, 1)
             ref_feats = self._extract_ref(
                 x_t_pixel, lr.to(self.device), ref.to(self.device)
             )
