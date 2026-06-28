@@ -21,4 +21,4 @@ rsync -avzP --partial --exclude='__pycache__' --exclude='.git' project/ 4090:/ta
 rsync -avzP --partial --delete project/ 4090:/target/project/
 
 # 查看log
-tensorboard --logdir logs/sd2_control
+tensorboard --logdir logs/sd2_control_ldm/
