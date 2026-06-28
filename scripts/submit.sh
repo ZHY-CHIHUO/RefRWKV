@@ -19,3 +19,6 @@ rsync -avzP --partial --exclude='__pycache__' --exclude='.git' project/ 4090:/ta
 
 # 同步（删除远程多余文件，慎用）
 rsync -avzP --partial --delete project/ 4090:/target/project/
+
+# 查看log
+tensorboard --logdir logs/sd2_control
