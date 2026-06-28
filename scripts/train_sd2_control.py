@@ -22,6 +22,7 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     LearningRateMonitor,
     EarlyStopping,
+    Callback,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 
@@ -31,6 +32,22 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # ==================== 导入模型和数据集 ====================
 from RefRWKV.models.RefDiffRWKV.sd2_control_ldm import SD2ControlLDM
 from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
+
+
+# ============================================================
+# NaN 监测回调
+# ============================================================
+class NaNMonitorCallback(Callback):
+    """在每个 backward 后检查所有参数梯度是否含 NaN / Inf。"""
+
+    def on_after_backward(self, trainer, model):
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            if torch.isnan(param.grad).any():
+                print(f"[NaN grad] {name} | step={trainer.global_step}")
+            if torch.isinf(param.grad).any():
+                print(f"[Inf grad] {name} | step={trainer.global_step}")
 
 
 # ============================================================
@@ -168,10 +185,13 @@ def build_model(cfg: dict) -> SD2ControlLDM:
         beta_schedule=mc.get("beta_schedule", "scaled_linear"),
         prediction_type=mc.get("prediction_type", "epsilon"),
         l_simple_weight=mc.get("l_simple_weight", 1.0),
+        weight_decay=mc.get("weight_decay", 1e-3),
         # Validation
         sample_steps=mc.get("sample_steps", 50),
         fr_metrics=mc.get("fr_metrics", None),
         iqa_device=mc.get("iqa_device", "cuda"),
+        # Debug
+        debug_nan=mc.get("debug_nan", True),                       # 新增
     )
 
 
@@ -186,6 +206,7 @@ def build_trainer(
     logger = TensorBoardLogger(log_dir, name=exp_name)
 
     callbacks = [
+        NaNMonitorCallback(),                                     # 新增：梯度 NaN 监测
         EarlyStopping(
             monitor="val/loss",
             patience=train_cfg.get("early_stopping_patience", 20),
@@ -194,7 +215,7 @@ def build_trainer(
         ),
         ModelCheckpoint(
             dirpath=full_checkpoint_dir,
-            filename="{epoch:04d}-{val_loss:.5f}",
+            filename="{epoch:04d}-{step:06d}",
             monitor="val/loss",
             save_top_k=train_cfg.get("save_top_k", 3),
             mode="min",
@@ -225,6 +246,10 @@ def build_trainer(
 # ============================================================
 def train(cfg: dict, resume_ckpt: str = None):
     """训练 SD2ControlLDM。"""
+
+    # ── 开启自动异常检测（调试用，训练慢 10-20%）──
+    torch.autograd.set_detect_anomaly(True)
+
     train_cfg = cfg["train"]
     output_cfg = cfg.get("output", {})
     checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints/sd2_control")
@@ -272,6 +297,7 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  LoRA rank   : {mc.get('lora_rank', 4)}")
     print(f"  LR          : {mc.get('learning_rate', 1e-4)}")
     print(f"  Semantic    : {mc.get('use_semantic', False)}")
+    print(f"  NaN debug   : {mc.get('debug_nan', True)}")         # 新增
     print(f"{'='*60}")
 
     # 开始训练
@@ -309,7 +335,6 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     shutil.copy2(args.config, os.path.join(checkpoint_dir, "train_config.yaml"))
-
 
     best_ckpt, best_score = train(cfg, resume_ckpt=args.resume)
 

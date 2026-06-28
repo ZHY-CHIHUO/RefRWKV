@@ -55,10 +55,13 @@ class SD2ControlLDM(pl.LightningModule):
         beta_schedule: str = "scaled_linear",
         prediction_type: str = "epsilon",
         l_simple_weight: float = 1.0,
+        weight_decay: float = 1e-3,
         # ── Validation ──
         sample_steps: int = 50,
         fr_metrics: Optional[List[str]] = None,
         iqa_device: str = "cpu",
+        # ── Debug ──
+        debug_nan: bool = True,                              # 新增
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -73,6 +76,11 @@ class SD2ControlLDM(pl.LightningModule):
         self.sample_steps = sample_steps
         self.fr_metrics = fr_metrics or ["psnr", "ssim", "lpips", "dists"]
         self.iqa_device = iqa_device
+        self.weight_decay = weight_decay
+        self.debug_nan = debug_nan                          # 新增
+
+        # NaN 计数器
+        self._nan_count = 0                                  # 新增
 
         # 1. VAE（冻结）
         self.vae = AutoencoderKL.from_pretrained(
@@ -136,9 +144,8 @@ class SD2ControlLDM(pl.LightningModule):
             verbose=False,
         )
 
-        # 8. UNet hooks
-        self._ref_features_for_hook: Optional[List[torch.Tensor]] = None
-        self._hook_idx: int = 0
+        # 8. UNet hooks — 按模块属性索引，兼容 gradient checkpointing
+        self._injection_blocks: List = []
         self._setup_unet_hooks()
 
     # ═══════════════════════════════════════════════════════
@@ -172,28 +179,60 @@ class SD2ControlLDM(pl.LightningModule):
                 p.requires_grad = False
 
     # ═══════════════════════════════════════════════════════
-    #  UNet Hook
+    #  UNet Hook（核心修改）
     # ═══════════════════════════════════════════════════════
 
     def _setup_unet_hooks(self):
-        self._hooks = [
-            self.unet.down_blocks[i].register_forward_hook(self._ref_injection_hook)
-            for i in [0, 1, 2]
-            if i < len(self.unet.down_blocks)
-        ]
+        for h in getattr(self, '_hook_handles', []):
+            h.remove()
+        self._injection_blocks = []
+        self._hook_handles = []
+        for i in [0, 1, 2]:
+            if i < len(self.unet.down_blocks):
+                block = self.unet.down_blocks[i]
+                handle = block.register_forward_hook(self._ref_injection_hook)
+                self._hook_handles.append(handle)
+                self._injection_blocks.append(block)
 
     def _ref_injection_hook(self, module, input, output):
-        if self._ref_features_for_hook is None:
+        """从模块自身属性读取特征，梯度检查点重算时特征依然存在。"""
+        feat = getattr(module, '_ref_feat', None)
+        if feat is None:
             return output
-        idx = self._hook_idx
-        if idx < len(self._ref_features_for_hook):
-            feat = self._ref_features_for_hook[idx]
-            hidden = output[0]
-            if hidden.shape[2:] != feat.shape[2:]:
-                feat = F.interpolate(feat, size=hidden.shape[2:], mode="nearest")
-            output = (hidden + feat,) + output[1:]
-            self._hook_idx += 1
-        return output
+        hidden = output[0]
+        if hidden.shape[2:] != feat.shape[2:]:
+            feat = F.interpolate(feat, size=hidden.shape[2:], mode='bilinear',
+                                 align_corners=False)
+        return (hidden + feat,) + output[1:]
+
+    def _inject_ref_feats(self, ref_feats: List[torch.Tensor]):
+        """将 ref 特征写入各 down block 的属性。"""
+        for block, feat in zip(self._injection_blocks, ref_feats):
+            block._ref_feat = feat
+
+    def _clear_ref_feats(self):
+        """清理注入的特征。"""
+        for block in self._injection_blocks:
+            if hasattr(block, '_ref_feat'):
+                del block._ref_feat
+
+    # ═══════════════════════════════════════════════════════
+    #  调试工具
+    # ═══════════════════════════════════════════════════════
+
+    def _check_tensor(self, t, name=""):
+        """检测张量是否含 NaN / Inf。返回 True 表示异常。"""
+        if not self.debug_nan:
+            return False
+        if torch.isnan(t).any():
+            print(f"[NaN] {name} | step={self.global_step} | "
+                  f"shape={t.shape} | min={t.min():.6f} max={t.max():.6f}")
+            return True
+        if torch.isinf(t).any():
+            print(f"[Inf] {name} | step={self.global_step} | "
+                  f"shape={t.shape} | min={t.min():.6f} max={t.max():.6f}")
+            return True
+        return False
 
     # ═══════════════════════════════════════════════════════
     #  VAE helpers
@@ -217,8 +256,6 @@ class SD2ControlLDM(pl.LightningModule):
         )
 
     def _extract_ref(self, x_t_pixel, lr, ref):
-        # 用索引访问而非解包：extract_ref_features 可能返回 3 或 4 个值
-        # (sem_pyramid 在 use_semantic=True 且 ref 非零时作为第 4 个值返回)
         result = self.ref_model.extract_ref_features(x_t=x_t_pixel, LR=lr, Ref=ref)
         return list(self.ref_adapter(result[0], result[1], result[2]))
 
@@ -231,7 +268,18 @@ class SD2ControlLDM(pl.LightningModule):
         ref = batch[self.ref_key].float()
         hr = batch[self.hr_key].float()
 
+        # ── 守卫：输入数据 ──
+        if self._check_tensor(lr, "input lr"):
+            return None
+        if self._check_tensor(ref, "input ref"):
+            return None
+        if self._check_tensor(hr, "input hr"):
+            return None
+
         x0 = self.encode_latent(hr.to(self.device))
+        if self._check_tensor(x0, "x0 (latent)"):
+            return None
+
         B = x0.shape[0]
         t = torch.randint(
             0,
@@ -241,6 +289,8 @@ class SD2ControlLDM(pl.LightningModule):
         ).long()
         noise = torch.randn_like(x0)
         x_t = self.noise_scheduler.add_noise(x0, noise, t)
+        if self._check_tensor(x_t, "x_t (noisy latent)"):
+            return None
 
         ref_input = ref.to(self.device)
         if self.cfg_drop_prob > 0:
@@ -249,20 +299,42 @@ class SD2ControlLDM(pl.LightningModule):
                 ref_input = ref_input.clone()
                 ref_input[drop_mask] = 0.0
 
-        ref_feats = self._extract_ref(
-            self.decode_latent(x_t).clamp(-1, 1), lr.to(self.device), ref_input
-        )
+        # ── decode + extract ref ──
+        x_t_pixel = self.decode_latent(x_t).clamp(-1, 1)
+        if self._check_tensor(x_t_pixel, "x_t_pixel"):
+            return None
 
-        self._ref_features_for_hook = ref_feats
-        self._hook_idx = 0
+        ref_feats = self._extract_ref(x_t_pixel, lr.to(self.device), ref_input)
+
+        # ── 守卫：ref 特征 ──
+        for i, f in enumerate(ref_feats):
+            if self._check_tensor(f, f"ref_feat[{i}]"):
+                return None
+
+        # 按模块属性注入
+        self._inject_ref_feats(ref_feats)
         pred = self.unet(
             x_t,
             t,
             encoder_hidden_states=self._empty_context(B, self.device),
         ).sample
-        self._ref_features_for_hook = None
+
+        if self._check_tensor(pred, "pred (UNet output)"):
+            return None
 
         loss = F.mse_loss(pred, noise) * self.l_simple_weight
+
+        if self._check_tensor(loss, "loss"):
+            self._nan_count += 1
+            print(f"⚠️  NaN loss #{self._nan_count} at step {self.global_step}")
+            if self._nan_count >= 10:
+                raise RuntimeError(
+                    f"连续 {self._nan_count} 步 NaN，终止训练 (step {self.global_step})"
+                )
+            return None
+        else:
+            self._nan_count = 0
+
         self.log("train/loss", loss, prog_bar=True, on_step=True)
         return loss
 
@@ -282,20 +354,21 @@ class SD2ControlLDM(pl.LightningModule):
         noise = torch.randn_like(x0)
         x_t = self.noise_scheduler.add_noise(x0, noise, t)
 
+        x_t_pixel = self.decode_latent(x_t).clamp(-1, 1)
         ref_feats = self._extract_ref(
-            self.decode_latent(x_t).clamp(-1, 1), lr.to(self.device), ref.to(self.device)
+            x_t_pixel, lr.to(self.device), ref.to(self.device)
         )
 
-        self._ref_features_for_hook = ref_feats
-        self._hook_idx = 0
+        self._inject_ref_feats(ref_feats)
         pred = self.unet(
             x_t,
             t,
             encoder_hidden_states=self._empty_context(B, self.device),
         ).sample
-        self._ref_features_for_hook = None
 
-        self.log("val/loss", F.mse_loss(pred, noise), on_epoch=True)
+        val_loss = F.mse_loss(pred, noise)
+        self.log("val/loss", val_loss, on_epoch=True)
+        self.log("val_loss", val_loss, on_epoch=True)
 
         if batch_idx == 0:
             self._validate_iqa(lr, ref, hr)
@@ -305,7 +378,8 @@ class SD2ControlLDM(pl.LightningModule):
         if self.global_semantic is not None:
             params += list(self.global_semantic.parameters())
         params += [p for p in self.unet.parameters() if p.requires_grad]
-        return torch.optim.AdamW(params, lr=self.learning_rate)
+        return torch.optim.AdamW(params, lr=self.learning_rate,
+                                 weight_decay=self.weight_decay)
 
     # ═══════════════════════════════════════════════════════
     #  IQA
@@ -320,43 +394,43 @@ class SD2ControlLDM(pl.LightningModule):
         self.noise_scheduler.set_timesteps(self.sample_steps)
         self.unet.eval()
 
-        for ts in self.noise_scheduler.timesteps:
-            t_b = torch.full((B,), ts, device=self.device).long()
-            x_t_pixel = self.decode_latent(latents).clamp(-1, 1)
-            ref_feats = self._extract_ref(
-                x_t_pixel, lr.to(self.device), ref.to(self.device)
-            )
-            self._ref_features_for_hook = ref_feats
-            self._hook_idx = 0
-            pred = self.unet(
-                latents,
-                t_b,
-                encoder_hidden_states=self._empty_context(B, self.device),
-            ).sample
-            self._ref_features_for_hook = None
-            latents = self.noise_scheduler.step(pred, ts, latents).prev_sample
-            
-            # ← 每步清理中间变量
-            del x_t_pixel, ref_feats, pred
+        try:
+            for ts in self.noise_scheduler.timesteps:
+                t_b = torch.full((B,), ts, device=self.device).long()
+                x_t_pixel = self.decode_latent(latents).clamp(-1, 1)
+                ref_feats = self._extract_ref(
+                    x_t_pixel, lr.to(self.device), ref.to(self.device)
+                )
+                self._inject_ref_feats(ref_feats)
+                pred = self.unet(
+                    latents,
+                    t_b,
+                    encoder_hidden_states=self._empty_context(B, self.device),
+                ).sample
+                self._clear_ref_feats()
+                latents = self.noise_scheduler.step(pred, ts, latents).prev_sample
+
+                del x_t_pixel, ref_feats, pred
+                torch.cuda.empty_cache()
+
+            sr = ((self.decode_latent(latents) + 1) / 2).clamp(0, 1)
+            del latents
             torch.cuda.empty_cache()
 
-        sr = ((self.decode_latent(latents) + 1) / 2).clamp(0, 1)
-        del latents
-        torch.cuda.empty_cache()
-        
-        hr_norm = (hr.to(self.device) + 1) / 2
-        self.unet.train()
+            hr_norm = (hr.to(self.device) + 1) / 2
 
-        accum = {m: 0.0 for m in self.fr_metrics}
-        for i in range(B):
-            r = self.iqa.evaluate_single(
-                sr[i].cpu().float().permute(1, 2, 0).numpy(),
-                hr_norm[i].cpu().float().permute(1, 2, 0).numpy(),
-            )
-            for k in accum:
-                accum[k] += r.get(k, 0.0)
-        for k, v in accum.items():
-            self.log(f"val/{k}", v / B)
+            accum = {m: 0.0 for m in self.fr_metrics}
+            for i in range(B):
+                r = self.iqa.evaluate_single(
+                    sr[i].cpu().float().permute(1, 2, 0).numpy(),
+                    hr_norm[i].cpu().float().permute(1, 2, 0).numpy(),
+                )
+                for k in accum:
+                    accum[k] += r.get(k, 0.0)
+            for k, v in accum.items():
+                self.log(f"val/{k}", v / B)
+        finally:
+            self.unet.train()
 
     # ═══════════════════════════════════════════════════════
     #  推理
@@ -388,19 +462,28 @@ class SD2ControlLDM(pl.LightningModule):
 
         for ts in self.noise_scheduler.timesteps:
             t_b = torch.full((1,), ts, device=self.device).long()
-            x_t_pixel = self.decode_latent(latents)
+            x_t_pixel = self.decode_latent(latents).clamp(-1, 1)
             ref_feats = self._extract_ref(x_t_pixel, lr, ref)
-            self._ref_features_for_hook = ref_feats
-            self._hook_idx = 0
+            self._inject_ref_feats(ref_feats)
             pred = self.unet(
                 latents,
                 t_b,
                 encoder_hidden_states=self._empty_context(1, self.device),
             ).sample
-            self._ref_features_for_hook = None
+            self._clear_ref_feats()
             latents = self.noise_scheduler.step(pred, ts, latents).prev_sample
 
         return ((self.decode_latent(latents) + 1) / 2).clamp(0, 1)
+
+    # ═══════════════════════════════════════════════════════
+    #  Checkpoint 序列化兼容
+    # ═══════════════════════════════════════════════════════
+
+    def on_save_checkpoint(self, checkpoint):
+        self._clear_ref_feats()
+
+    def on_load_checkpoint(self, checkpoint):
+        self._setup_unet_hooks()
 
 
 # ═══════════════════════════════════════════════════════
