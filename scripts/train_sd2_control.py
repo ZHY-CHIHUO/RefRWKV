@@ -246,12 +246,14 @@ def build_trainer(
 # ============================================================
 def train(cfg: dict, resume_ckpt: str = None):
     """训练 SD2ControlLDM。"""
-
-    # ── 开启自动异常检测（调试用，训练慢 10-20%）──
-    torch.autograd.set_detect_anomaly(True)
-
     train_cfg = cfg["train"]
     output_cfg = cfg.get("output", {})
+
+    # ── 开启自动异常检测（调试用，训练慢 10-20%）──
+    if train_cfg.get("detect_anomaly", False):
+        torch.autograd.set_detect_anomaly(True)
+        print("⚠️  autograd 异常检测已开启，训练速度会降低")
+
     checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints/sd2_control")
     log_dir = output_cfg.get("log_dir", "logs/sd2_control")
     exp_name = output_cfg.get("experiment_name", "sd2_control")

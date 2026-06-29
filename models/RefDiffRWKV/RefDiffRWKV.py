@@ -8,13 +8,12 @@ RefDiffRWKV.py — Ref 特征提取管线
         LR=lr_image,             # 低分辨率输入
         Ref=ref_image            # 参考图像
     )
-    # rf1: (B, 384, H/4, W/4)   → SD2 down_blocks[0]
-    # rf2: (B, 768, H/8, W/8)   → SD2 down_blocks[1]
-    # rf3: (B, 1536, H/16, W/16) → SD2 down_blocks[2]
+# rf1: (B, 384, H/8, W/8)    → SD2 down_blocks[0]
+# rf2: (B, 768, H/16, W/16)  → SD2 down_blocks[1]
+# rf3: (B, 1536, H/32, W/32) → SD2 down_blocks[2]
 
 """
 
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -57,7 +56,9 @@ def get_2d_sincos_pos_embed(embed_dim, h, w, cls_token=False, extra_tokens=0):
     """
     grid_h = np.arange(h, dtype=np.float32)
     grid_w = np.arange(w, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # 注意：先 w 后 h，产生 (2, h, w)
+    grid = np.meshgrid(
+        grid_w, grid_h, indexing="xy"
+    )  # 显式指定 xy 索引，兼容 numpy ≥ 1.22
     grid = np.stack(grid, axis=0)
     grid = grid.reshape([2, 1, h, w])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
@@ -96,7 +97,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
         emb: shape (M, embed_dim)
     """
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
     omega /= embed_dim / 2.0
     omega = 1.0 / 10000**omega  # (D/2,)
 
@@ -163,8 +164,11 @@ class VRWKV_SpatialMix(nn.Module):
 
     核心改进 (vs. 原始 RWKV):
         - 用 OmniShift（多尺度深度卷积）替代 q_shift，提供局部邻域信息
-        - 使用两次 WKV 扫描（正向 + 转置方向），实现近似全局双向交互
-        - 移除与层数相关的初始化，参数更干净
+        - 使用两次级联 WKV 扫描实现近全局双向感受野:
+            j=0: 行优先扫描 → 每个 token 聚合同行左侧上下文
+            j=1: 以 j=0 输出为基础，做列优先扫描 → 聚合同列上方上下文
+          两次级联后每个 token 近似看到整个 2D 邻域的上下文。
+        - 使用全负数衰减初始化，避免长序列下 WKV 状态爆炸
 
     Args:
         n_embd: token 嵌入维度
@@ -173,7 +177,7 @@ class VRWKV_SpatialMix(nn.Module):
     def __init__(self, n_embd: int):
         super().__init__()
         self.n_embd = n_embd
-        self.recurrence = 2  # 双向扫描次数: 正向 + 转置方向
+        self.recurrence = 2  # 级联扫描次数: 行优先 → 列优先
 
         # 局部空间增强（替代原版 q_shift）
         # Local enhancement via OmniShift (replaces q_shift)
@@ -186,14 +190,14 @@ class VRWKV_SpatialMix(nn.Module):
         self.output = nn.Linear(n_embd, n_embd, bias=False)
 
         # 双向衰减 & 首位置偏置参数，形状 (2, n_embd)
+        # 全负数初始化：exp(decay) < 1，保证 WKV 状态指数衰减而非爆炸
         # Bidirectional decay and first-position bias, shape (2, n_embd)
         with torch.no_grad():
+            decay_base = torch.linspace(-1.0, -6.0, n_embd)
             self.spatial_decay = nn.Parameter(
-                torch.randn(self.recurrence, n_embd) * 0.1
+                decay_base.unsqueeze(0).expand(self.recurrence, -1).clone()
             )
-            self.spatial_first = nn.Parameter(
-                torch.randn(self.recurrence, n_embd) * 0.1
-            )
+            self.spatial_first = nn.Parameter(torch.zeros(self.recurrence, n_embd))
 
     def jit_func(self, x: torch.Tensor, resolution: tuple):
         """
@@ -224,12 +228,15 @@ class VRWKV_SpatialMix(nn.Module):
 
     def forward(self, x: torch.Tensor, resolution: tuple):
         """
-        双向 WKV 扫描。
+        级联双向 WKV 扫描。
 
-        recurrence=2 的两次扫描:
-            j=0: 标准正向扫描（行优先）
-            j=1: 转置方向扫描（列优先 → WKV → 转回）
-                 等效于在另一个方向做双向感受野
+        recurrence=2 的两次级联扫描:
+            j=0: 行优先扫描 → 每个 token 看到同行左侧上下文
+            j=1: 以 j=0 输出为输入，做列优先扫描 → 聚合同列上方上下文
+                 两次级联后每个 token 近似拥有整个 2D 邻域的感受野。
+
+        注意: 两次扫描是级联而非并行——j=1 的输入是 j=0 的输出，
+        因此最终状态同时包含了行和列两个方向的信息。
         """
         B, T, C = x.shape
         sr, k, v = self.jit_func(x, resolution)
@@ -237,7 +244,7 @@ class VRWKV_SpatialMix(nn.Module):
 
         for j in range(self.recurrence):
             if j % 2 == 0:
-                # 正向扫描: 行优先 → 每个 token 看到左侧上下文
+                # 正向扫描: 行优先 → 每个 token 看到同行左侧上下文
                 # Forward scan: row-major, each token attends to left context
                 v = RUN_CUDA(
                     self.spatial_decay[j] / s,
@@ -246,19 +253,18 @@ class VRWKV_SpatialMix(nn.Module):
                     v,
                 )
             else:
-                # 转置扫描: 列优先 → 等效于从上到下看上下文
-                # Transposed scan: col-major, equivalent to top-down context
+                # 转置扫描: 以 j=0 输出为基础，列优先 → 聚合同列上方上下文
+                # Transposed scan: operates on j=0 output, col-major
                 h, w = resolution
-                k = rearrange(k, "b (h w) c -> b (w h) c", h=h, w=w)
-                v = rearrange(v, "b (h w) c -> b (w h) c", h=h, w=w)
-                v = RUN_CUDA(
+                k_t = rearrange(k.clone(), "b (h w) c -> b (w h) c", h=h, w=w)
+                v_t = rearrange(v, "b (h w) c -> b (w h) c", h=h, w=w)
+                v_t = RUN_CUDA(
                     self.spatial_decay[j] / s,
                     self.spatial_first[j] / s,
-                    k,
-                    v,
+                    k_t,
+                    v_t,
                 )
-                k = rearrange(k, "b (w h) c -> b (h w) c", h=h, w=w)
-                v = rearrange(v, "b (w h) c -> b (h w) c", h=h, w=w)
+                v = rearrange(v_t, "b (w h) c -> b (h w) c", h=h, w=w)
 
         x = sr * v  # 门控
         x = self.output(x)  # 输出投影
@@ -274,9 +280,6 @@ class VRWKV_ChannelMix(nn.Module):
         - 移除 q_shift + spatial_mix_k/r 的插值混合
         - 改用 OmniShift 提供局部空间信息
         - 保留 RWKV 的平方激活门控: k = relu(k)^2
-
-    注: 本模块在当前精简版中未被直接调用，保留作为备用的通道混合工具。
-    Note: Not directly used in this stripped-down version; kept as a utility.
 
     Args:
         n_embd:      输入/输出维度
@@ -347,8 +350,6 @@ class Upsample(nn.Module):
     通道数减半，空间分辨率翻倍。
 
     示例: (B, C, H, W) → (B, C/2, H*2, W*2)
-
-    注: 在当前精简版中保留作为备用工具。
     """
 
     def __init__(self, n_feat):
@@ -454,12 +455,9 @@ class RefMultiScaleProcessor(nn.Module):
             ▼ transpose + reshape
         (B, embed_dim, H, W)
             │
-            ├─► proj1 → ChannelMix(f1) ─────────────► f1  (B, d1, H,   W)
-            │
-            ├─► downsample → adapt1 → ChannelMix(f2) ► f2  (B, d2, H/2, W/2)
-            │
-            └─► downsample → adapt2 → ChannelMix(f3) ► f3  (B, d3, H/4, W/4)
-
+            ├─► proj1 → ChannelMix(f1) → 2×↓ ──────► f1  (B, d1, H/2,   W/2)
+            ├─► downsample → adapt1 → ChannelMix(f2) → 2×↓ ► f2  (B, d2, H/4, W/4)
+            └─► downsample → adapt2 → ChannelMix(f3) → 2×↓ ► f3  (B, d3, H/8, W/8)
 
     Args:
         embed_dim: Ref token 的嵌入维度
@@ -491,9 +489,9 @@ class RefMultiScaleProcessor(nn.Module):
             H, W:       特征图的空间尺寸（patch 数量）
 
         Returns:
-            f1: (B, d1, H,   W)
-            f2: (B, d2, H/2, W/2)
-            f3: (B, d3, H/4, W/4)
+            f1: (B, d2, H/2, W/2)
+            f2: (B, d3, H/4, W/4)
+            f3: (B, d3, H/8, W/8)
         """
         B, _, C = ref_tokens.shape
         x = ref_tokens.transpose(1, 2).reshape(B, C, H, W)
@@ -509,6 +507,10 @@ class RefMultiScaleProcessor(nn.Module):
         # Level 3
         f3 = self.adapt2(self.down2(f2))  # (B, d3, H/4, W/4)
         f3 = self._apply_channel_mix(f3, self.channel_mix3)
+
+        f1 = F.interpolate(f1, scale_factor=0.5, mode="bilinear", align_corners=False)
+        f2 = F.interpolate(f2, scale_factor=0.5, mode="bilinear", align_corners=False)
+        f3 = F.interpolate(f3, scale_factor=0.5, mode="bilinear", align_corners=False)
 
         return f1, f2, f3
 
@@ -542,7 +544,7 @@ class RefMultiScaleProcessor(nn.Module):
 
 class CrossFusion(nn.Module):
     """
-    跨图融合模块: main 和 ref 各自经过双向 WKV 扫描后，
+    跨图融合模块: main 和 ref 各自经过级联双向 WKV 扫描后，
     通过门控机制融合: main_out = main + gate * fused。
 
     设计动机 (Motivation):
@@ -562,8 +564,8 @@ class CrossFusion(nn.Module):
         super().__init__()
         self.n_embd = embed_dim
 
-        # main 和 ref 各自独立的双向 WKV 扫描
-        # Independent bidirectional WKV scans for main and ref
+        # main 和 ref 各自独立的级联双向 WKV 扫描
+        # Independent cascaded bidirectional WKV scans for main and ref
         self.wkv_main = VRWKV_SpatialMix(embed_dim)
         self.wkv_ref = VRWKV_SpatialMix(embed_dim)
 
@@ -591,7 +593,7 @@ class CrossFusion(nn.Module):
             main_out: (B, N, C) 融合后的 main token（残差连接：main + gate * fused）
             ref_out:  (B, N, C) 处理后的 ref token（供后续 RefMultiScaleProcessor 提取多尺度特征）
         """
-        # 各自独立做双向 WKV 扫描
+        # 各自独立做级联双向 WKV 扫描
         main_out = self.wkv_main(main_tokens, resolution)
         ref_out = self.wkv_ref(ref_tokens, resolution)
 
@@ -612,47 +614,23 @@ class CrossFusion(nn.Module):
 
 class RefDiffRWKV(nn.Module):
     """
-    RefDiffRWKV 精简版 — 仅保留 ref 特征提取管线。
+    RefDiffRWKV 精简版 — 仅保留 ref 纹理特征提取管线。
 
-    完整数据流 (Full Data Flow):
-        ┌─────────────────────────────────────────────────────────┐
-        │                                                         │
-        │  x_t (noisy image, pixel)    LR (low-res)    Ref        │
-        │       │                         │              │        │
-        │       │                         ▼              │        │
-        │       │                  lr_upsampler          │        │
-        │       │                         │              │        │
-        │       └───── concat ────────────┘              │        │
-        │                     │                          │        │
-        │                     ▼                          ▼        │
-        │           patch_embed_main            patch_embed_ref   │
-        │                     │                          │        │
-        │                     ▼                          ▼        │
-        │              main_tokens                ref_tokens      │
-        │                     │ + pos_embed        │ + pos_embed  │
-        │                     └──────┬─────────────┘              │
-        │                            ▼                            │
-        │                      CrossFusion                        │
-        │                            │                            │
-        │                   ┌────────┴────────┐                   │
-        │                   ▼                 ▼                   │
-        │             main_tokens'       ref_tokens'              │
-        │                                       │                 │
-        │                                       ▼                 │
-        │                           RefMultiScaleProcessor        │
-        │                                      │                  │
-        │                          rf1, rf2, rf3                  │
-        │                            │    │    │                  │
-        │                            ▼    ▼    ▼                  │
-        │                    SD2 down_blocks[0][1][2]             │
-        └─────────────────────────────────────────────────────────┘
+    管线流程:
+        LR (48×48) ──► Upsample ──► concat(x_t, LR_up) ──► PatchEmbed
+        Ref (480×480) ────────────────────────────────────► PatchEmbed
+            │
+            ▼
+        CrossFusion（门控融合 main 与 ref token）
+            │
+            ▼
+        RefMultiScaleProcessor → rf1, rf2, rf3（多尺度 2D 特征图）
 
     Args:
-        patch_size:       patch 边长（默认 4）
-        embed_dim:        嵌入维度（默认 384）
-        channels:         图像通道数（默认 3，RGB）
-        upsample_mode:    LR 上采样模式: "bilinear" / "cnn" / "pixelshuffle"
-        global_semantic:  可选的 GlobalSemanticModule（DINOv2 语义提取器）
+        patch_size:    patch 边长（默认 4）
+        embed_dim:     嵌入维度（默认 384）
+        channels:      图像通道数（默认 3，RGB）
+        upsample_mode: LR 上采样模式: "bilinear" / "cnn" / "pixelshuffle"
     """
 
     def __init__(
@@ -661,13 +639,11 @@ class RefDiffRWKV(nn.Module):
         embed_dim: int = 384,
         channels: int = 3,
         upsample_mode: str = "bilinear",
-        global_semantic: nn.Module = None,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.channels = channels
-        self.global_semantic = global_semantic
 
         # ── LR 上采样器 ──
         # 根据 upsample_mode 选择不同的上采样策略
@@ -718,7 +694,7 @@ class RefDiffRWKV(nn.Module):
         Ref: torch.Tensor,  # (B, 3, H, W) 参考图像（与 x_t 同分辨率）
     ) -> tuple:
         """
-        从 noisy image、LR、Ref 中提取多尺度 ref 特征。
+        从 noisy image、LR、Ref 中提取多尺度 ref 纹理特征。
 
         这是 RefDiffRWKV 精简版的核心对外接口。
         调用者（sd2_control_ldm.py）在训练/推理循环中调用此方法获取 rf1/rf2/rf3，
@@ -740,13 +716,10 @@ class RefDiffRWKV(nn.Module):
             Ref:  (B, 3, H, W) 参考图像（像素空间，应与 x_t 同分辨率）
 
         Returns:
-            rf1: (B, embed_dim,     H/p,   W/p)    ← 高分辨率 ref 特征 (~384ch)
-            rf2: (B, embed_dim*2,   H/2p,  W/2p)   ← 中分辨率 ref 特征 (~768ch)
-            rf3: (B, embed_dim*4,   H/4p,  W/4p)   ← 低分辨率 ref 特征 (~1536ch)
+            rf1: (B, embed_dim,     H/2p,   W/2p)    ← 高分辨率 ref 特征 (~384ch)
+            rf2: (B, embed_dim*2,   H/4p,  W/4p)   ← 中分辨率 ref 特征 (~768ch)
+            rf3: (B, embed_dim*4,   H/8p,  W/8p)   ← 低分辨率 ref 特征 (~1536ch)
             其中 p = patch_size
-
-            如果 global_semantic 不为 None，额外返回:
-            sem_pyramid: dict with keys "e1","e2","e3","latent"
 
         Raises:
             AssertionError: 如果 x_t 的 H/W 不能被 patch_size 整除
@@ -759,9 +732,9 @@ class RefDiffRWKV(nn.Module):
             ...     LR=lr_image,       # (B, 3, 48, 48)
             ...     Ref=ref_image      # (B, 3, 480, 480)
             ... )
-            >>> rf1.shape  # (B, 384, 120, 120)   for 480/4=120
-            >>> rf2.shape  # (B, 768, 60,  60)
-            >>> rf3.shape  # (B, 1536, 30, 30)
+            >>> rf1.shape  # (B, 384, 60, 60)   for 480/4=120
+            >>> rf2.shape  # (B, 768, 30, 30)
+            >>> rf3.shape  # (B, 1536, 15, 15)
         """
         B, _, H, W = x_t.shape
 
@@ -796,18 +769,8 @@ class RefDiffRWKV(nn.Module):
         main_tokens = main_tokens + pos_embed
         ref_tokens = ref_tokens + pos_embed
 
-        # ── Step 3.5: 全局语义提取（可选）──
-        # 如果传入了 GlobalSemanticModule，在此提取 DINOv2 语义特征
-        # 注意: 精简版中 sem tokens 不在内部使用（无 BiBlock），
-        #       由调用者决定是否注入 SD2 UNet
-        sem_pyramid = None
-        if self.global_semantic is not None:
-            # 仅在 Ref 非全零时提取（避免对空 Ref 做无意义计算）
-            if Ref.abs().sum() > 1e-6:
-                sem_pyramid = self.global_semantic(Ref)
-
         # ── Step 4: 跨图融合 ──
-        # main token 与 ref token 通过双向 WKV + 门控机制交互
+        # main token 与 ref token 通过级联双向 WKV + 门控机制交互
         # 输出: main_tokens'（融合后，当前未使用）、ref_tokens'（ref 信息增强后）
         main_tokens, ref_tokens = self.cross_fusion(
             main_tokens, ref_tokens, (patch_h, patch_w)
@@ -819,9 +782,6 @@ class RefDiffRWKV(nn.Module):
         # 将交互后的 ref token 转为 3 个尺度的 2D 特征图
         rf1, rf2, rf3 = self.ref_ms_processor(ref_tokens, patch_h, patch_w)
 
-        # ── 返回 ──
-        if sem_pyramid is not None:
-            return rf1, rf2, rf3, sem_pyramid
         return rf1, rf2, rf3
 
     # ==================================================================
@@ -860,13 +820,12 @@ class RefDiffRWKV(nn.Module):
             embed_dim=getattr(args, "embed_dim", 384),
             channels=getattr(args, "channels", 3),
             upsample_mode=getattr(args, "upsample_mode", "bilinear"),
-            global_semantic=getattr(args, "global_semantic", None),
         )
 
     def get_parameter_count(self) -> dict:
         """
-        统计各子模块的可训练参数量。
-        Count trainable parameters per sub-module.
+        统计各子模块的参数量。
+        Count parameters per sub-module.
         """
         counts = {}
         total = 0
@@ -886,7 +845,7 @@ class RefDiffRWKV(nn.Module):
             if mod is None:
                 counts[name] = 0
             else:
-                n = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+                n = sum(p.numel() for p in mod.parameters())
                 counts[name] = n
                 total += n
 
@@ -894,92 +853,5 @@ class RefDiffRWKV(nn.Module):
         return counts
 
 
-# ======================================================================
-#  9. 测试代码
-#     Test / Sanity Check
-# ======================================================================
 
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
 
-    # ── 构建精简版 RefDiffRWKV ──
-    model = RefDiffRWKV(
-        patch_size=4,
-        embed_dim=384,
-        channels=3,
-        upsample_mode="bilinear",
-    ).to(device)
-    model.eval()
-
-    # ── 打印参数量 ──
-    param_counts = model.get_parameter_count()
-    print("=" * 65)
-    print("RefDiffRWKV (精简版) — Parameter Count")
-    print("-" * 65)
-    for k, v in param_counts.items():
-        print(f"  {k:25s}: {v:>10,}")
-    print("-" * 65)
-    print(
-        f"  {'Total':25s}: {param_counts['total']:>10,} "
-        f"(~{param_counts['total']/1e6:.1f}M)"
-    )
-    print("=" * 65)
-
-    # ── 模拟输入 ──
-    # 假设: 原始图像 480×480, patch_size=4 → patch 网格 120×120
-    #       VAE 8× 下采样后 latent 为 60×60
-    #       此处 x_t 是 VAE 解码回像素空间的 noisy image
-    B = 2
-    H, W = 480, 480  # 像素空间分辨率
-    LR_H, LR_W = 48, 48  # 低分辨率输入 (10× 上采样到 480)
-
-    x_t = torch.randn(B, 3, H, W).to(device)  # noisy image (pixel space)
-    LR = torch.randn(B, 3, LR_H, LR_W).to(device)  # low-res input
-    Ref = torch.randn(B, 3, H, W).to(device)  # reference image
-
-    print(f"Input shapes:")
-    print(f"  x_t:  {x_t.shape}   (noisy image, pixel space)")
-    print(f"  LR:   {LR.shape}    (low-res input)")
-    print(f"  Ref:  {Ref.shape}   (reference image)")
-
-    # ── 提取 ref 特征 ──
-    with torch.no_grad():
-        rf1, rf2, rf3 = model.extract_ref_features(x_t=x_t, LR=LR, Ref=Ref)
-
-    print(f"Output shapes:")
-    print(f"  rf1:  {rf1.shape}   ← SD2 down_blocks[0] (320ch via Adapter)")
-    print(f"  rf2:  {rf2.shape}   ← SD2 down_blocks[1] (640ch via Adapter)")
-    print(f"  rf3:  {rf3.shape}   ← SD2 down_blocks[2] (1280ch via Adapter)")
-
-    # ── 验证分辨率正确性 ──
-    patch_h, patch_w = H // 4, W // 4  # patch_size=4 → 120×120
-    assert (
-        rf1.shape[2] == patch_h and rf1.shape[3] == patch_w
-    ), f"rf1 resolution mismatch: expected ({patch_h},{patch_w}), got ({rf1.shape[2]},{rf1.shape[3]})"
-    assert (
-        rf2.shape[2] == patch_h // 2 and rf2.shape[3] == patch_w // 2
-    ), f"rf2 resolution mismatch"
-    assert (
-        rf3.shape[2] == patch_h // 4 and rf3.shape[3] == patch_w // 4
-    ), f"rf3 resolution mismatch"
-
-    print(f"✓ All resolution checks passed.")
-
-    # ── 验证通道数 ──
-    assert rf1.shape[1] == 384, f"rf1 channels: expected 384, got {rf1.shape[1]}"
-    assert rf2.shape[1] == 768, f"rf2 channels: expected 768, got {rf2.shape[1]}"
-    assert rf3.shape[1] == 1536, f"rf3 channels: expected 1536, got {rf3.shape[1]}"
-
-    print(f"✓ All channel checks passed.")
-
-    # ── 验证兼容性 forward ──
-    rf1_fwd, rf2_fwd, rf3_fwd = model(x_t=x_t, timesteps=None, LR=LR, Ref=Ref)
-    assert torch.equal(
-        rf1, rf1_fwd
-    ), "forward() and extract_ref_features() mismatch for rf1"
-    print(f"✓ Backward-compatible forward() verified.")
-
-    print(f"{'='*65}")
-    print(f"All tests passed! RefDiffRWKV (精简版) is ready.")
-    print(f"{'='*65}")
