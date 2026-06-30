@@ -303,12 +303,12 @@ def test(cfg: dict, ckpt_path: str):
 
         # 写入文件
         with open(output_dir / "metrics.txt", "w") as f:
-            f.write(f"Checkpoint: {ckpt_path}")
-            f.write(f"Samples: {len(loader.dataset)}")
-            f.write(f"Sample steps: {sample_steps}")
-            f.write(f"{'='*40}")
+            f.write(f"Checkpoint: {ckpt_path}\n")
+            f.write(f"Samples: {len(loader.dataset)}\n")
+            f.write(f"Sample steps: {sample_steps}\n")
+            f.write(f"{'='*40}\n")
             for k in fr_metrics:
-                f.write(f"{k}: {iqa_accum[k] / iqa_count:.6f}")
+                f.write(f"{k}: {iqa_accum[k] / iqa_count:.6f}\n")
 
     return output_dir
 
