@@ -215,7 +215,7 @@ def build_trainer(
         ),
         ModelCheckpoint(
             dirpath=full_checkpoint_dir,
-            filename="{epoch:04d}-{step:06d}",
+            filename="{epoch:04d}-val_loss={val_loss:.6f}",
             monitor="val/loss",
             save_top_k=train_cfg.get("save_top_k", 3),
             mode="min",
