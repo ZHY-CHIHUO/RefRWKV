@@ -8,6 +8,49 @@ from vision_aided_loss.cv_losses import multilevel_loss
 
 
 # ══════════════════════════════════════════════════════════════
+#  Haar 小波高频分解（频域判别器核心）
+# ══════════════════════════════════════════════════════════════
+
+def haar_highpass(x):
+    """
+    Haar 小波高频分解：返回 [LH, HL, HH] 三个高频子带 concat。
+
+    输入：(B, C, H, W)  RGB 像素图像
+    输出：(B, C*3, H//2, W//2)  三个方向的高频细节
+
+    LH: 水平边缘（左 - 右差异）
+    HL: 垂直边缘（上 - 下差异）
+    HH: 对角边缘/角点
+    """
+    B, C, H, W = x.shape
+
+    # 确保 H, W 是偶数
+    if H % 2 != 0:
+        x = x[:, :, :H - 1, :]
+        H = H - 1
+    if W % 2 != 0:
+        x = x[:, :, :, :W - 1]
+        W = W - 1
+
+    # 2×2 分块
+    x = x.reshape(B, C, H // 2, 2, W // 2, 2)
+
+    # 四个象限
+    x00 = x[:, :, :, 0, :, 0]  # 左上
+    x01 = x[:, :, :, 0, :, 1]  # 右上
+    x10 = x[:, :, :, 1, :, 0]  # 左下
+    x11 = x[:, :, :, 1, :, 1]  # 右下
+
+    LH = x01 - x00   # 水平高频（水平相邻差 → 垂直边缘）
+    HL = x10 - x00   # 垂直高频（垂直相邻差 → 水平边缘）
+    HH = x11 - x00   # 对角高频
+
+    # concat 三个高频子带
+    high = torch.cat([LH, HL, HH], dim=1)  # (B, C*3, H//2, W//2)
+    return high
+
+
+# ══════════════════════════════════════════════════════════════
 #  Backbone: OpenCLIP ConvNeXt（冻结，仅提取多级特征）
 # ══════════════════════════════════════════════════════════════
 
@@ -116,19 +159,33 @@ class MultiLevelDConv(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  ImageConvNextDiscriminator — 完整判别器
+#  ImageConvNextDiscriminator — 完整判别器（频域版本）
 # ══════════════════════════════════════════════════════════════
 
 class ImageConvNextDiscriminator(nn.Module):
 
-    def __init__(self, alpha=0.8, precision="fp32"):
+    def __init__(self, alpha=0.8, precision="fp32", use_freq=True):
+        """
+        Args:
+            alpha: GAN loss 中 multilevel loss 的混合系数
+            precision: CLIP backbone 精度（"fp32" / "fp16"）
+            use_freq: True=频域判别（小波高频子带），False=像素域判别（原行为）
+        """
         super().__init__()
         self.gan_alpha = alpha
+        self.use_freq = use_freq
+
         self.model = ImageOpenCLIPConvNext(precision=precision)
         self.model.eval().requires_grad_(False)
+
         self.decoder = MultiLevelDConv(
             level=4, in_ch1=[384, 768, 1536], in_ch2=1024, out_ch=512, down=2
         )
+
+        # 频域模式：替换 ConvNeXt 第一层卷积以适配 9 通道输入
+        if use_freq:
+            self._adapt_first_conv(9)
+
         self.register_buffer(
             "image_mean",
             torch.tensor([0.48145466, 0.4578275, 0.40821073], dtype=torch.float32),
@@ -137,6 +194,36 @@ class ImageConvNextDiscriminator(nn.Module):
             "image_std",
             torch.tensor([0.26862954, 0.26130258, 0.27577711], dtype=torch.float32),
         )
+
+    def _adapt_first_conv(self, in_channels=9):
+        """
+        重新初始化 ConvNeXt 第一层卷积以适配频域输入通道。
+        前 3 通道复用 CLIP 预训练权重，后 6 通道用正交初始化，
+        因为小波高频子带是零均值的差分信号。
+        """
+        old_conv = self.model.model.trunk.stem[0]
+        old_weight = old_conv.weight.data  # (384, 3, 4, 4)
+
+        # 创建新卷积：9 通道输入，其他参数与原 stem 一致
+        new_conv = nn.Conv2d(
+            in_channels,
+            old_weight.shape[0],
+            kernel_size=4,
+            stride=4,
+            padding=0,
+        )
+
+        with torch.no_grad():
+            # 前 3 通道复用预训练权重
+            new_conv.weight[:, :3, :, :] = old_weight
+            # 后 6 通道（LH/HL/HH × 2 组 RGB）用正交初始化
+            for c in range(3, in_channels):
+                nn.init.orthogonal_(new_conv.weight[:, c:c + 1, :, :])
+
+        # 原地替换
+        new_conv.bias.data.copy_(old_conv.bias.data)
+        new_conv.requires_grad_(False)
+        self.model.model.trunk.stem[0] = new_conv
 
     def train(self, mode=True):
         self.decoder.train(mode)
@@ -153,8 +240,17 @@ class ImageConvNextDiscriminator(nn.Module):
     def forward(
         self, x, for_real=True, for_G=False, verbose=False, return_logits=False
     ):
-        x = x * 0.5 + 0.5
-        x = (x - self.image_mean[:, None, None]) / self.image_std[:, None, None]
+        # x: (B, 3, H, W)  值域 [-1, 1]
+
+        # ── 预处理分支 ──
+        if self.use_freq:
+            # 频域路径：小波高频分解 → 逐样本 z-score
+            x = haar_highpass(x)                                    # (B, 9, H//2, W//2)
+            x = (x - x.mean(dim=[2, 3], keepdim=True)) / (x.std(dim=[2, 3], keepdim=True) + 1e-6)       # 方差标准化
+        else:
+            # 像素域路径：原 CLIP 归一化
+            x = x * 0.5 + 0.5                                       # [-1,1] → [0,1]
+            x = (x - self.image_mean[:, None, None]) / self.image_std[:, None, None]
 
         features = self.model.encode_image(x, return_pooled_feats=True)
         if verbose:

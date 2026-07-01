@@ -29,62 +29,115 @@ from discriminator import ImageConvNextDiscriminator
 class SD2ControlLDM(pl.LightningModule):
     def __init__(
         self,
+        # ═════════════════════════════════════════════
+        #  1. 数据键名
+        # ═════════════════════════════════════════════
         lr_key: str = "lr",
         ref_key: str = "ref",
         hr_key: str = "hr",
+
+        # ═════════════════════════════════════════════
+        #  2. SD2 基础（冻结 backbone）
+        # ═════════════════════════════════════════════
         sd_model_path: str = "sd2-community/stable-diffusion-2-1-base",
         use_lora: bool = True,
-        lora_rank: int = 4,
+        lora_rank: int = 64,
         lora_target_modules: Optional[List[str]] = None,
         sd_locked: bool = True,
+
+        # ═════════════════════════════════════════════
+        #  3. RefDiffRWKV — 纹理提取
+        # ═════════════════════════════════════════════
         patch_size: int = 4,
         embed_dim: int = 384,
         upsample_mode: str = "bilinear",
+
+        # ═════════════════════════════════════════════
+        #  4. 语义路径
+        # ═════════════════════════════════════════════
         use_semantic: bool = True,
         dinov2_model_name: str = "facebook/dinov2-base",
         cfg_drop_prob: float = 0.1,
-        learning_rate: float = 1e-4,
-        lr_D: float = 1e-4,
+
+        # ═════════════════════════════════════════════
+        #  5. Noise Scheduler
+        # ═════════════════════════════════════════════
         num_train_timesteps: int = 1000,
         beta_start: float = 0.00085,
         beta_end: float = 0.012,
         beta_schedule: str = "scaled_linear",
         prediction_type: str = "epsilon",
+        model_t: int = 200,
+
+        # ═════════════════════════════════════════════
+        #  6. Loss 权重
+        # ═════════════════════════════════════════════
         l_simple_weight: float = 1.0,
         lambda_lpips: float = 0.1,
         lambda_gan: float = 0.005,
-        model_t: int = 200,
+        use_freq: bool = True,          # True=频域D, False=像素D
+
+        # ═════════════════════════════════════════════
+        #  7. 训练控制
+        # ═════════════════════════════════════════════
+        learning_rate: float = 1e-4,
+        lr_D: float = 1e-4,
+        use_amp: bool = True,
         weight_decay: float = 1e-3,
+        debug_nan: bool = True,
+        accumulate_grad_batches: int = 8,   # 手动梯度累积步数
+
+        # ═════════════════════════════════════════════
+        #  8. 验证 / 推理
+        # ═════════════════════════════════════════════
         sample_steps: int = 50,
         fr_metrics: Optional[List[str]] = None,
         iqa_device: str = "cpu",
-        debug_nan: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
 
+        # ── 数据键 / 基础开关 ──
         self.lr_key = lr_key
         self.ref_key = ref_key
         self.hr_key = hr_key
         self.sd_locked = sd_locked
         self.cfg_drop_prob = cfg_drop_prob
+
+        # ── 训练超参 ──
         self.learning_rate = learning_rate
         self.lr_D = lr_D
+        self.weight_decay = weight_decay
+        self.use_amp = use_amp
+        self.debug_nan = debug_nan
+        self.accumulate_grad_batches = accumulate_grad_batches
+
+        # ── Loss 权重 ──
         self.l_simple_weight = l_simple_weight
         self.lambda_lpips = lambda_lpips
         self.lambda_gan = lambda_gan
+        self.use_freq = use_freq
+
+        # ── 推理配置 ──
         self.model_t = model_t
         self.sample_steps = sample_steps
         self.fr_metrics = fr_metrics or ["psnr", "ssim", "lpips", "dists"]
         self.iqa_device = iqa_device
-        self.weight_decay = weight_decay
-        self.debug_nan = debug_nan
+
+        # ── NaN 追踪 ──
         self._nan_count = 0
 
-        # ── 手动优化：G/D 交替训练 ──
+        # ══════════════════════════════════════════════
+        #  AMP / 手动优化 / 梯度累积
+        # ══════════════════════════════════════════════
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.automatic_optimization = False
+        self._g_accum_count = 0
+        self._d_accum_count = 0
 
-        # 1. VAE
+        # ══════════════════════════════════════════════
+        #  1. VAE（冻结）
+        # ══════════════════════════════════════════════
         self.vae = AutoencoderKL.from_pretrained(
             sd_model_path, subfolder="vae", local_files_only=True
         )
@@ -92,7 +145,9 @@ class SD2ControlLDM(pl.LightningModule):
         self.vae.eval()
         self.vae_scale_factor = self.vae.config.scaling_factor
 
-        # 2. UNet + LoRA
+        # ══════════════════════════════════════════════
+        #  2. UNet + LoRA（可训练 attention）
+        # ══════════════════════════════════════════════
         self.unet = UNet2DConditionModel.from_pretrained(
             sd_model_path, subfolder="unet", local_files_only=True
         )
@@ -101,8 +156,11 @@ class SD2ControlLDM(pl.LightningModule):
             self._inject_lora(lora_rank, lora_target_modules)
         if sd_locked:
             self._freeze_unet_except_attn()
+        self.cross_attn_dim = self.unet.config.cross_attention_dim
 
-        # 3. Noise Scheduler
+        # ══════════════════════════════════════════════
+        #  3. Noise Scheduler
+        # ══════════════════════════════════════════════
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_start=beta_start,
@@ -111,18 +169,18 @@ class SD2ControlLDM(pl.LightningModule):
             prediction_type=prediction_type,
         )
 
-        self.cross_attn_dim = self.unet.config.cross_attention_dim  # 768
-
-        # 4. GlobalSemantic（DINOv2 → RWKV Pyramid）
-        if use_semantic:
-            self.global_semantic = GlobalSemanticModule(
-                dinov2_model_name=dinov2_model_name,
-            )
-        else:
-            self.global_semantic = None
+        # ══════════════════════════════════════════════
+        #  4. GlobalSemantic — 语义路径（DINOv2 → RWKV）
+        # ══════════════════════════════════════════════
+        self.global_semantic = (
+            GlobalSemanticModule(dinov2_model_name=dinov2_model_name)
+            if use_semantic else None
+        )
         self.sem_proj: Optional[nn.Linear] = None
 
-        # 5. RefDiffRWKV（纯纹理提取）
+        # ══════════════════════════════════════════════
+        #  5. RefDiffRWKV — 纹理路径
+        # ══════════════════════════════════════════════
         self.ref_model = RefDiffRWKV(
             patch_size=patch_size,
             embed_dim=embed_dim,
@@ -130,23 +188,30 @@ class SD2ControlLDM(pl.LightningModule):
             upsample_mode=upsample_mode,
         )
 
-        # 6. Adapter
+        # ══════════════════════════════════════════════
+        #  6. Adapter — ref_dims → sd2_dims
+        # ══════════════════════════════════════════════
         self.ref_adapter = RWKV_Ref_Adapter(
             ref_dims=(384, 768, 1536),
             sd2_dims=(320, 640, 1280),
         )
 
-        # 7. LPIPS 感知损失
+        # ══════════════════════════════════════════════
+        #  7. LPIPS（冻结）
+        # ══════════════════════════════════════════════
         self.net_lpips = lpips.LPIPS(net="vgg", verbose=False)
         self.net_lpips.eval()
         self.net_lpips.requires_grad_(False)
 
-        # 8. 判别器（GAN）
-        self.D = ImageConvNextDiscriminator(precision="fp32")
+        # ══════════════════════════════════════════════
+        #  8. 判别器（GAN）
+        # ══════════════════════════════════════════════
+        self.D = ImageConvNextDiscriminator(precision="fp32", use_freq=self.use_freq)
 
-        # 9. IQA
+        # ══════════════════════════════════════════════
+        #  9. IQA 引擎
+        # ══════════════════════════════════════════════
         from RefRWKV.evaluation.eval_pyiqa import IQAEngine
-
         self.iqa = IQAEngine(
             device=iqa_device,
             nr_metrics=[],
@@ -155,7 +220,9 @@ class SD2ControlLDM(pl.LightningModule):
             verbose=False,
         )
 
-        # 10. UNet hooks（纹理 skip connection 注入点）
+        # ══════════════════════════════════════════════
+        #  10. UNet hooks — 纹理 skip connection 注入点
+        # ══════════════════════════════════════════════
         self._injection_blocks: List = []
         self._hook_handles: List = []
         self._setup_unet_hooks()
@@ -271,7 +338,8 @@ class SD2ControlLDM(pl.LightningModule):
         return self.vae.decode(z / self.vae_scale_factor).sample
 
     def _decode_latent_train(self, z):
-        """VAE decode with gradient flow（training 用，梯度穿过冻结 VAE）。"""
+        """VAE decode with gradient flow（training 用，梯度穿过冻结 VAE）。
+        调用方负责保证输入是 float32（AMP 下需显式 .float()）。"""
         return self.vae.decode(z / self.vae_scale_factor).sample
 
     def _empty_context(self, B, device):
@@ -318,22 +386,30 @@ class SD2ControlLDM(pl.LightningModule):
         sem_tokens = self._build_sem_tokens(sem_pyramid)
         return sem_tokens
 
-    def _extract_ref_static(self, lr, ref, latent_shape):
+    def _extract_ref_static(self, lr, ref, latent_shape, x_t_pixel=None):
+        """提取 Ref 纹理 + 语义特征。
+
+        Args:
+            lr:           低分辨率输入 (B, 3, 48, 48)
+            ref:          参考图像 (B, 3, H, W)
+            latent_shape: (B, 4, H_lat, W_lat)
+            x_t_pixel:    真实 noisy latent 解码后的像素图，或 None（回退到 dummy）
+        """
         B, _, H, W = latent_shape
 
-        with torch.no_grad():
-            dummy = torch.zeros(B, 4, H, W, device=self.device)
-            dummy_pixel = self.vae.decode(
-                dummy / self.vae_scale_factor
-            ).sample.clamp(-1, 1)
+        if x_t_pixel is None:
+            with torch.no_grad():
+                dummy = torch.zeros(B, 4, H, W, device=self.device)
+                x_t_pixel = self.vae.decode(
+                    dummy / self.vae_scale_factor
+                ).sample.clamp(-1, 1)
 
         if self._is_zero_image(ref):
-            rf_feats = self._zero_ref_feats(dummy_pixel, lr)
+            rf_feats = self._zero_ref_feats(x_t_pixel, lr)
         else:
-            rf_feats = self._extract_ref(dummy_pixel, lr, ref)
+            rf_feats = self._extract_ref(x_t_pixel, lr, ref)
 
         sem_tokens = self._extract_ref_semantic(ref)
-
         return rf_feats, sem_tokens
 
     def _build_sem_tokens(self, sem_pyramid):
@@ -382,19 +458,13 @@ class SD2ControlLDM(pl.LightningModule):
         return empty_ctx
 
     # ════════════════════════════════════════════════════════
-    #  UNet forward helper（共享给 G step 和 D step）
+    #  UNet forward helper（G/D 共享）
     # ════════════════════════════════════════════════════════
 
     def _run_unet(self, lr, ref, hr):
-        """
-        完整 UNet 前向：HR encode → add noise (t=model_t) → UNet → pred_x0。
-
-        Returns:
-            pred_x0:   (B, 4, H_lat, W_lat)  预测的干净 latent
-            noise_pred: (B, 4, H_lat, W_lat)  UNet 噪声预测
-            noise:      (B, 4, H_lat, W_lat)  实际加入的噪声
-        """
-        x0 = self.encode_latent(hr.to(self.device))
+        """完整 UNet 前向：HR encode → add noise (t=model_t) → UNet → pred_x0。"""
+        with torch.amp.autocast('cuda', enabled=False):
+            x0 = self.encode_latent(hr.to(self.device))
         B = x0.shape[0]
 
         t = torch.full((B,), self.model_t, device=self.device).long()
@@ -403,6 +473,13 @@ class SD2ControlLDM(pl.LightningModule):
 
         if self._check_tensor(x_t, "x_t (noisy latent)"):
             return None, None, None
+
+        # decode 真实 noisy latent → pixel（CrossFusion main 分支）
+        with torch.amp.autocast('cuda', enabled=False):
+            with torch.no_grad():
+                x_t_pixel = self.vae.decode(
+                    x_t / self.vae_scale_factor
+                ).sample.clamp(-1, 1)
 
         # CFG drop
         ref_input = ref.to(self.device)
@@ -413,7 +490,7 @@ class SD2ControlLDM(pl.LightningModule):
                 ref_input[drop_mask] = 0.0
 
         rf_feats, sem_tokens = self._extract_ref_static(
-            lr.to(self.device), ref_input, x0.shape
+            lr.to(self.device), ref_input, x0.shape, x_t_pixel=x_t_pixel
         )
         for i, f in enumerate(rf_feats):
             if self._check_tensor(f, f"ref_feat[{i}]"):
@@ -437,13 +514,12 @@ class SD2ControlLDM(pl.LightningModule):
         return pred_x0, noise_pred, noise
 
     # ════════════════════════════════════════════════════════
-    #  Training — G/D 交替（手动优化）
+    #  Training — G/D 交替（手动优化 + AMP + 梯度累积）
     # ════════════════════════════════════════════════════════
 
     def training_step(self, batch, batch_idx):
         g_opt, d_opt = self.optimizers()
 
-        # 按 global_step 奇偶交替：偶 → Generator，奇 → Discriminator
         is_g_step = (self.trainer.global_step % 2 == 0)
 
         try:
@@ -455,7 +531,10 @@ class SD2ControlLDM(pl.LightningModule):
             self._clear_ref_feats()
 
     def _generator_step(self, batch, batch_idx, g_opt):
-        """Generator step: L2 + LPIPS + GAN → 更新 G 参数。"""
+        """Generator step: L2 + LPIPS + GAN → 更新 G 参数。
+
+        梯度累积 self.accumulate_grad_batches 次后才执行 optimizer.step()。
+        """
         lr = batch[self.lr_key].float()
         ref = batch[self.ref_key].float()
         hr = batch[self.hr_key].float()
@@ -465,26 +544,31 @@ class SD2ControlLDM(pl.LightningModule):
            self._check_tensor(hr, "input hr"):
             return None
 
-        # ── D 置 eval，冻结 ──
+        # ── D eval 模式 + 冻结参数 ──
         self.D.eval()
         self.D.requires_grad_(False)
 
-        # ── UNet 前向 ──
-        pred_x0, noise_pred, noise = self._run_unet(lr, ref, hr)
-        if pred_x0 is None:
-            return None
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            # ── UNet 前向 ──
+            pred_x0, noise_pred, noise = self._run_unet(lr, ref, hr)
+            if pred_x0 is None:
+                return None
 
-        # ── latent → 像素空间（梯度穿过 VAE decoder）──
-        x_pred = self._decode_latent_train(pred_x0)
-        if self._check_tensor(x_pred, "x_pred (pixel)"):
-            return None
+            # ── latent → 像素空间 ──
+            x_pred = self._decode_latent_train(pred_x0.float())
+            if self._check_tensor(x_pred, "x_pred (pixel)"):
+                return None
 
-        # ── 三项 loss ──
-        loss_l2 = F.mse_loss(x_pred, hr.to(self.device)) * self.l_simple_weight
-        loss_lpips = self.net_lpips(x_pred, hr.to(self.device)).mean() * self.lambda_lpips
-        loss_gan = self.D(x_pred, for_G=True).mean() * self.lambda_gan
+            # ── L2 + LPIPS ──
+            hr_gpu = hr.to(self.device)
+            loss_l2 = F.mse_loss(x_pred.float(), hr_gpu) * self.l_simple_weight
+            loss_lpips = self.net_lpips(x_pred.float(), hr_gpu).mean() * self.lambda_lpips
 
-        loss_G = loss_l2 + loss_lpips + loss_gan
+        # ── GAN loss：D 全程 fp32，在 autocast 外跑 ──
+        with torch.amp.autocast('cuda', enabled=False):
+            loss_gan = self.D(x_pred.float(), for_G=True).mean() * self.lambda_gan
+
+        loss_G = (loss_l2 + loss_lpips + loss_gan) / self.accumulate_grad_batches
 
         if self._check_tensor(loss_G, "loss_G"):
             self._nan_count += 1
@@ -498,23 +582,32 @@ class SD2ControlLDM(pl.LightningModule):
             self._nan_count = 0
 
         # ── 手动 backward ──
-        g_opt.zero_grad()
-        self.manual_backward(loss_G)
-        self.clip_gradients(g_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
-        g_opt.step()
+        self.scaler.scale(loss_G).backward()
+        self._g_accum_count += 1
 
-        # ── log ──
+        if self._g_accum_count >= self.accumulate_grad_batches:
+            self.scaler.unscale_(g_opt)
+            self.clip_gradients(g_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+            self.scaler.step(g_opt)
+            self.scaler.update()
+            g_opt.zero_grad()
+            self._g_accum_count = 0
+
+        # ── log（还原真实 scale）──
         self.log_dict({
-            "train/G_total": loss_G,
+            "train/G_total": loss_G * self.accumulate_grad_batches,
             "train/G_l2": loss_l2,
             "train/G_lpips": loss_lpips,
             "train/G_gan": loss_gan,
         }, prog_bar=True, on_step=True)
 
-        return loss_G
+        return loss_G.detach() * self.accumulate_grad_batches
 
     def _discriminator_step(self, batch, batch_idx, d_opt):
-        """Discriminator step: real/fake BCE → 更新 D 参数。"""
+        """Discriminator step: real/fake BCE → 更新 D 参数。
+
+        梯度累积 self.accumulate_grad_batches 次后才执行 optimizer.step()。
+        """
         lr = batch[self.lr_key].float()
         ref = batch[self.ref_key].float()
         hr = batch[self.hr_key].float()
@@ -522,36 +615,45 @@ class SD2ControlLDM(pl.LightningModule):
         if self._check_tensor(hr, "input hr (D step)"):
             return None
 
-        # ── D 置 train ──
+        # ── D train 模式 ──
         self.D.train()
         self.D.requires_grad_(True)
 
-        # ── 无梯度生成 x_pred ──
-        with torch.no_grad():
-            pred_x0, _, _ = self._run_unet(lr, ref, hr)
-            if pred_x0 is None:
-                return None
-            x_pred = self.decode_latent(pred_x0)
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            # ── 无梯度生成 x_pred ──
+            with torch.no_grad():
+                pred_x0, _, _ = self._run_unet(lr, ref, hr)
+                if pred_x0 is None:
+                    return None
+                x_pred = self.decode_latent(pred_x0.float())
 
-        # ── 判别器 loss ──
-        loss_D_real = self.D(hr.to(self.device), for_real=True).mean()
-        loss_D_fake = self.D(x_pred, for_real=False).mean()
-        loss_D = loss_D_real + loss_D_fake
+        # ── D loss：全程 fp32，在 autocast 外跑 ──
+        with torch.amp.autocast('cuda', enabled=False):
+            hr_gpu = hr.to(self.device)
+            loss_D_real = self.D(hr_gpu, for_real=True).mean()
+            loss_D_fake = self.D(x_pred.float(), for_real=False).mean()
+            loss_D = (loss_D_real + loss_D_fake) / self.accumulate_grad_batches
 
         # ── 手动 backward ──
-        d_opt.zero_grad()
-        self.manual_backward(loss_D)
-        self.clip_gradients(d_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
-        d_opt.step()
+        self.scaler.scale(loss_D).backward()
+        self._d_accum_count += 1
 
-        # ── log ──
+        if self._d_accum_count >= self.accumulate_grad_batches:
+            self.scaler.unscale_(d_opt)
+            self.clip_gradients(d_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+            self.scaler.step(d_opt)
+            self.scaler.update()
+            d_opt.zero_grad()
+            self._d_accum_count = 0
+
+        # ── log（还原真实 scale）──
         self.log_dict({
-            "train/D_total": loss_D,
+            "train/D_total": loss_D * self.accumulate_grad_batches,
             "train/D_real": loss_D_real,
             "train/D_fake": loss_D_fake,
         }, prog_bar=True, on_step=True)
 
-        return loss_D
+        return loss_D.detach() * self.accumulate_grad_batches
 
     # ════════════════════════════════════════════════════════
     #  Validation
@@ -572,7 +674,6 @@ class SD2ControlLDM(pl.LightningModule):
         if pred_x0 is None:
             return None
 
-        # latent 空间 noise loss（与 HYPIR 一致：验证时仍看 denoising 能力）
         val_loss = F.mse_loss(noise_pred, noise)
         self.log("val/loss", val_loss, on_epoch=True)
         self.log("val_loss", val_loss, on_epoch=True)
@@ -628,16 +729,16 @@ class SD2ControlLDM(pl.LightningModule):
         latent_shape = self.encode_latent(hr.to(self.device)).shape
         _, _, H, W = latent_shape
 
-        rf_feats, sem_tokens = self._extract_ref_static(
-            lr.to(self.device), ref.to(self.device), latent_shape
-        )
-        self._inject_ref_feats(rf_feats)
-        context = self._build_context(B, self.device, sem_tokens)
-
-        # 单步出图
         noise = torch.randn(B, 4, H, W, device=self.device)
         alpha_bar = self.noise_scheduler.alphas_cumprod[self.model_t]
         z_t = torch.sqrt(1 - alpha_bar) * noise
+        x_t_pixel = self.decode_latent(z_t.float())
+
+        rf_feats, sem_tokens = self._extract_ref_static(
+            lr.to(self.device), ref.to(self.device), latent_shape, x_t_pixel=x_t_pixel
+        )
+        self._inject_ref_feats(rf_feats)
+        context = self._build_context(B, self.device, sem_tokens)
 
         t_b = torch.full((B,), self.model_t, device=self.device).long()
         self.unet.eval()
@@ -684,21 +785,24 @@ class SD2ControlLDM(pl.LightningModule):
             )
 
         latent_shape = (1, 4, th // 8, tw // 8)
-        rf_feats, sem_tokens = self._extract_ref_static(lr, ref, latent_shape)
-        self._inject_ref_feats(rf_feats)
-        context = self._build_context(1, self.device, sem_tokens)
 
         g = torch.Generator(device=self.device).manual_seed(seed)
-        self.unet.eval()
         noise = torch.randn(
             1, 4, th // 8, tw // 8, generator=g, device=self.device,
         )
 
-        # 单步：纯噪声 → 在 t=model_t 噪声水平去噪 → x0
         alpha_bar = self.noise_scheduler.alphas_cumprod[self.model_t]
         z_t = torch.sqrt(1 - alpha_bar) * noise
-        t_b = torch.full((1,), self.model_t, device=self.device).long()
+        x_t_pixel = self.decode_latent(z_t.float())
 
+        rf_feats, sem_tokens = self._extract_ref_static(
+            lr, ref, latent_shape, x_t_pixel=x_t_pixel
+        )
+        self._inject_ref_feats(rf_feats)
+        context = self._build_context(1, self.device, sem_tokens)
+
+        t_b = torch.full((1,), self.model_t, device=self.device).long()
+        self.unet.eval()
         noise_pred = self.unet(
             z_t, t_b,
             encoder_hidden_states=context,
@@ -716,52 +820,11 @@ class SD2ControlLDM(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         self._clear_ref_feats()
+        keys_to_pop = [k for k in checkpoint["state_dict"] if k.startswith("D.model.")]
+        for k in keys_to_pop:
+            del checkpoint["state_dict"][k]
 
     def on_load_checkpoint(self, checkpoint):
         self._setup_unet_hooks()
         if self.sem_proj is not None and self.global_semantic is not None:
             print("[SemProj] 已从 checkpoint 恢复")
-
-
-# ═══════════════════════════════════════════════════════════
-#  Smoke test
-# ═══════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    model = SD2ControlLDM(
-        sd_model_path="sd2-community/stable-diffusion-2-1-base",
-        use_lora=True, lora_rank=4, sd_locked=True,
-        use_semantic=True,
-        learning_rate=1e-4,
-        model_t=200,
-        lambda_lpips=0.1,
-        lambda_gan=0.005,
-    ).to(device)
-
-    total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable: {total:,} (~{total/1e6:.1f}M)")
-
-    B, H, W = 2, 480, 480
-    batch = {
-        "lr": torch.randn(B, 3, 48, 48, device=device),
-        "ref": torch.randn(B, 3, H, W, device=device),
-        "hr": torch.randn(B, 3, H, W, device=device),
-    }
-    # Smoke test: 跑一次 G step
-    g_opt, d_opt = model.configure_optimizers()
-    # 手动设置 global_step 来触发 G step
-    model.trainer = type("Dummy", (), {"global_step": 0})()
-    loss = model.training_step(batch, 0)
-    if loss is not None:
-        print(f"G Loss: {loss.item():.4f}")
-
-    sr = model.inference(
-        torch.randn(1, 3, 48, 48, device=device),
-        torch.randn(1, 3, H, W, device=device),
-        seed=42,
-    )
-    print(f"Inference output: {sr.shape}")
-    print("✓ Smoke test passed!")

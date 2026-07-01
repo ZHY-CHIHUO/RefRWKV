@@ -1,9 +1,14 @@
 #!/usr/bin/env python
 """
 SD2ControlLDM 训练脚本（RefDiffRWKV + SD2 UNet 端到端扩散超分）
+
 用法:
     python scripts/train_sd2_control.py --config configs/sd2_control_config.yaml
     python scripts/train_sd2_control.py --config configs/sd2_control_config.yaml --resume checkpoints/.../last.ckpt
+
+注意：
+    - 手动优化模式下 G/D 交替训练使用模型内置 AMP scaler (use_amp)。
+    - Trainer precision 设为 "32"，避免与内置 scaler 双重混合精度冲突。
 """
 
 import sys
@@ -139,7 +144,7 @@ def build_dataloaders(cfg: dict):
         val_ds,
         batch_size=data_cfg.get("val_batch_size", 1),
         shuffle=False,
-        num_workers=data_cfg.get("val_num_workers", 4),
+        num_workers=data_cfg.get("val_num_workers", 2),
         pin_memory=True,
     )
 
@@ -147,7 +152,7 @@ def build_dataloaders(cfg: dict):
         test_ds,
         batch_size=data_cfg.get("val_batch_size", 1),
         shuffle=False,
-        num_workers=data_cfg.get("val_num_workers", 4),
+        num_workers=data_cfg.get("val_num_workers", 2),
         pin_memory=True,
     )
 
@@ -155,7 +160,10 @@ def build_dataloaders(cfg: dict):
 
 
 def build_model(cfg: dict) -> SD2ControlLDM:
-    """根据配置构建 SD2ControlLDM。"""
+    """根据配置构建 SD2ControlLDM。
+
+    所有可调超参均从配置文件读取，方便实验管理。
+    """
     mc = cfg.get("model", {})
 
     return SD2ControlLDM(
@@ -166,7 +174,7 @@ def build_model(cfg: dict) -> SD2ControlLDM:
         # SD2
         sd_model_path=mc["sd_model_path"],
         use_lora=mc.get("use_lora", True),
-        lora_rank=mc.get("lora_rank", 4),
+        lora_rank=mc.get("lora_rank", 64),
         lora_target_modules=mc.get("lora_target_modules", None),
         sd_locked=mc.get("sd_locked", True),
         # RefDiffRWKV
@@ -176,29 +184,42 @@ def build_model(cfg: dict) -> SD2ControlLDM:
         # GlobalSemantic
         use_semantic=mc.get("use_semantic", False),
         dinov2_model_name=mc.get("dinov2_model_name", "facebook/dinov2-base"),
-        # Training
+        # Diffusion
         cfg_drop_prob=mc.get("cfg_drop_prob", 0.1),
-        learning_rate=mc.get("learning_rate", 1e-4),
         num_train_timesteps=mc.get("num_train_timesteps", 1000),
         beta_start=mc.get("beta_start", 0.00085),
         beta_end=mc.get("beta_end", 0.012),
         beta_schedule=mc.get("beta_schedule", "scaled_linear"),
         prediction_type=mc.get("prediction_type", "epsilon"),
+        model_t=mc.get("model_t", 200),
+        # Loss weights & GAN
+        learning_rate=mc.get("learning_rate", 1e-4),
+        lr_D=mc.get("lr_D", 1e-4),
         l_simple_weight=mc.get("l_simple_weight", 1.0),
+        lambda_lpips=mc.get("lambda_lpips", 0.1),
+        lambda_gan=mc.get("lambda_gan", 0.005),
+        use_freq=mc.get("use_freq", True), 
         weight_decay=mc.get("weight_decay", 1e-3),
+        # AMP（手动优化模式下独立于 Trainer precision）
+        use_amp=mc.get("use_amp", True),
         # Validation
         sample_steps=mc.get("sample_steps", 50),
         fr_metrics=mc.get("fr_metrics", None),
         iqa_device=mc.get("iqa_device", "cuda"),
         # Debug
-        debug_nan=mc.get("debug_nan", True),                       # 新增
+        debug_nan=mc.get("debug_nan", True),
+        accumulate_grad_batches=mc.get("accumulate_grad_batches", 8),
     )
 
 
 def build_trainer(
     cfg: dict, exp_name: str, checkpoint_dir: str, log_dir: str, max_epochs: int
 ):
-    """构建 PyTorch Lightning Trainer。"""
+    """构建 PyTorch Lightning Trainer。
+
+    注意：手动优化 + 内置 AMP scaler 时 trainer precision 应设为 "32"，
+    避免 Lightning 注入额外的 autocast 导致双重混合精度。
+    """
     train_cfg = cfg.get("train", {})
     full_checkpoint_dir = os.path.join(checkpoint_dir, exp_name)
     os.makedirs(full_checkpoint_dir, exist_ok=True)
@@ -206,10 +227,10 @@ def build_trainer(
     logger = TensorBoardLogger(log_dir, name=exp_name)
 
     callbacks = [
-        NaNMonitorCallback(),                                     # 新增：梯度 NaN 监测
+        NaNMonitorCallback(),
         EarlyStopping(
             monitor="val/loss",
-            patience=train_cfg.get("early_stopping_patience", 20),
+            patience=train_cfg.get("early_stopping_patience", 30),
             mode="min",
             verbose=True,
         ),
@@ -227,12 +248,10 @@ def build_trainer(
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=train_cfg.get("devices", 1),
-        precision=train_cfg.get("precision", "bf16-mixed"),
+        precision=train_cfg.get("precision", "32"),
         max_epochs=max_epochs,
         log_every_n_steps=train_cfg.get("log_every_n_steps", 20),
         val_check_interval=train_cfg.get("val_check_interval", 0.5),
-        gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
-        accumulate_grad_batches=train_cfg.get("accumulate_grad_batches", 1),
         callbacks=callbacks,
         logger=logger,
         enable_progress_bar=True,
@@ -248,6 +267,7 @@ def train(cfg: dict, resume_ckpt: str = None):
     """训练 SD2ControlLDM。"""
     train_cfg = cfg["train"]
     output_cfg = cfg.get("output", {})
+    mc = cfg.get("model", {})
 
     # ── 开启自动异常检测（调试用，训练慢 10-20%）──
     if train_cfg.get("detect_anomaly", False):
@@ -266,7 +286,7 @@ def train(cfg: dict, resume_ckpt: str = None):
     if pretrained.get("sd2_control_ckpt") and not resume_ckpt:
         load_weights(model, pretrained["sd2_control_ckpt"])
 
-    # 构建数据（只在 train() 内调用一次）
+    # 构建数据
     train_loader, val_loader, test_loader = build_dataloaders(cfg)
 
     # 构建 Trainer
@@ -285,21 +305,26 @@ def train(cfg: dict, resume_ckpt: str = None):
     # ── 打印训练摘要 ──
     print(f"{'='*60}")
     print(f"  SD2ControlLDM 训练")
-    print(f"  数据根目录  : {cfg['data']['root']}")
+    print(f"  数据根目录    : {cfg['data']['root']}")
     print(
-        f"  Batch size  : {cfg['data']['batch_size']} × accumulate {train_cfg.get('accumulate_grad_batches', 1)}"
+        f"  Batch size    : {cfg['data']['batch_size']} × "
+        f"accumulate {mc.get('accumulate_grad_batches', 8)}"
     )
-    print(f"  训练样本数  : {len(train_loader.dataset)}")
-    print(f"  验证样本数  : {len(val_loader.dataset)}")
-    print(f"  测试样本数  : {len(test_loader.dataset)}")
-    print(f"  精度        : {train_cfg.get('precision', 'bf16-mixed')}")
-    print(f"  最大 epoch  : {max_epochs}")
-    mc = cfg.get("model", {})
-    print(f"  CFG dropout : {mc.get('cfg_drop_prob', 0.1)}")
-    print(f"  LoRA rank   : {mc.get('lora_rank', 4)}")
-    print(f"  LR          : {mc.get('learning_rate', 1e-4)}")
-    print(f"  Semantic    : {mc.get('use_semantic', False)}")
-    print(f"  NaN debug   : {mc.get('debug_nan', True)}")         # 新增
+    print(f"  训练样本数    : {len(train_loader.dataset)}")
+    print(f"  验证样本数    : {len(val_loader.dataset)}")
+    print(f"  测试样本数    : {len(test_loader.dataset)}")
+    print(f"  Trainer prec  : {train_cfg.get('precision', '32')}")
+    print(f"  手动 AMP      : {mc.get('use_amp', True)}")
+    print(f"  最大 epoch    : {max_epochs}")
+    print(f"  LoRA rank     : {mc.get('lora_rank', 64)}")
+    print(f"  LR (G / D)    : {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 1e-4)}")
+    print(f"  LPIPS λ       : {mc.get('lambda_lpips', 0.1)}")
+    print(f"  GAN λ         : {mc.get('lambda_gan', 0.005)}")
+    print(f"  Freq D        : {mc.get('use_freq', True)}")
+    print(f"  model_t       : {mc.get('model_t', 200)}")
+    print(f"  CFG dropout   : {mc.get('cfg_drop_prob', 0.1)}")
+    print(f"  Semantic      : {mc.get('use_semantic', False)}")
+    print(f"  NaN debug     : {mc.get('debug_nan', True)}")
     print(f"{'='*60}")
 
     # 开始训练
@@ -330,7 +355,6 @@ def main():
     log_dir = output_cfg.get("log_dir", "logs")
     experiment_name = output_cfg.get("experiment_name", "")
 
-    # 拼上实验名
     if experiment_name:
         checkpoint_dir = os.path.join(checkpoint_dir, experiment_name)
 
