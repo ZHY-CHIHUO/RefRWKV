@@ -136,7 +136,7 @@ def build_dataloaders(cfg: dict):
         num_workers=data_cfg["num_workers"],
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True,
+        persistent_workers=(data_cfg["num_workers"] > 0),
         prefetch_factor=data_cfg.get("prefetch_factor", 4),
     )
 

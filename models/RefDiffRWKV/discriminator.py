@@ -5,8 +5,6 @@ from torch import nn
 import open_clip
 from vision_aided_loss.cv_discriminator import BlurPool, spectral_norm
 from vision_aided_loss.cv_losses import multilevel_loss
-
-
 # ══════════════════════════════════════════════════════════════
 #  Haar 小波高频分解（频域判别器核心）
 # ══════════════════════════════════════════════════════════════
@@ -76,18 +74,28 @@ def _visual_forward(model, image, return_feats=False, return_pooled_feats=False)
     return x
 
 
+import os
+
 class ImageOpenCLIPConvNext(nn.Module):
 
     def __init__(self, precision="fp32"):
         super().__init__()
+        
+        # 直接用本地缓存路径，跳过所有网络请求
+        local_ckpt = os.path.expanduser(
+            "~/.cache/huggingface/hub/"
+            "models--laion--CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup/"
+            "snapshots/9f3e8ee3f383c672388d9178afe70af9e63ac9df/"
+            "open_clip_pytorch_model.bin"
+        )
+        
         full_model, _, _ = open_clip.create_model_and_transforms(
             "convnext_xxlarge",
-            pretrained="laion2b_s34b_b82k_augreg_soup",
+            pretrained=local_ckpt,   # ← 本地路径，零网络
             precision=precision,
         )
-        # 只保留 visual，丢弃 text tower，省 ~1GB 显存
         self.model = full_model.visual
-
+        
     def encode_image(self, image, return_feats=False, return_pooled_feats=False):
         return _visual_forward(
             self.model,
@@ -179,7 +187,7 @@ class ImageConvNextDiscriminator(nn.Module):
         self.model.eval().requires_grad_(False)
 
         self.decoder = MultiLevelDConv(
-            level=4, in_ch1=[384, 768, 1536], in_ch2=1024, out_ch=512, down=2
+            level=3, in_ch1=[768, 1536], in_ch2=1024, out_ch=512, down=2
         )
 
         # 频域模式：替换 ConvNeXt 第一层卷积以适配 9 通道输入
@@ -253,14 +261,7 @@ class ImageConvNextDiscriminator(nn.Module):
             x = (x - self.image_mean[:, None, None]) / self.image_std[:, None, None]
 
         features = self.model.encode_image(x, return_pooled_feats=True)
-        if verbose:
-            for i, f in enumerate(features):
-                print(f"{i}-th feature: {f.shape}")
-
         features = self.decoder(features)
-        if verbose:
-            for i, f in enumerate(features):
-                print(f"{i}-th feature after decoder: {f.shape}")
 
         # 每次 forward 临时创建 loss_fn，不挂 self，避免 checkpoint 序列化污染
         loss_fn = multilevel_loss(alpha=self.gan_alpha)

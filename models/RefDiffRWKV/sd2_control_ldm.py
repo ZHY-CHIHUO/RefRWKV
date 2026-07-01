@@ -171,11 +171,15 @@ class SD2ControlLDM(pl.LightningModule):
 
         # ══════════════════════════════════════════════
         #  4. GlobalSemantic — 语义路径（DINOv2 → RWKV）
+        #      冻结 backbone，仅通过 sem_proj 学习投影
         # ══════════════════════════════════════════════
         self.global_semantic = (
             GlobalSemanticModule(dinov2_model_name=dinov2_model_name)
             if use_semantic else None
         )
+        if self.global_semantic is not None:
+            self.global_semantic.eval()
+            self.global_semantic.requires_grad_(False)
         self.sem_proj: Optional[nn.Linear] = None
 
         # ══════════════════════════════════════════════
@@ -382,7 +386,8 @@ class SD2ControlLDM(pl.LightningModule):
             return None
         if self._is_zero_image(ref):
             return None
-        sem_pyramid = self.global_semantic(ref)
+        with torch.no_grad():
+            sem_pyramid = self.global_semantic(ref)
         sem_tokens = self._build_sem_tokens(sem_pyramid)
         return sem_tokens
 
@@ -690,10 +695,8 @@ class SD2ControlLDM(pl.LightningModule):
     def configure_optimizers(self):
         self._ensure_sem_proj()
 
-        # ── Generator 参数 ──
+        # ── Generator 参数（DINOv2 已冻结，不参与优化）──
         g_params = list(self.ref_model.parameters()) + list(self.ref_adapter.parameters())
-        if self.global_semantic is not None:
-            g_params += list(self.global_semantic.parameters())
         if self.sem_proj is not None:
             g_params += list(self.sem_proj.parameters())
         g_params += [p for p in self.unet.parameters() if p.requires_grad]
