@@ -195,10 +195,13 @@ def build_model(cfg: dict) -> SD2ControlLDM:
         # Loss weights & GAN
         learning_rate=mc.get("learning_rate", 1e-4),
         lr_D=mc.get("lr_D", 1e-4),
+        lr_D_texture=mc.get("lr_D_texture", 1e-4),  # ← 新增
+        lambda_gan_texture=mc.get("lambda_gan_texture", 0.5),  # ← 新增
+        disc_trainable_stages=mc.get("disc_trainable_stages", 1),  # ← 新增
         l_simple_weight=mc.get("l_simple_weight", 1.0),
         lambda_lpips=mc.get("lambda_lpips", 0.1),
         lambda_gan=mc.get("lambda_gan", 0.005),
-        use_freq=mc.get("use_freq", True), 
+        use_freq=mc.get("use_freq", True),
         weight_decay=mc.get("weight_decay", 1e-3),
         # AMP（手动优化模式下独立于 Trainer precision）
         use_amp=mc.get("use_amp", True),
@@ -317,10 +320,15 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  手动 AMP      : {mc.get('use_amp', True)}")
     print(f"  最大 epoch    : {max_epochs}")
     print(f"  LoRA rank     : {mc.get('lora_rank', 64)}")
-    print(f"  LR (G / D)    : {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 1e-4)}")
+    print(
+        f"  LR (G / D_sem / D_tex) : {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 1e-4)} / {mc.get('lr_D_texture', 1e-4)}"
+    )
     print(f"  LPIPS λ       : {mc.get('lambda_lpips', 0.1)}")
-    print(f"  GAN λ         : {mc.get('lambda_gan', 0.005)}")
+    print(
+        f"  GAN λ (sem / tex) : {mc.get('lambda_gan', 0.005)} / {mc.get('lambda_gan_texture', 0.5)}"
+    )
     print(f"  Freq D        : {mc.get('use_freq', True)}")
+    print(f"  D stages      : {mc.get('disc_trainable_stages', 1)}")
     print(f"  model_t       : {mc.get('model_t', 200)}")
     print(f"  CFG dropout   : {mc.get('cfg_drop_prob', 0.1)}")
     print(f"  Semantic      : {mc.get('use_semantic', False)}")

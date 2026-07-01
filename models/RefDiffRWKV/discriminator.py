@@ -5,9 +5,13 @@ from torch import nn
 import open_clip
 from vision_aided_loss.cv_discriminator import BlurPool, spectral_norm
 from vision_aided_loss.cv_losses import multilevel_loss
+
+import os
+
 # ══════════════════════════════════════════════════════════════
 #  Haar 小波高频分解（频域判别器核心）
 # ══════════════════════════════════════════════════════════════
+
 
 def haar_highpass(x):
     """
@@ -22,41 +26,34 @@ def haar_highpass(x):
     """
     B, C, H, W = x.shape
 
-    # 确保 H, W 是偶数
     if H % 2 != 0:
-        x = x[:, :, :H - 1, :]
+        x = x[:, :, : H - 1, :]
         H = H - 1
     if W % 2 != 0:
-        x = x[:, :, :, :W - 1]
+        x = x[:, :, :, : W - 1]
         W = W - 1
 
-    # 2×2 分块
     x = x.reshape(B, C, H // 2, 2, W // 2, 2)
 
-    # 四个象限
-    x00 = x[:, :, :, 0, :, 0]  # 左上
-    x01 = x[:, :, :, 0, :, 1]  # 右上
-    x10 = x[:, :, :, 1, :, 0]  # 左下
-    x11 = x[:, :, :, 1, :, 1]  # 右下
+    x00 = x[:, :, :, 0, :, 0]
+    x01 = x[:, :, :, 0, :, 1]
+    x10 = x[:, :, :, 1, :, 0]
+    x11 = x[:, :, :, 1, :, 1]
 
-    LH = x01 - x00   # 水平高频（水平相邻差 → 垂直边缘）
-    HL = x10 - x00   # 垂直高频（垂直相邻差 → 水平边缘）
-    HH = x11 - x00   # 对角高频
+    LH = x01 - x00
+    HL = x10 - x00
+    HH = x11 - x00
 
-    # concat 三个高频子带
-    high = torch.cat([LH, HL, HH], dim=1)  # (B, C*3, H//2, W//2)
+    high = torch.cat([LH, HL, HH], dim=1)
     return high
 
 
 # ══════════════════════════════════════════════════════════════
-#  Backbone: OpenCLIP ConvNeXt（冻结，仅提取多级特征）
+#  Backbone: OpenCLIP ConvNeXt
 # ══════════════════════════════════════════════════════════════
 
+
 def _visual_forward(model, image, return_feats=False, return_pooled_feats=False):
-    """
-    直接接收 open_clip 的 visual 对象（不含 text tower），
-    避免加载完整 CLIP 浪费 ~1GB 显存。
-    """
     x, intermediates = model.trunk.forward_intermediates(
         image,
         indices=None,
@@ -74,28 +71,46 @@ def _visual_forward(model, image, return_feats=False, return_pooled_feats=False)
     return x
 
 
-import os
-
 class ImageOpenCLIPConvNext(nn.Module):
+    """
+    OpenCLIP ConvNeXt-XXLarge 视觉 backbone 封装。
 
-    def __init__(self, precision="fp32"):
+    Args:
+        precision:        "fp32" / "fp16"
+        trainable_stages: 解冻 stem + 前 N 个 stage
+                          0 = 全冻结（原行为）
+                          1 = 解冻 stem（第一层卷积 + LayerNorm）
+                          2 = 解冻 stem + stage1
+                          3 = 解冻 stem + stage1 + stage2
+    """
+
+    def __init__(self, precision="fp32", trainable_stages=0):
         super().__init__()
-        
-        # 直接用本地缓存路径，跳过所有网络请求
+
         local_ckpt = os.path.expanduser(
             "~/.cache/huggingface/hub/"
             "models--laion--CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup/"
             "snapshots/9f3e8ee3f383c672388d9178afe70af9e63ac9df/"
             "open_clip_pytorch_model.bin"
         )
-        
+
         full_model, _, _ = open_clip.create_model_and_transforms(
             "convnext_xxlarge",
-            pretrained=local_ckpt,   # ← 本地路径，零网络
+            pretrained=local_ckpt,
             precision=precision,
         )
         self.model = full_model.visual
-        
+        self.trainable_stages = trainable_stages
+
+        # 按需解冻
+        self.model.eval().requires_grad_(False)
+        if trainable_stages >= 1:
+            self.model.trunk.stem.requires_grad_(True)
+        if trainable_stages >= 2:
+            self.model.trunk.stages[0].requires_grad_(True)
+        if trainable_stages >= 3:
+            self.model.trunk.stages[1].requires_grad_(True)
+
     def encode_image(self, image, return_feats=False, return_pooled_feats=False):
         return _visual_forward(
             self.model,
@@ -106,8 +121,9 @@ class ImageOpenCLIPConvNext(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  MultiLevelDConv — 多尺度判别器头部
+#  MultiLevelDConv — 多尺度判别器头部（加深版）
 # ══════════════════════════════════════════════════════════════
+
 
 class MultiLevelDConv(nn.Module):
 
@@ -127,9 +143,12 @@ class MultiLevelDConv(nn.Module):
         for i in range(level - 1):
             self.decoder.append(
                 nn.Sequential(
-                    BlurPool(in_ch1[i], pad_type="zero", stride=1, pad_off=1)
-                    if down > 1
-                    else nn.Identity(),
+                    (
+                        BlurPool(in_ch1[i], pad_type="zero", stride=1, pad_off=1)
+                        if down > 1
+                        else nn.Identity()
+                    ),
+                    # ── 第一层 3×3 ──
                     spectral_norm(
                         nn.Conv2d(
                             in_ch1[i],
@@ -140,6 +159,10 @@ class MultiLevelDConv(nn.Module):
                         )
                     ),
                     activation,
+                    # ── 第二层 3×3 ──
+                    spectral_norm(nn.Conv2d(out_ch, out_ch, 3, padding=1)),
+                    activation,
+                    # ═══════════════════════════════════════════
                     BlurPool(out_ch, pad_type="zero", stride=1),
                     spectral_norm(nn.Conv2d(out_ch, 1, kernel_size=1, stride=2)),
                 )
@@ -167,30 +190,44 @@ class MultiLevelDConv(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  ImageConvNextDiscriminator — 完整判别器（频域版本）
+#  ImageConvNextDiscriminator — 语义判别器（频域 + 可训练 stem）
 # ══════════════════════════════════════════════════════════════
 
-class ImageConvNextDiscriminator(nn.Module):
 
-    def __init__(self, alpha=0.8, precision="fp32", use_freq=True):
+class ImageConvNextDiscriminator(nn.Module):
+    """
+    语义级判别器：判断"这张图看起来真实吗"。
+
+    采用 Haar 小波频域输入 + ConvNeXt-XXLarge backbone + 多尺度头部。
+    主要用于保证生成图的低频合理性（色彩、语义一致性），
+    纹理细节的驱动由 TextureConsistencyDiscriminator 负责。
+    """
+
+    def __init__(self, alpha=0.8, precision="fp32", use_freq=True, trainable_stages=1):
         """
         Args:
-            alpha: GAN loss 中 multilevel loss 的混合系数
-            precision: CLIP backbone 精度（"fp32" / "fp16"）
-            use_freq: True=频域判别（小波高频子带），False=像素域判别（原行为）
+            alpha:             GAN loss 中 multilevel loss 的混合系数
+            precision:         CLIP backbone 精度（"fp32" / "fp16"）
+            use_freq:          True=频域判别（小波高频子带），False=像素域判别
+            trainable_stages:  解冻 backbone 的层数
+                               0 = 全冻结（原行为，不推荐）
+                               1 = 解冻 stem（推荐起步值）
+                               2 = 解冻 stem + stage1
         """
         super().__init__()
         self.gan_alpha = alpha
         self.use_freq = use_freq
+        self.trainable_stages = trainable_stages
 
-        self.model = ImageOpenCLIPConvNext(precision=precision)
-        self.model.eval().requires_grad_(False)
+        self.model = ImageOpenCLIPConvNext(
+            precision=precision,
+            trainable_stages=trainable_stages,
+        )
 
         self.decoder = MultiLevelDConv(
             level=3, in_ch1=[768, 1536], in_ch2=1024, out_ch=512, down=2
         )
 
-        # 频域模式：替换 ConvNeXt 第一层卷积以适配 9 通道输入
         if use_freq:
             self._adapt_first_conv(9)
 
@@ -205,14 +242,13 @@ class ImageConvNextDiscriminator(nn.Module):
 
     def _adapt_first_conv(self, in_channels=9):
         """
-        重新初始化 ConvNeXt 第一层卷积以适配频域输入通道。
-        前 3 通道复用 CLIP 预训练权重，后 6 通道用正交初始化，
-        因为小波高频子带是零均值的差分信号。
+        重新初始化 ConvNeXt 第一层卷积以适配 9 通道频域输入。
+        前 3 通道复用 CLIP 预训练权重，后 6 通道用正交初始化。
+        stem 的 requires_grad 由 trainable_stages 控制。
         """
         old_conv = self.model.model.trunk.stem[0]
-        old_weight = old_conv.weight.data  # (384, 3, 4, 4)
+        old_weight = old_conv.weight.data
 
-        # 创建新卷积：9 通道输入，其他参数与原 stem 一致
         new_conv = nn.Conv2d(
             in_channels,
             old_weight.shape[0],
@@ -222,51 +258,181 @@ class ImageConvNextDiscriminator(nn.Module):
         )
 
         with torch.no_grad():
-            # 前 3 通道复用预训练权重
             new_conv.weight[:, :3, :, :] = old_weight
-            # 后 6 通道（LH/HL/HH × 2 组 RGB）用正交初始化
             for c in range(3, in_channels):
-                nn.init.orthogonal_(new_conv.weight[:, c:c + 1, :, :])
-
-        # 原地替换
+                nn.init.orthogonal_(new_conv.weight[:, c : c + 1, :, :])
         new_conv.bias.data.copy_(old_conv.bias.data)
-        new_conv.requires_grad_(False)
+
+        new_conv.requires_grad_(self.trainable_stages >= 1)
+
         self.model.model.trunk.stem[0] = new_conv
 
+        if self.trainable_stages >= 1:
+            self.model.model.trunk.stem[1].requires_grad_(True)
+
     def train(self, mode=True):
+        """只让 decoder + 已解冻的 stem/stage 进入 train 模式。"""
         self.decoder.train(mode)
+        if self.trainable_stages >= 1:
+            self.model.model.trunk.stem.train(mode)
+        if self.trainable_stages >= 2:
+            self.model.model.trunk.stages[0].train(mode)
         return self
 
     def eval(self):
-        self.train(False)
-        return self
+        return self.train(False)
 
     def requires_grad_(self, requires_grad=True):
         self.decoder.requires_grad_(requires_grad)
+        if self.trainable_stages >= 1:
+            self.model.model.trunk.stem.requires_grad_(requires_grad)
+        if self.trainable_stages >= 2:
+            self.model.model.trunk.stages[0].requires_grad_(requires_grad)
         return self
 
     def forward(
         self, x, for_real=True, for_G=False, verbose=False, return_logits=False
     ):
-        # x: (B, 3, H, W)  值域 [-1, 1]
-
-        # ── 预处理分支 ──
         if self.use_freq:
-            # 频域路径：小波高频分解 → 逐样本 z-score
-            x = haar_highpass(x)                                    # (B, 9, H//2, W//2)
-            x = (x - x.mean(dim=[2, 3], keepdim=True)) / (x.std(dim=[2, 3], keepdim=True) + 1e-6)       # 方差标准化
+            x = haar_highpass(x)
+            # 逐样本 z-score 标准化（高频子带是零均值差分，不用 CLIP 均值/方差）
+            x = (x - x.mean(dim=[2, 3], keepdim=True)) / (
+                x.std(dim=[2, 3], keepdim=True) + 1e-6
+            )
         else:
-            # 像素域路径：原 CLIP 归一化
-            x = x * 0.5 + 0.5                                       # [-1,1] → [0,1]
+            x = x * 0.5 + 0.5
             x = (x - self.image_mean[:, None, None]) / self.image_std[:, None, None]
 
         features = self.model.encode_image(x, return_pooled_feats=True)
         features = self.decoder(features)
 
-        # 每次 forward 临时创建 loss_fn，不挂 self，避免 checkpoint 序列化污染
         loss_fn = multilevel_loss(alpha=self.gan_alpha)
         loss = loss_fn(features, for_real=for_real, for_G=for_G)
 
         if return_logits:
             return loss, features
         return loss
+
+
+# ══════════════════════════════════════════════════════════════
+#  TextureConsistencyDiscriminator — 纹理一致性判别器（遥感 RefSR 专用）
+# ══════════════════════════════════════════════════════════════
+
+
+class TextureConsistencyDiscriminator(nn.Module):
+    """
+    多尺度特征差值纹理一致性判别器 — 遥感 RefSR 专用。
+
+    设计原理：
+      不判断"生成图是否等于 ref"，而是判断"生成图相对 ref 的纹理差异
+      是否和 HR 相对 ref 的纹理差异属于同一模式"。
+
+      输入：(生成图或HR, ref)
+      过程：共享编码器提取多尺度特征 → 计算特征差值 → 判别器判断差值模式
+      输出：单个 logit（Hinge loss 用）
+
+    为什么适合时间跨度的遥感场景：
+      - 地物真实变化（农田→住宅）：差值大但纹理完整 → 判别器学到这是正常模式
+      - 纹理迁移失败（模糊）：差值中高频子带能量异常低 → 被识别为异常
+      - 纹理迁移错误（森林纹理错贴到城市）：差值空间分布异常 → 被识别
+      - 小树长成大树：差值模式与"模糊"不同 → 不会被错判
+
+    训练策略：
+      - 正样本：(HR, ref) → 期望 logit > +1
+      - 负样本：(生成图, ref) → 期望 logit < -1
+      - 判别器学习的是"差值模式的统计分布"，而非"差值是否为零"
+
+    参数：
+      in_ch:        输入通道数（3 for RGB）
+      base_ch:      基础通道数，~3M 总参数量
+      num_scales:   多尺度层数（4 = 感受野从局部到全局覆盖完整）
+      use_spectral: 是否使用 spectral norm（稳定训练）
+    """
+
+    def __init__(self, in_ch=3, base_ch=48, num_scales=4, use_spectral=True):
+        super().__init__()
+        self.num_scales = num_scales
+        self._sn = spectral_norm if use_spectral else lambda x: x
+
+        # ═══════════════════════════════════════════
+        # 共享编码器（对 image 和 ref 使用同一套权重）
+        # 逐层下采样 → 多尺度特征金字塔
+        # ═══════════════════════════════════════════
+        enc_chs = [in_ch] + [base_ch * (2**i) for i in range(num_scales)]
+        # enc_chs: [3, 48, 96, 192, 384]
+
+        self.encoder = nn.ModuleList()
+        for i in range(num_scales):
+            self.encoder.append(
+                nn.Sequential(
+                    self._sn(nn.Conv2d(enc_chs[i], enc_chs[i + 1], 4, 2, 1)),
+                    nn.GroupNorm(min(8, enc_chs[i + 1] // 4), enc_chs[i + 1]),
+                    nn.LeakyReLU(0.2),
+                    self._sn(nn.Conv2d(enc_chs[i + 1], enc_chs[i + 1], 3, 1, 1)),
+                    nn.GroupNorm(min(8, enc_chs[i + 1] // 4), enc_chs[i + 1]),
+                    nn.LeakyReLU(0.2),
+                )
+            )
+
+        # ═══════════════════════════════════════════
+        # 多尺度差值判别器头部
+        # 每个尺度独立处理差值特征后聚合
+        # ═══════════════════════════════════════════
+        self.scale_heads = nn.ModuleList()
+        for i in range(num_scales):
+            ch = enc_chs[i + 1]
+            self.scale_heads.append(
+                nn.Sequential(
+                    # 差值特征 → 判别特征（两层 3×3 卷积）
+                    self._sn(nn.Conv2d(ch, ch // 2, 3, 1, 1)),
+                    nn.LeakyReLU(0.2),
+                    self._sn(nn.Conv2d(ch // 2, ch // 4, 3, 1, 1)),
+                    nn.LeakyReLU(0.2),
+                    # 全局平均池化 → 单个判别分数
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Flatten(),
+                    self._sn(nn.Linear(ch // 4, 1)),
+                )
+            )
+
+        # ═══════════════════════════════════════════
+        # 可学习的尺度聚合权重
+        # 初始化为均匀分布，训练中自适应调整
+        # ═══════════════════════════════════════════
+        self.scale_weights = nn.Parameter(torch.ones(num_scales) / num_scales)
+
+    def _extract_features(self, x):
+        """提取多尺度特征金字塔。"""
+        feats = []
+        for layer in self.encoder:
+            x = layer(x)
+            feats.append(x)
+        return feats  # [feat_s0(H×W), feat_s1(H/2×W/2), ..., feat_s{n-1}]
+
+    def forward(self, image, ref):
+        """
+        Args:
+            image: (B, 3, H, W)  生成图 或 HR 真实图
+            ref:   (B, 3, H, W)  参考图像（已 resize 到相同尺寸）
+
+        Returns:
+            logit:           (B, 1)  真假评分（Hinge loss 用）
+            per_scale_logits: List[(B, 1)]  各尺度 logit（用于调试/可视化）
+        """
+        # Step 1: 共享编码器提取多尺度特征
+        feats_image = self._extract_features(image)
+        feats_ref = self._extract_features(ref)
+
+        # Step 2: 计算各尺度特征差值 → 判别器头部打分
+        per_scale_logits = []
+        for i, head in enumerate(self.scale_heads):
+            diff = torch.abs(feats_image[i] - feats_ref[i])
+            logit = head(diff)  # (B, 1)
+            per_scale_logits.append(logit)
+
+        # Step 3: 可学习加权聚合
+        weights = torch.softmax(self.scale_weights, dim=0)
+        logits_stacked = torch.stack(per_scale_logits, dim=0)  # (S, B, 1)
+        weighted = (weights.unsqueeze(1).unsqueeze(2) * logits_stacked).sum(dim=0)
+
+        return weighted, per_scale_logits
