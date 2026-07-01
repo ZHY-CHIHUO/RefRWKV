@@ -165,6 +165,7 @@ class MultiLevelDConv(nn.Module):
                     # ═══════════════════════════════════════════
                     BlurPool(out_ch, pad_type="zero", stride=1),
                     spectral_norm(nn.Conv2d(out_ch, 1, kernel_size=1, stride=2)),
+                    nn.Tanh(),  # ← 值域约束 [-1, 1]，防止空间预测无界发散
                 )
             )
         self.decoder.append(
@@ -185,6 +186,7 @@ class MultiLevelDConv(nn.Module):
         if self.embed is not None:
             out += torch.sum(self.embed(c) * h, 1, keepdim=True)
 
+        out = torch.tanh(out)  # ← 值域约束 [-1, 1]，防止标量预测无界发散
         final_pred.append(out)
         return final_pred
 
@@ -435,4 +437,4 @@ class TextureConsistencyDiscriminator(nn.Module):
         logits_stacked = torch.stack(per_scale_logits, dim=0)  # (S, B, 1)
         weighted = (weights.unsqueeze(1).unsqueeze(2) * logits_stacked).sum(dim=0)
 
-        return weighted, per_scale_logits
+        return torch.tanh(weighted), per_scale_logits  # ← 值域约束 [-1, 1]
