@@ -81,7 +81,7 @@ class SD2ControlLDM(pl.LightningModule):
         # ═════════════════════════════════════════════
         learning_rate: float = 1e-4,
         lr_D: float = 5e-6,
-        lr_D_texture: float = 1e-4,
+        lr_D_texture: float = 1e-5,
         disc_trainable_stages: int = 1,
         use_amp: bool = True,
         weight_decay: float = 1e-3,
@@ -142,6 +142,11 @@ class SD2ControlLDM(pl.LightningModule):
         self._g_accum_count = 0
         self._d_sem_accum_count = 0
         self._d_tex_accum_count = 0
+
+        # [FIX] G/D 交替相位: 0=Generator, 1=Discriminator
+        # 每个 phase 持续 accumulate_grad_batches 个 training_step 调用，
+        # 直到对应 optimizer 真正 step 后才切换到另一 phase
+        self._gd_phase = 0
 
         # ══════════════════════════════════════════════
         #  1. VAE（冻结）
@@ -210,11 +215,13 @@ class SD2ControlLDM(pl.LightningModule):
         )
 
         # ══════════════════════════════════════════════
-        #  7. LPIPS（冻结）
+        #  7. LPIPS（冻结权重，不调用 eval 避免被 Lightning 误判）
         # ══════════════════════════════════════════════
         self.net_lpips = lpips.LPIPS(net="vgg", verbose=False)
-        self.net_lpips.eval()
-        self.net_lpips.requires_grad_(False)
+        # [FIX] 只冻结权重，不调用 .eval()——避免被 PyTorch Lightning 列入
+        # "eval mode modules" 警告，且 LPIPS 内部无 BN/Dropout，train/eval 模式无区别
+        for param in self.net_lpips.parameters():
+            param.requires_grad = False
 
         # ══════════════════════════════════════════════
         #  8. 双判别器（GAN）
@@ -531,16 +538,24 @@ class SD2ControlLDM(pl.LightningModule):
 
     # ════════════════════════════════════════════════════════
     #  Training — G/D 交替（手动优化 + AMP + 梯度累积）
-    #  全局步数 % 2: 偶数→Generator, 奇数→双 Discriminator
+    #
+    #  [FIX] 使用 _gd_phase 控制交替，而非 trainer.global_step % 2。
+    #  原因：trainer.global_step 每次 training_step 调用就 +1，
+    #  但真正 optimizer.step() 每 accumulate_grad_batches 次才执行一次。
+    #  用 % 2 会导致同一个梯度累积窗口内混合 G/D 两种 step，
+    #  各自只积累了不到 accumulate_grad_batches 的梯度，永远不会触发 step。
+    #
+    #  现在的逻辑：
+    #    _gd_phase=0 → 连续 accumulate_grad_batches 次 G step → 触发 G 更新 → 切到 D
+    #    _gd_phase=1 → 连续 accumulate_grad_batches 次 D step → 触发 D 更新 → 切到 G
     # ════════════════════════════════════════════════════════
 
     def training_step(self, batch, batch_idx):
         g_opt, d_sem_opt, d_tex_opt = self.optimizers()
 
-        is_g_step = self.trainer.global_step % 2 == 0
-
+        # [FIX] 用 phase 控制，而非 trainer.global_step % 2
         try:
-            if is_g_step:
+            if self._gd_phase == 0:
                 return self._generator_step(batch, batch_idx, g_opt)
             else:
                 return self._discriminator_step(batch, batch_idx, d_sem_opt, d_tex_opt)
@@ -628,6 +643,8 @@ class SD2ControlLDM(pl.LightningModule):
             self.scaler_g.update()
             g_opt.zero_grad()
             self._g_accum_count = 0
+            # [FIX] G 权重已更新，切换到 D phase
+            self._gd_phase = 1
 
         # ── log ──
         self.log_dict(
@@ -743,6 +760,8 @@ class SD2ControlLDM(pl.LightningModule):
             self.scaler_d_tex.update()
             d_tex_opt.zero_grad()
             self._d_tex_accum_count = 0
+            # [FIX] 纹理 D 也已完成一次更新，两个 D 都不会再更新了 → 切回 G phase
+            self._gd_phase = 0
 
         # Part 2 完成后冻结纹理 D（为下一个 G step 做准备）
         self.D_texture.eval()
@@ -967,6 +986,8 @@ class SD2ControlLDM(pl.LightningModule):
         checkpoint["d_sem_accum_count"] = self._d_sem_accum_count
         checkpoint["d_tex_accum_count"] = self._d_tex_accum_count
         checkpoint["nan_count"] = self._nan_count
+        # [FIX] 持久化 G/D phase
+        checkpoint["gd_phase"] = self._gd_phase
 
         # 持久化 GradScaler 内部状态（scale factor + growth 计数等）
         checkpoint["scaler_g"] = self.scaler_g.state_dict()
@@ -1000,6 +1021,11 @@ class SD2ControlLDM(pl.LightningModule):
             if ckpt_key in checkpoint:
                 setattr(self, attr_name, checkpoint[ckpt_key])
                 restored.append(f"{attr_name}={checkpoint[ckpt_key]}")
+
+        # [FIX] 恢复 G/D phase
+        if "gd_phase" in checkpoint:
+            self._gd_phase = checkpoint["gd_phase"]
+            restored.append(f"_gd_phase={self._gd_phase}")
 
         if restored:
             print(f"[AccumCounter] 恢复：{', '.join(restored)}")
