@@ -62,19 +62,20 @@ class ImageOpenCLIPConvNext(nn.Module):
     def __init__(self, precision="fp32", trainable_stages=0):
         super().__init__()
 
-        local_ckpt = os.path.expanduser(
-            "~/.cache/huggingface/hub/models--laion--CLIP-convnext_base_w-laion2B-s13B-b82K/snapshots/main/open_clip_pytorch_model.bin"
-        )
+        model_name = "convnext_base_w"
+        pretrained_name = "laion2b_s13b_b82k"
 
         full_model, _, _ = open_clip.create_model_and_transforms(
-            "convnext_base_w",
-            pretrained=local_ckpt,
+            model_name,
+            pretrained=pretrained_name,
             precision=precision,
         )
+
         self.model = full_model.visual
         self.trainable_stages = trainable_stages
 
         self.model.eval().requires_grad_(False)
+
         if trainable_stages >= 1:
             self.model.trunk.stem.requires_grad_(True)
         if trainable_stages >= 2:
@@ -82,7 +83,6 @@ class ImageOpenCLIPConvNext(nn.Module):
 
     def encode_image(self, image, return_feats=False, return_pooled_feats=False):
         return _visual_forward(self.model, image, return_feats, return_pooled_feats)
-
 
 # ══════════════════════════════════════════════════════════════
 #  MultiLevelDConv — 已适配实际特征通道
