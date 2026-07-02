@@ -48,7 +48,11 @@ class SD2ControlLDM(pl.LightningModule):
         lora_target_modules: Optional[List[str]] = None,
         sd_locked: bool = True,
         # ═════════════════════════════════════════════
-        #  3. RefDiffRWKV — 纹理提取
+        #  3. SR prior / 预训练超分模型
+        sr_model: Optional[nn.Module] = None,
+        sr_fixed: bool = True,
+        # ═════════════════════════════════════════════
+        #  4. RefDiffRWKV — 纹理提取
         # ═════════════════════════════════════════════
         patch_size: int = 4,
         embed_dim: int = 384,
@@ -95,7 +99,7 @@ class SD2ControlLDM(pl.LightningModule):
         iqa_device: str = "cpu",
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["sr_model"])
 
         # ── 数据键 / 基础开关 ──
         self.lr_key = lr_key
@@ -103,6 +107,13 @@ class SD2ControlLDM(pl.LightningModule):
         self.hr_key = hr_key
         self.sd_locked = sd_locked
         self.cfg_drop_prob = cfg_drop_prob
+
+        # ── SR prior / 预训练超分模型 ──
+        self.sr_model = sr_model
+        self.sr_fixed = sr_fixed
+        if self.sr_model is not None and self.sr_fixed:
+            self.sr_model.eval()
+            self.sr_model.requires_grad_(False)
 
         # ── 训练超参 ──
         self.learning_rate = learning_rate
@@ -487,8 +498,16 @@ class SD2ControlLDM(pl.LightningModule):
     # ════════════════════════════════════════════════════════
 
     def _run_unet(self, lr, ref, hr):
-        with torch.amp.autocast("cuda", enabled=False):
-            x0 = self.encode_latent(hr.to(self.device))
+        if self.sr_model is not None:
+            if self.sr_fixed:
+                with torch.no_grad():
+                    sr_prior = self.sr_model(lr.to(self.device), ref.to(self.device))
+            else:
+                sr_prior = self.sr_model(lr.to(self.device), ref.to(self.device))
+            x0 = self.encode_latent(sr_prior)
+        else:
+            with torch.amp.autocast("cuda", enabled=False):
+                x0 = self.encode_latent(hr.to(self.device))
         B = x0.shape[0]
 
         t = torch.full((B,), self.model_t, device=self.device).long()
@@ -831,6 +850,8 @@ class SD2ControlLDM(pl.LightningModule):
         if self.sem_proj is not None:
             g_params += list(self.sem_proj.parameters())
         g_params += [p for p in self.unet.parameters() if p.requires_grad]
+        if self.sr_model is not None and not self.sr_fixed:
+            g_params += [p for p in self.sr_model.parameters() if p.requires_grad]
 
         g_opt = torch.optim.AdamW(
             g_params, lr=self.learning_rate, weight_decay=self.weight_decay
@@ -945,9 +966,21 @@ class SD2ControlLDM(pl.LightningModule):
             device=self.device,
         )
 
-        alpha_bar = self.noise_scheduler.alphas_cumprod[self.model_t]
-        z_t = torch.sqrt(1 - alpha_bar) * noise
-        x_t_pixel = self.decode_latent(z_t.float())
+        if self.sr_model is not None:
+            if self.sr_fixed:
+                with torch.no_grad():
+                    sr_prior = self.sr_model(lr, ref)
+            else:
+                sr_prior = self.sr_model(lr, ref)
+            x0 = self.encode_latent(sr_prior)
+            t = torch.full((1,), self.model_t, device=self.device).long()
+            x_t = self.noise_scheduler.add_noise(x0, noise, t)
+            x_t_pixel = self.decode_latent(x_t / self.vae_scale_factor).sample
+        else:
+            alpha_bar = self.noise_scheduler.alphas_cumprod[self.model_t]
+            z_t = torch.sqrt(1 - alpha_bar) * noise
+            x_t = z_t
+            x_t_pixel = self.decode_latent(z_t.float())
 
         rf_feats, sem_tokens = self._extract_ref_static(
             lr, ref, latent_shape, x_t_pixel=x_t_pixel
@@ -958,12 +991,12 @@ class SD2ControlLDM(pl.LightningModule):
         t_b = torch.full((1,), self.model_t, device=self.device).long()
         self.unet.eval()
         noise_pred = self.unet(
-            z_t,
+            x_t,
             t_b,
             encoder_hidden_states=context,
         ).sample
         z = self.noise_scheduler.step(
-            noise_pred, self.model_t, z_t
+            noise_pred, self.model_t, x_t
         ).pred_original_sample
 
         self._clear_ref_feats()

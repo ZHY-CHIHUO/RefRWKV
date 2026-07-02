@@ -36,7 +36,52 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==================== 导入模型和数据集 ====================
 from RefRWKV.models.RefDiffRWKV.sd2_control_ldm import SD2ControlLDM
+from RefRWKV.models.RefSRWKV import RefSRWKV
 from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
+
+
+def build_sr_model(cfg: dict):
+    mc = cfg.get("model", {})
+    if not mc.get("sr_enabled", False):
+        return None
+
+    sr_cfg = mc.get("sr", {})
+    model = RefSRWKV(
+        inp_channels=sr_cfg.get("inp_channels", 3),
+        out_channels=sr_cfg.get("out_channels", 3),
+        dim=sr_cfg.get("dim", 48),
+        num_blocks=tuple(sr_cfg.get("num_blocks", [4, 6, 6, 8])),
+        num_refinement_blocks=sr_cfg.get("num_refinement_blocks", 4),
+        scale=sr_cfg.get("scale", 10),
+        drop_path_rate=sr_cfg.get("drop_path_rate", 0.1),
+        hidden_rate=sr_cfg.get("hidden_rate", 4),
+    )
+
+    ckpt_path = sr_cfg.get("ckpt_path")
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            ckpt = ckpt["state_dict"]
+        if isinstance(ckpt, dict):
+            state_dict = {}
+            for k, v in ckpt.items():
+                k = k.replace("module.", "")
+                if k.startswith("model."):
+                    k = k[len("model.") :]
+                state_dict[k] = v
+            ckpt = state_dict
+        model.load_state_dict(ckpt, strict=False)
+        print(f"✅ Loaded SR prior weights from {ckpt_path}")
+    elif mc.get("sr_enabled", False):
+        print(
+            "⚠️ sr_enabled=True but sr.ckpt_path is null; using randomly initialized SR prior"
+        )
+
+    if mc.get("sr_fixed", True):
+        model.eval()
+        model.requires_grad_(False)
+
+    return model
 
 
 # ============================================================
@@ -166,6 +211,8 @@ def build_model(cfg: dict) -> SD2ControlLDM:
     """
     mc = cfg.get("model", {})
 
+    sr_model = build_sr_model(cfg)
+
     return SD2ControlLDM(
         # Data keys
         lr_key=mc.get("lr_key", "lr"),
@@ -177,6 +224,9 @@ def build_model(cfg: dict) -> SD2ControlLDM:
         lora_rank=mc.get("lora_rank", 64),
         lora_target_modules=mc.get("lora_target_modules", None),
         sd_locked=mc.get("sd_locked", True),
+        # SR prior
+        sr_model=sr_model,
+        sr_fixed=mc.get("sr_fixed", True),
         # RefDiffRWKV
         patch_size=mc.get("patch_size", 4),
         embed_dim=mc.get("embed_dim", 384),

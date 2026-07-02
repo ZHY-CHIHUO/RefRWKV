@@ -85,7 +85,7 @@ class ImageOpenCLIPConvNext(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  MultiLevelDConv
+#  MultiLevelDConv — 已适配实际特征通道
 # ══════════════════════════════════════════════════════════════
 
 
@@ -93,8 +93,8 @@ class MultiLevelDConv(nn.Module):
     def __init__(
         self,
         level=3,
-        in_ch1=(384, 768),
-        in_ch2=512,
+        in_ch1=(256, 512),  # ← 关键修复：匹配 ConvNeXt-Base-W 的实际特征
+        in_ch2=640,  # ← pooled feature 维度
         out_ch=256,
         num_classes=0,
         activation=nn.LeakyReLU(0.2, inplace=True),
@@ -116,7 +116,7 @@ class MultiLevelDConv(nn.Module):
                         nn.Conv2d(
                             in_ch1[i],
                             out_ch,
-                            3,
+                            kernel_size=3,
                             stride=2 if down > 1 else 1,
                             padding=1 if down == 1 else 0,
                         )
@@ -169,7 +169,7 @@ class ImageConvNextDiscriminator(nn.Module):
         )
 
         self.decoder = MultiLevelDConv(
-            level=3, in_ch1=[384, 768], in_ch2=512, out_ch=256, down=2
+            level=3, in_ch1=[256, 512], in_ch2=640, out_ch=256, down=2  # ← 与上面一致
         )
 
         if use_freq:
@@ -205,7 +205,6 @@ class ImageConvNextDiscriminator(nn.Module):
         if self.trainable_stages >= 1:
             self.model.model.trunk.stem[1].requires_grad_(True)
 
-    # train / eval / requires_grad_ 方法保持不变
     def train(self, mode=True):
         self.decoder.train(mode)
         if self.trainable_stages >= 1:
@@ -236,6 +235,8 @@ class ImageConvNextDiscriminator(nn.Module):
             x = (x - self.image_mean[:, None, None]) / self.image_std[:, None, None]
 
         features = self.model.encode_image(x, return_pooled_feats=True)
+        # print(f"[Debug] Features shapes: {[f.shape for f in features]}")  # 调试时打开
+
         features = self.decoder(features)
 
         loss_fn = multilevel_loss(alpha=self.gan_alpha)
@@ -244,6 +245,11 @@ class ImageConvNextDiscriminator(nn.Module):
         if return_logits:
             return loss, features
         return loss
+
+
+# ══════════════════════════════════════════════════════════════
+#  TextureConsistencyDiscriminator（保持不变）
+# ══════════════════════════════════════════════════════════════
 
 
 class TextureConsistencyDiscriminator(nn.Module):

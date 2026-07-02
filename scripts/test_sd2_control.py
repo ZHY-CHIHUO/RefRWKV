@@ -26,6 +26,7 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from RefRWKV.models.RefDiffRWKV.sd2_control_ldm import SD2ControlLDM
+from RefRWKV.models.RefSRWKV import RefSRWKV
 from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
 
 torch.set_float32_matmul_precision("high")
@@ -72,7 +73,7 @@ def load_weights(model, ckpt_path: str):
     for k, v in state_dict.items():
         for pre in ["model.", "model_sr.", "model_diff.", "model_enhance."]:
             if k.startswith(pre):
-                k = k[len(pre):]
+                k = k[len(pre) :]
                 break
         new_state_dict[k] = v
 
@@ -122,9 +123,54 @@ def build_test_dataloader(cfg: dict):
     return loader
 
 
+def build_sr_model(cfg: dict):
+    mc = cfg.get("model", {})
+    if not mc.get("sr_enabled", False):
+        return None
+
+    sr_cfg = mc.get("sr", {})
+    model = RefSRWKV(
+        inp_channels=sr_cfg.get("inp_channels", 3),
+        out_channels=sr_cfg.get("out_channels", 3),
+        dim=sr_cfg.get("dim", 48),
+        num_blocks=tuple(sr_cfg.get("num_blocks", [4, 6, 6, 8])),
+        num_refinement_blocks=sr_cfg.get("num_refinement_blocks", 4),
+        scale=sr_cfg.get("scale", 10),
+        drop_path_rate=sr_cfg.get("drop_path_rate", 0.1),
+        hidden_rate=sr_cfg.get("hidden_rate", 4),
+    )
+
+    ckpt_path = sr_cfg.get("ckpt_path")
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            ckpt = ckpt["state_dict"]
+        if isinstance(ckpt, dict):
+            state_dict = {}
+            for k, v in ckpt.items():
+                k = k.replace("module.", "")
+                if k.startswith("model."):
+                    k = k[len("model.") :]
+                state_dict[k] = v
+            ckpt = state_dict
+        model.load_state_dict(ckpt, strict=False)
+        print(f"✅ Loaded SR prior weights from {ckpt_path}")
+    elif mc.get("sr_enabled", False):
+        print(
+            "⚠️ sr_enabled=true but sr.ckpt_path is null; using randomly initialized SR prior"
+        )
+
+    if mc.get("sr_fixed", True):
+        model.eval()
+        model.requires_grad_(False)
+
+    return model
+
+
 def build_model(cfg: dict, device) -> SD2ControlLDM:
     """根据配置构建 SD2ControlLDM。"""
     mc = cfg.get("model", {})
+    sr_model = build_sr_model(cfg)
 
     return SD2ControlLDM(
         lr_key=mc.get("lr_key", "lr"),
@@ -135,6 +181,8 @@ def build_model(cfg: dict, device) -> SD2ControlLDM:
         lora_rank=mc.get("lora_rank", 4),
         lora_target_modules=mc.get("lora_target_modules", None),
         sd_locked=mc.get("sd_locked", True),
+        sr_model=sr_model,
+        sr_fixed=mc.get("sr_fixed", True),
         patch_size=mc.get("patch_size", 4),
         embed_dim=mc.get("embed_dim", 384),
         upsample_mode=mc.get("upsample_mode", "bilinear"),
@@ -168,7 +216,7 @@ def save_tensor(tensor, path):
 def build_comparison(lr, ref, sr, hr, save_to):
     """拼接对比图: lr(放大) | ref | sr | hr。"""
     lr, ref, sr, hr = lr.cpu(), ref.cpu(), sr.cpu(), hr.cpu()
-    
+
     lr_up = F.interpolate(
         lr.unsqueeze(0), size=ref.shape[-2:], mode="bilinear", align_corners=False
     ).squeeze(0)
@@ -233,9 +281,7 @@ def test(cfg: dict, ckpt_path: str):
     all_metrics = []
     start_time = time.time()
 
-    for batch_idx, batch in enumerate(
-        tqdm(loader, desc="Testing", unit="sample")
-    ):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Testing", unit="sample")):
         lr = batch["lr"].float().to(device)
         ref = batch["ref"].float().to(device)
         hr = batch["hr"].float().to(device)
@@ -248,7 +294,6 @@ def test(cfg: dict, ckpt_path: str):
                 sr = model.inference(
                     lr[i : i + 1],
                     ref[i : i + 1],
-                    steps=sample_steps,
                     seed=base_seed + batch_idx * B + i,
                 )  # [1, 3, H, W] range [0, 1]
 
@@ -267,10 +312,10 @@ def test(cfg: dict, ckpt_path: str):
             for i in range(B):
                 idx = batch_idx * B + i
                 build_comparison(
-                    lr[i].cpu(),           # [-1, 1]
-                    ref[i].cpu(),          # [-1, 1]
-                    (sr_list[i] * 2 - 1).cpu(),    # [0, 1] → [-1, 1]
-                    hr[i].cpu(),           # [-1, 1]
+                    lr[i].cpu(),  # [-1, 1]
+                    ref[i].cpu(),  # [-1, 1]
+                    (sr_list[i] * 2 - 1).cpu(),  # [0, 1] → [-1, 1]
+                    hr[i].cpu(),  # [-1, 1]
                     comp_dir / f"{idx:06d}.png",
                 )
 
