@@ -245,9 +245,9 @@ def build_model(cfg: dict) -> SD2ControlLDM:
         # Loss weights & GAN
         learning_rate=mc.get("learning_rate", 1e-4),
         lr_D=mc.get("lr_D", 1e-4),
-        lr_D_texture=mc.get("lr_D_texture", 1e-4),  # ← 新增
-        lambda_gan_texture=mc.get("lambda_gan_texture", 0.5),  # ← 新增
-        disc_trainable_stages=mc.get("disc_trainable_stages", 1),  # ← 新增
+        lr_D_texture=mc.get("lr_D_texture", 1e-4),
+        lambda_gan_texture=mc.get("lambda_gan_texture", 0.5),
+        disc_trainable_stages=mc.get("disc_trainable_stages", 1),
         l_simple_weight=mc.get("l_simple_weight", 1.0),
         lambda_lpips=mc.get("lambda_lpips", 0.1),
         lambda_gan=mc.get("lambda_gan", 0.005),
