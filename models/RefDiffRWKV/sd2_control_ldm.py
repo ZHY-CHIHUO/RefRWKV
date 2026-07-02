@@ -263,6 +263,10 @@ class SD2ControlLDM(pl.LightningModule):
             verbose=False,
         )
 
+        # 验证 IQA 缓存（每个 epoch 重置）
+        self._val_iqa_buffer = []          # 存放每个 batch 的指标字典
+        self._val_save_images = []         # 存放前3张生成图像 (tensor)
+
         # ══════════════════════════════════════════════
         #  10. UNet hooks — 纹理 skip connection 注入点
         # ══════════════════════════════════════════════
@@ -618,21 +622,22 @@ class SD2ControlLDM(pl.LightningModule):
             # ── L2 + LPIPS ──
             hr_gpu = hr.to(self.device)
             loss_l2 = F.mse_loss(x_pred.float(), hr_gpu) * self.l_simple_weight
-            loss_lpips = (
-                self.net_lpips(x_pred.float(), hr_gpu).mean() * self.lambda_lpips
-            )
+            lpips_raw = self.net_lpips(x_pred.float(), hr_gpu).mean()
+            loss_lpips = lpips_raw * self.lambda_lpips
 
         # ── GAN loss：D 全程 fp32，在 autocast 外跑 ──
         with torch.amp.autocast("cuda", enabled=False):
             # 语义 GAN
-            loss_gan = self.D(x_pred.float(), for_G=True).mean() * self.lambda_gan
+            gan_sem_raw = self.D(x_pred.float(), for_G=True).mean()
+            loss_gan = gan_sem_raw * self.lambda_gan
 
             # 纹理一致性 GAN
             ref_resized = F.interpolate(
                 ref.to(self.device), size=x_pred.shape[2:], mode="bilinear"
             )
             fake_logit, _ = self.D_texture(x_pred.float(), ref_resized)
-            loss_gan_tex = -fake_logit.mean() * self.lambda_gan_texture
+            gan_tex_raw = -fake_logit.mean()
+            loss_gan_tex = gan_tex_raw * self.lambda_gan_texture
 
         loss_G = (
             loss_l2 + loss_lpips + loss_gan + loss_gan_tex
@@ -670,9 +675,9 @@ class SD2ControlLDM(pl.LightningModule):
             {
                 "train/G_total": loss_G * self.accumulate_grad_batches,
                 "train/G_l2": loss_l2,
-                "train/G_lpips": loss_lpips,
-                "train/G_gan_sem": loss_gan,
-                "train/G_gan_tex": loss_gan_tex,
+                "train/G_lpips": lpips_raw,
+                "train/G_gan_sem": gan_sem_raw,
+                "train/G_gan_tex": gan_tex_raw,
             },
             prog_bar=True,
             on_step=True,
@@ -819,22 +824,46 @@ class SD2ControlLDM(pl.LightningModule):
         ref = batch[self.ref_key].float()
         hr = batch[self.hr_key].float()
 
+        # 1. 像素 L2 Loss（全验证集平均）
         pred_x0, noise_pred, noise = self._run_unet(lr, ref, hr)
         if pred_x0 is None:
             return None
-
-        # ── 像素空间 L2（与训练目标 x0 预测一致）──
         with torch.no_grad():
             x_pred = self.decode_latent(pred_x0.float())
         val_l2 = F.mse_loss(x_pred, hr.to(self.device))
-
         self.log("val/loss", val_l2, on_epoch=True)
         self.log("val_loss", val_l2, on_epoch=True)
 
-        if batch_idx == 0:
-            self._validate_iqa(lr, ref, hr)
+        # 2. IQA 累积（只对前 10 个 Batch）
+        if batch_idx < 10:
+            iqa_dict, sr = self._compute_iqa_for_batch(lr, ref, hr)
+            self._val_iqa_buffer.append(iqa_dict)
 
+            # 保存前 3 张生成图像（用于拼接）
+            if batch_idx < 3:
+                self._val_save_images.append(sr)   # sr 是 [B,3,H,W]，但此处 B=1，因为 val_batch_size=1
+        
         return val_l2
+    
+    def on_validation_epoch_end(self):
+        # 1. IQA 平均
+        if self._val_iqa_buffer:
+            avg_metrics = {}
+            for key in self._val_iqa_buffer[0].keys():
+                values = [d[key] for d in self._val_iqa_buffer]
+                avg_metrics[key] = sum(values) / len(values)
+            for k, v in avg_metrics.items():
+                self.log(f"val/{k}", v, on_epoch=True)
+            # 清空缓存，准备下一个 epoch
+            self._val_iqa_buffer = []
+
+        # 2. 保存前 3 张图像的拼接图（如果有）
+        if self._val_save_images:
+            # 假设每个 sr 是 [1,3,H,W]，拼接成 3 张并排
+            imgs_to_save = torch.cat(self._val_save_images, dim=0)  # [3,3,H,W]
+            from torchvision.utils import save_image
+            save_image(imgs_to_save, f"debug_val_epoch{self.current_epoch}.png", nrow=3)
+            self._val_save_images = []   # 清空
 
     # ════════════════════════════════════════════════════════
     #  Optimizer（三个优化器 + CosineAnnealingLR）
@@ -892,7 +921,8 @@ class SD2ControlLDM(pl.LightningModule):
     # ════════════════════════════════════════════════════════
 
     @torch.no_grad()
-    def _validate_iqa(self, lr, ref, hr):
+    def _compute_iqa_for_batch(self, lr, ref, hr):
+        """计算单个 batch 的 IQA 指标，返回字典 {metric_name: value}"""
         B = hr.shape[0]
         latent_shape = self.encode_latent(hr.to(self.device)).shape
         _, _, H, W = latent_shape
@@ -920,11 +950,9 @@ class SD2ControlLDM(pl.LightningModule):
         ).pred_original_sample
         sr = ((self.decode_latent(z) + 1) / 2).clamp(0, 1)
         self.unet.train()
+        self._clear_ref_feats()
 
-        from torchvision.utils import save_image
-
-        save_image(sr[0:4], f"debug_val_epoch{self.current_epoch}.png")
-
+        # 计算 IQA 指标
         hr_norm = (hr.to(self.device) + 1) / 2
         accum = {m: 0.0 for m in self.fr_metrics}
         for i in range(B):
@@ -934,10 +962,10 @@ class SD2ControlLDM(pl.LightningModule):
             )
             for k in accum:
                 accum[k] += r.get(k, 0.0)
-        for k, v in accum.items():
-            self.log(f"val/{k}", v / B)
-
-        self._clear_ref_feats()
+        # 取平均（如果 B>1）
+        for k in accum:
+            accum[k] /= B
+        return accum, sr  # 返回指标字典和生成图像
 
     # ════════════════════════════════════════════════════════
     #  推理（单步）
