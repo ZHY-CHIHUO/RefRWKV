@@ -8,7 +8,12 @@ from pathlib import Path
 
 root_dir = str(Path(__file__).parent.parent.parent)
 sys.path.insert(0, root_dir)
+
+# 保留 RWKV 原生 CUDA 算子
 from models.RefSRWKV import RUN_CUDA, OmniShift
+
+# 参考 SR_Ref_Encoder_LCA，导入其融合模块
+from modules import LocalCrossAttention, MaskAttention
 
 
 def get_2d_sincos_pos_embed(embed_dim, h, w, cls_token=False, extra_tokens=0):
@@ -147,6 +152,7 @@ class VRWKV_ChannelMix(nn.Module):
 
 
 class Downsample(nn.Module):
+    """空间减半、通道翻倍。H/4 x W/4 -> H/8 x W/8, C -> 2C。"""
     def __init__(self, n_feat):
         super().__init__()
         self.body = nn.Sequential(
@@ -219,130 +225,139 @@ class LRUpsamplerPixelShuffle(nn.Module):
         return x
 
 
-class RefMultiScaleProcessor(nn.Module):
-    def __init__(self, embed_dim, dims):
+class RWKVBlock(nn.Module):
+    """
+    一个 RWKV 编码块：SpatialMix + ChannelMix，残差连接。
+    对应 SR_Ref_Encoder_LCA 中的 Resblock/ConvBlock 层级。
+    """
+
+    def __init__(self, dim: int):
         super().__init__()
-        d1, d2, d3 = dims
+        self.spatial = VRWKV_SpatialMix(dim)
+        self.channel = VRWKV_ChannelMix(dim)
 
-        self.proj1 = nn.Conv2d(embed_dim, d1, 1)
-        self.channel_mix1 = VRWKV_ChannelMix(d1)
-
-        self.down1 = Downsample(d1)
-        self.adapt1 = nn.Conv2d(d1 * 2, d2, 1)
-        self.channel_mix2 = VRWKV_ChannelMix(d2)
-
-        self.down2 = Downsample(d2)
-        self.adapt2 = nn.Conv2d(d2 * 2, d3, 1)
-        self.channel_mix3 = VRWKV_ChannelMix(d3)
-
-    def forward(self, ref_tokens, H, W):
-        B, _, C = ref_tokens.shape
-        x = ref_tokens.transpose(1, 2).reshape(B, C, H, W)
-
-        f1 = self.proj1(x)
-        f1 = self._apply_channel_mix(f1, self.channel_mix1)
-
-        f2 = self.adapt1(self.down1(f1))
-        f2 = self._apply_channel_mix(f2, self.channel_mix2)
-
-        f3 = self.adapt2(self.down2(f2))
-        f3 = self._apply_channel_mix(f3, self.channel_mix3)
-
-        f1 = F.interpolate(f1, scale_factor=0.5, mode="bilinear", align_corners=False)
-        f2 = F.interpolate(f2, scale_factor=0.5, mode="bilinear", align_corners=False)
-        f3 = F.interpolate(f3, scale_factor=0.5, mode="bilinear", align_corners=False)
-
-        return f1, f2, f3
-
-    @staticmethod
-    def _apply_channel_mix(x: torch.Tensor, mix: VRWKV_ChannelMix) -> torch.Tensor:
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        x = mix(x, (H, W))
-        x = x.transpose(1, 2).reshape(B, C, H, W)
+    def forward(self, x: torch.Tensor, resolution: tuple):
+        x = x + self.spatial(x, resolution)
+        x = x + self.channel(x, resolution)
         return x
 
 
-class CrossFusion(nn.Module):
-
-    def __init__(self, embed_dim: int):
-        super().__init__()
-        self.n_embd = embed_dim
-
-        self.wkv_main = VRWKV_SpatialMix(embed_dim)
-        self.wkv_ref = VRWKV_SpatialMix(embed_dim)
-
-        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim, bias=False)
-        self.fuse_gate = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.Sigmoid(),
-        )
-        self.fuse_norm = nn.LayerNorm(embed_dim)
-
-        nn.init.zeros_(self.fuse_proj.weight)
-        nn.init.constant_(self.fuse_gate[0].bias, -2.0)
-
-    def forward(self, main_tokens, ref_tokens, resolution):
-        main_out = self.wkv_main(main_tokens, resolution)
-        ref_out = self.wkv_ref(ref_tokens, resolution)
-
-        concat = torch.cat([main_out, ref_out], dim=-1)
-        fused = self.fuse_proj(concat)
-        gate = self.fuse_gate(concat)
-        main_out = main_tokens + gate * self.fuse_norm(fused)
-
-        return main_out, ref_out
-
-
 class RefDiffRWKV(nn.Module):
+    """
+    单尺度 RWKV Ref 特征编码器。
+
+    设计思路（参考 SR_Ref_Encoder_LCA）：
+        1. LR、Ref 分别做 patch embed + 位置编码
+        2. 分 3 个尺度做 RWKV 编码 + LCA/MaskAttention 融合
+        3. 最终输出单尺度特征图 (B, out_channel, H/8, W/8)
+           与 CRefDiff 编码器输出维度一致，可直接接入 SD2 后处理链
+
+    空间分辨率（以 Ref 480x480, patch_size=4 为例）：
+        scale1: 120x120
+        scale2:  60x60  (H/8)
+        scale3:  60x60  (H/8)
+    输出: 60x60
+    """
 
     def __init__(
         self,
+        out_channel: int = 192,
+        in_channels: int = 3,
         patch_size: int = 4,
         embed_dim: int = 384,
-        channels: int = 3,
         upsample_mode: str = "bilinear",
     ):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        self.channels = channels
+        self.out_channel = out_channel
 
         if upsample_mode == "bilinear":
             self.lr_upsampler = lr_upsample_bilinear
         elif upsample_mode == "cnn":
             self.lr_upsampler = LRUpsamplerCNN(
-                in_ch=channels, out_ch=channels, scale_factor=10, hidden_ch=64
+                in_ch=in_channels, out_ch=in_channels, scale_factor=10, hidden_ch=64
             )
         elif upsample_mode == "pixelshuffle":
             self.lr_upsampler = LRUpsamplerPixelShuffle(
-                in_ch=channels, out_ch=channels, hidden_ch=64
+                in_ch=in_channels, out_ch=in_channels, hidden_ch=64
             )
         else:
             raise ValueError(f"Unsupported upsample_mode: {upsample_mode}")
 
-        self.patch_embed_main = PatchEmbed(
-            patch_size, in_chans=channels, embed_dim=embed_dim
+        # LR / Ref 各自的 patch embed
+        self.lr_patch_embed = PatchEmbed(
+            patch_size, in_chans=in_channels, embed_dim=embed_dim
         )
-        self.patch_embed_ref = PatchEmbed(
-            patch_size, in_chans=channels, embed_dim=embed_dim
-        )
-
-        self.cross_fusion = CrossFusion(embed_dim)
-
-        self.ref_ms_processor = RefMultiScaleProcessor(
-            embed_dim=embed_dim,
-            dims=(embed_dim, embed_dim * 2, embed_dim * 4),
+        self.ref_patch_embed = PatchEmbed(
+            patch_size, in_chans=in_channels, embed_dim=embed_dim
         )
 
-    def extract_ref_features(
+        # ===================== Scale 1: H/4 =====================
+        self.lr_block1 = RWKVBlock(embed_dim)
+        self.ref_block1 = RWKVBlock(embed_dim)
+        self.lca1 = LocalCrossAttention(embed_dim, window_size=8, num_heads=4)
+        self.mask1 = MaskAttention(embed_dim)
+        # H/4 -> H/8, 通道 embed_dim -> 2*embed_dim
+        self.down1 = Downsample(embed_dim)
+
+        # ===================== Scale 2: H/8 =====================
+        self.lr_block2 = RWKVBlock(embed_dim * 2)
+        self.ref_block2 = RWKVBlock(embed_dim * 2)
+        self.lca2 = LocalCrossAttention(embed_dim * 2, window_size=4, num_heads=4)
+        self.mask2 = MaskAttention(embed_dim * 2)
+
+        # ===================== Scale 3: H/8 =====================
+        self.lr_block3 = RWKVBlock(embed_dim * 2)
+        self.ref_block3 = RWKVBlock(embed_dim * 2)
+        self.lca3 = LocalCrossAttention(embed_dim * 2, window_size=4, num_heads=4)
+        self.mask3 = MaskAttention(embed_dim * 2)
+
+        # 输出投影：concat(LCA, Mask) -> out_channel
+        self.last_linear = nn.Conv2d(embed_dim * 4, out_channel, 1, bias=False)
+
+    @staticmethod
+    def _to_spatial(tokens, H, W):
+        B, N, C = tokens.shape
+        return tokens.transpose(1, 2).reshape(B, C, H, W)
+
+    @staticmethod
+    def _to_tokens(feat):
+        B, C, H, W = feat.shape
+        return feat.flatten(2).transpose(1, 2)
+
+    def _call_lca(self, lca, sr_feat, ref_feat, sim_lamuda, return_map):
+        if return_map:
+            return lca(
+                sr_feat,
+                ref_feat,
+                sim_lamuda=sim_lamuda,
+                return_cos_sim_map=True,
+            )
+        else:
+            return lca(sr_feat, ref_feat, sim_lamuda=sim_lamuda), None
+
+    def _call_mask(self, mask, sr_feat, ref_feat, sim_lamuda, return_map):
+        if return_map:
+            return mask(
+                sr_feat,
+                ref_feat,
+                sim_lamuda=sim_lamuda,
+                return_learned_sim_map=True,
+            )
+        else:
+            return mask(sr_feat, ref_feat, sim_lamuda=sim_lamuda), None
+
+    def forward(
         self,
         LR: torch.Tensor,
         Ref: torch.Tensor,
-    ) -> tuple:
-
+        sim_lamuda=1,
+        return_cos_sim_map=False,
+        return_learned_sim_map=False,
+        **kwargs,
+    ):
         B, _, H, W = Ref.shape
-
         assert (
             H % self.patch_size == 0 and W % self.patch_size == 0
         ), f"Input size {H}x{W} must be divisible by patch_size {self.patch_size}"
@@ -350,68 +365,120 @@ class RefDiffRWKV(nn.Module):
         patch_h = H // self.patch_size
         patch_w = W // self.patch_size
 
+        # LR 上采样到 Ref 尺寸
         LR_up = self.lr_upsampler(LR)
 
-        main_input = LR_up
-        main_tokens = self.patch_embed_main(main_input)
+        # Patch embed 到 tokens
+        sr_tokens = self.lr_patch_embed(LR_up)
+        ref_tokens = self.ref_patch_embed(Ref)
 
-        ref_tokens = self.patch_embed_ref(Ref)
-
+        # 位置编码（仅加一次）
         pos_embed_np = get_2d_sincos_pos_embed(self.embed_dim, patch_h, patch_w)
-        pos_embed = torch.from_numpy(pos_embed_np).float().to(Ref.device).unsqueeze(0)
-
-        main_tokens = main_tokens + pos_embed
+        pos_embed = (
+            torch.from_numpy(pos_embed_np).float().to(Ref.device).unsqueeze(0)
+        )
+        sr_tokens = sr_tokens + pos_embed
         ref_tokens = ref_tokens + pos_embed
 
-        main_tokens, ref_tokens = self.cross_fusion(
-            main_tokens, ref_tokens, (patch_h, patch_w)
+        # 用于收集返回的 map
+        cos_maps = []
+        learned_maps = []
+
+        # ===================== Scale 1: H/4 =====================
+        sr_tokens = self.lr_block1(sr_tokens, (patch_h, patch_w))
+        ref_tokens = self.ref_block1(ref_tokens, (patch_h, patch_w))
+
+        sr_feat = self._to_spatial(sr_tokens, patch_h, patch_w)
+        ref_feat = self._to_spatial(ref_tokens, patch_h, patch_w)
+
+        sr_cond1, cos_map1 = self._call_lca(
+            self.lca1, sr_feat, ref_feat, sim_lamuda, return_cos_sim_map
         )
-
-        rf1, rf2, rf3 = self.ref_ms_processor(ref_tokens, patch_h, patch_w)
-
-        with torch.no_grad():
-            lr_for_sim = F.interpolate(
-                LR_up, size=rf1.shape[2:], mode="bilinear", align_corners=False
-            )
-            ref_for_sim = F.interpolate(
-                Ref, size=rf1.shape[2:], mode="bilinear", align_corners=False
-            )
-            sim_map = (
-                F.cosine_similarity(
-                    lr_for_sim.flatten(2), ref_for_sim.flatten(2), dim=1
-                )
-                .reshape(rf1.shape[0], 1, rf1.shape[2], rf1.shape[3])
-                .clamp(min=0.0)
-            )
-
-        rf1 = rf1 * F.interpolate(
-            sim_map, size=rf1.shape[2:], mode="bilinear", align_corners=False
+        sr_cond2, learned_map1 = self._call_mask(
+            self.mask1, sr_feat, ref_feat, sim_lamuda, return_learned_sim_map
         )
-        rf2 = rf2 * F.interpolate(
-            sim_map, size=rf2.shape[2:], mode="bilinear", align_corners=False
+        if cos_map1 is not None:
+            cos_maps.append(cos_map1)
+        if learned_map1 is not None:
+            learned_maps.append(learned_map1)
+
+        # 先融合再下采样，对应 LCA 的 sr_cond = lca + mask
+        sr_fused = sr_cond1 + sr_cond2
+
+        # LR 分支下采样；Ref 分支也要继续编码
+        sr_fused = self.down1(sr_fused)
+        ref_feat = self.down1(ref_feat)
+        patch_h2, patch_w2 = patch_h // 2, patch_w // 2
+
+        sr_tokens = self._to_tokens(sr_fused)
+        ref_tokens = self._to_tokens(ref_feat)
+
+        # ===================== Scale 2: H/8 =====================
+        sr_tokens = self.lr_block2(sr_tokens, (patch_h2, patch_w2))
+        ref_tokens = self.ref_block2(ref_tokens, (patch_h2, patch_w2))
+
+        sr_feat = self._to_spatial(sr_tokens, patch_h2, patch_w2)
+        ref_feat = self._to_spatial(ref_tokens, patch_h2, patch_w2)
+
+        sr_cond1, cos_map2 = self._call_lca(
+            self.lca2, sr_feat, ref_feat, sim_lamuda, return_cos_sim_map
         )
-        rf3 = rf3 * F.interpolate(
-            sim_map, size=rf3.shape[2:], mode="bilinear", align_corners=False
+        sr_cond2, learned_map2 = self._call_mask(
+            self.mask2, sr_feat, ref_feat, sim_lamuda, return_learned_sim_map
         )
+        if cos_map2 is not None:
+            cos_maps.append(cos_map2)
+        if learned_map2 is not None:
+            learned_maps.append(learned_map2)
 
-        return rf1, rf2, rf3
+        # 这一层不下采样
+        sr_fused = sr_cond1 + sr_cond2
+        sr_tokens = self._to_tokens(sr_fused)
+        ref_tokens = self._to_tokens(ref_feat)
 
-    def forward(self, LR, Ref):
+        # ===================== Scale 3: H/8 =====================
+        sr_tokens = self.lr_block3(sr_tokens, (patch_h2, patch_w2))
+        ref_tokens = self.ref_block3(ref_tokens, (patch_h2, patch_w2))
 
-        return self.extract_ref_features(LR=LR, Ref=Ref)
+        sr_feat = self._to_spatial(sr_tokens, patch_h2, patch_w2)
+        ref_feat = self._to_spatial(ref_tokens, patch_h2, patch_w2)
+
+        sr_cond1, cos_map3 = self._call_lca(
+            self.lca3, sr_feat, ref_feat, sim_lamuda, return_cos_sim_map
+        )
+        sr_cond2, learned_map3 = self._call_mask(
+            self.mask3, sr_feat, ref_feat, sim_lamuda, return_learned_sim_map
+        )
+        if cos_map3 is not None:
+            cos_maps.append(cos_map3)
+        if learned_map3 is not None:
+            learned_maps.append(learned_map3)
+
+        # 最后一层像 LCA 一样 concat 后投影
+        sr_cond = torch.cat([sr_cond1, sr_cond2], dim=1)
+        out = self.last_linear(sr_cond)
+
+        if not return_cos_sim_map and not return_learned_sim_map:
+            return out
+        elif return_cos_sim_map:
+            return out, cos_maps
+        elif return_learned_sim_map:
+            return out, learned_maps
+        else:
+            # 两个 flag 都为 True 的情况，按 LCA 风格返回
+            return out, cos_maps, learned_maps
 
     @classmethod
     def from_args(cls, args):
-
         return cls(
+            out_channel=getattr(args, "out_channel", 192),
+            in_channels=getattr(args, "in_channels", 3),
             patch_size=getattr(args, "patch_size", 4),
             embed_dim=getattr(args, "embed_dim", 384),
-            channels=getattr(args, "channels", 3),
             upsample_mode=getattr(args, "upsample_mode", "bilinear"),
         )
 
     def get_parameter_count(self) -> dict:
-
         counts = {}
         total = 0
 
@@ -419,10 +486,23 @@ class RefDiffRWKV(nn.Module):
             "lr_upsampler": (
                 self.lr_upsampler if isinstance(self.lr_upsampler, nn.Module) else None
             ),
-            "patch_embed_main": self.patch_embed_main,
-            "patch_embed_ref": self.patch_embed_ref,
-            "cross_fusion": self.cross_fusion,
-            "ref_ms_processor": self.ref_ms_processor,
+            "lr_patch_embed": self.lr_patch_embed,
+            "ref_patch_embed": self.ref_patch_embed,
+            "blocks": nn.ModuleList(
+                [
+                    self.lr_block1,
+                    self.ref_block1,
+                    self.lr_block2,
+                    self.ref_block2,
+                    self.lr_block3,
+                    self.ref_block3,
+                ]
+            ),
+            "lca_mask": nn.ModuleList(
+                [self.lca1, self.mask1, self.lca2, self.mask2, self.lca3, self.mask3]
+            ),
+            "down1": self.down1,
+            "last_linear": self.last_linear,
         }
 
         for name, mod in submodules.items():
@@ -435,3 +515,18 @@ class RefDiffRWKV(nn.Module):
 
         counts["total"] = total
         return counts
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = RefDiffRWKV(out_channel=192, embed_dim=384).to(device)
+
+    B = 2
+    LR = torch.randn(B, 3, 48, 48).to(device)
+    Ref = torch.randn(B, 3, 480, 480).to(device)
+
+    with torch.no_grad():
+        out = model(LR, Ref)
+    print(f"Input:  LR={LR.shape}, Ref={Ref.shape}")
+    print(f"Output: {out.shape}")
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
