@@ -558,6 +558,11 @@ class SD2ControlLDM(pl.LightningModule):
         rf_feats, sem_tokens = self._extract_ref_static(
             lr, ref_input, x_t.shape, x_t_pixel=x_t_pixel
         )
+
+        # 新增：缓存 ref 特征范数
+        with torch.no_grad():
+            self._last_rf_norm = torch.stack([f.detach().norm() for f in rf_feats]).sum()
+
         for i, f in enumerate(rf_feats):
             if self._check_tensor(f, f"ref_feat[{i}]"):
                 return None, None, None, None, None
@@ -701,6 +706,10 @@ class SD2ControlLDM(pl.LightningModule):
             prog_bar=True,
             on_step=True,
         )
+
+        with torch.no_grad():
+            ref_norm = getattr(self, '_last_rf_norm', torch.tensor(0.0))
+            self.log("debug/ref_feat_norm", ref_norm, on_step=True)
 
         return loss_G.detach() * self.accumulate_grad_batches
 

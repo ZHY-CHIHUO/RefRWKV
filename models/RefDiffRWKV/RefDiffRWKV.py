@@ -707,6 +707,7 @@ class RefDiffRWKV(nn.Module):
             4. 动态位置编码（根据 patch 网格尺寸动态生成，无需插值）
             5. CrossFusion: main_tokens 与 ref_tokens 门控交互
             6. RefMultiScaleProcessor: ref_tokens → rf1, rf2, rf3（多尺度 2D 特征图）
+            7. 显式相似度图加权: LR_up 与 Ref 的余弦相似度 → 逐位置抑制不匹配区域的特征注入
 
         Args:
             x_t:  (B, 3, H, W) 当前 noisy image（像素空间，值域 [-1, 1]）
@@ -781,6 +782,40 @@ class RefDiffRWKV(nn.Module):
         # ── Step 5: Ref 多尺度特征提取 ──
         # 将交互后的 ref token 转为 3 个尺度的 2D 特征图
         rf1, rf2, rf3 = self.ref_ms_processor(ref_tokens, patch_h, patch_w)
+
+        # ── Step 6: 显式相似度图加权 (借鉴 CRefDiff LCA_Adapter) ──
+        # 核心思想: LR 和 Ref 在内容不匹配的区域，ref 特征应被抑制，
+        # 避免把 Ref 中不相关的纹理错误注入到生成结果。
+        # CRefDiff 的做法: cosine_similarity → 逐位置加权 → 不相似区域权重→0
+        # 在 CrossFusion 的隐式门控之上加这层确定性 mask，
+        # 保证训练早期即使 gate 没学好，也不会发生严重误注入。
+        with torch.no_grad():
+            # 将 LR_up（已上采样到全分辨率）和 Ref 统一缩放到 rf1 的分辨率
+            lr_for_sim = F.interpolate(
+                LR_up, size=rf1.shape[2:], mode="bilinear", align_corners=False
+            )
+            ref_for_sim = F.interpolate(
+                Ref, size=rf1.shape[2:], mode="bilinear", align_corners=False
+            )
+            # 逐位置余弦相似度: (B,3,H,W) → flatten → (B,1,H,W)
+            sim_map = (
+                F.cosine_similarity(
+                    lr_for_sim.flatten(2), ref_for_sim.flatten(2), dim=1
+                )
+                .reshape(rf1.shape[0], 1, rf1.shape[2], rf1.shape[3])
+                .clamp(min=0.0)  # 负相似度(完全不相关区域)直接归零
+            )
+
+        # 用相似度图加权所有尺度的 ref 特征
+        rf1 = rf1 * F.interpolate(
+            sim_map, size=rf1.shape[2:], mode="bilinear", align_corners=False
+        )
+        rf2 = rf2 * F.interpolate(
+            sim_map, size=rf2.shape[2:], mode="bilinear", align_corners=False
+        )
+        rf3 = rf3 * F.interpolate(
+            sim_map, size=rf3.shape[2:], mode="bilinear", align_corners=False
+        )
 
         return rf1, rf2, rf3
 
