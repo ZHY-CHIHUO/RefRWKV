@@ -71,7 +71,7 @@ class SD2ControlLDM(pl.LightningModule):
         beta_end: float = 0.012,
         beta_schedule: str = "scaled_linear",
         prediction_type: str = "epsilon",
-        model_t: int = 200,
+        model_t: tuple = (300, 700),
         # ═════════════════════════════════════════════
         #  6. Loss 权重
         # ═════════════════════════════════════════════
@@ -133,7 +133,7 @@ class SD2ControlLDM(pl.LightningModule):
         self.use_freq = use_freq
 
         # ── 推理配置 ──
-        self.model_t = model_t
+        self.t_noise_min, self.t_noise_max = model_t
         self.sample_steps = sample_steps
         self.fr_metrics = fr_metrics or ["psnr", "ssim", "lpips", "dists"]
         self.iqa_device = iqa_device
@@ -530,7 +530,13 @@ class SD2ControlLDM(pl.LightningModule):
         else:
             sr_latent = None
             noise = torch.randn_like(hr_latent)
-            t = torch.randint(300, 701, (B,), device=device, dtype=torch.long)
+            t = torch.randint(
+                self.t_noise_min,
+                self.t_noise_max + 1,
+                (B,),
+                device=device,
+                dtype=torch.long,
+            )
             x_t = self.noise_scheduler.add_noise(hr_latent, noise, t)
 
         if self._check_tensor(x_t, "x_t (noisy latent)"):
