@@ -1,219 +1,539 @@
 """
-sd2_ref_adapter.py — RWKV Ref Adapter (轻量级 Ref 特征注入适配器)
+sd2_ref_adapter.py — 统一 Ref 特征融合适配器 (SD2 UNet)
 
-将 RefDiffRWKV ref 管线输出的 rf1/rf2/rf3 特征，
-通过逐层 1×1 卷积映射到 SD2 UNet 对应层通道数，
-再以加法方式注入 SD2 UNet 的 down_blocks。
+═══════════════════════════════════════════════════════════════
+设计原则: 导入而非迁移 (Import, Don't Migrate)
 
-设计原则 (Design Principles):
-    - 极轻量: 仅 3 层 1×1 Conv，总计 ~3M 参数
-    - 零初始化: 训练初期 ref 贡献为零，逐步释放 ref 信息
-    - 无上/下采样: 假设 rf 特征图尺寸已与 UNet 各层对齐
+- 所有核心模块来自 modules.py 和 RefDiffRWKV.py，直接 import 使用
+- 本文件仅包含 SD2 特有的组装逻辑和通道适配层
+- 不复制任何 encoder、attention、RWKV 算子的实现代码
 
-通道映射 (Channel Mapping):
-    rf1 (384ch) → sd2_down0 ( 320ch)
-    rf2 (768ch) → sd2_down1 ( 640ch)
-    rf3 (1536ch)→ sd2_down2 (1280ch)
+策略一览:
+    ① "lca"     — CAA块 (LocalCrossAttention + MaskAttention) ★CRefDiff 默认
+    ② "spade"   — SPADE 归一化调制
+    ③ "dual"    — 双路独立编码 + 余弦加权
+    ④ "cos_sim" — 编码器内嵌余弦相似度
+    ⑤ "cat"     — 拼接后单编码器 (基线)
+    ⑥ "rwkv"    — WKV 双向扫描 + 门控融合 + 显式 mask ★RWKV 方法
 
-参考文献:
-    T2I-Adapter: Mou et al., "T2I-Adapter: Learning Adapters to Dig out
-                  More Controllable Ability for Text-to-Image Diffusion Models", 2023
-    CRefDiff:    \Hou et al., "CRefDiff: ...", 2024
+用法:
+    adapter = SD2_RefAdapter(strategy="rwkv")
+    f320, f640, f1280 = adapter(LR=lr_image, Ref=ref_image)
+    # → 注入 SD2 UNet: h = down[0](h) + f320; ...
 
-用法 (Usage):
-    adapter = RWKV_Ref_Adapter(ref_dims=(384, 768, 1536), sd2_dims=(320, 640, 1280))
-    rf1, rf2, rf3 = ref_diff_rwkv.extract_ref_features(LR, Ref)
-    a1, a2, a3 = adapter(rf1, rf2, rf3)
-    # 在 SD2 UNet 内部:
-    # h = down_blocks[0](h) + a1
-    # h = down_blocks[1](h) + a2
-    # h = down_blocks[2](h) + a3
+依赖:
+    - modules.py         → CRefDiff 全部编码器 & 融合模块
+    - RefDiffRWKV.py     → RefDiffRWKV (WKV 序列融合)
+    - RefSRWKV.py        → RUN_CUDA, OmniShift (由 RefDiffRWKV 内部引入)
+═══════════════════════════════════════════════════════════════
 """
 
 import torch
 import torch.nn as nn
+from typing import Optional, Tuple, List
+
+# ═══════════════════════════════════════════════════════════════
+#  Part 1: 从 modules.py 导入 CRefDiff 全部模块
+# ═══════════════════════════════════════════════════════════════
+
+from modules import (
+    cosine_attention_map,
+    ConvBlock,
+    Resblock,
+    Downsample,
+    SR_Encoder,
+    SR_Ref_Encoder_LCA,
+    SR_Ref_Encoder_Spade,
+    SR_Ref_Encoder_Cos_Sim,
+    ImplicitPromptModule,
+)
+
+# ═══════════════════════════════════════════════════════════════
+#  Part 2: 从 RefDiffRWKV.py 导入 RWKV 融合模块
+# ═══════════════════════════════════════════════════════════════
+
+from RefDiffRWKV import RefDiffRWKV
 
 
-class RWKV_Ref_Adapter(nn.Module):
+# ═══════════════════════════════════════════════════════════════
+#  Part 3: SD2 特有的组装组件
+#          (这些类不来自任何外部模块，是 SD2 UNet 专用的适配层)
+# ═══════════════════════════════════════════════════════════════
+
+class ResnetBlock_SD2(nn.Module):
+    """SD2 风格的残差块 — 用于 CRefDiff 系列 Adapter 的后处理链。"""
+
+    def __init__(self, in_c, out_c, down=False, ksize=3, sk=False, use_conv=True):
+        super().__init__()
+        ps = ksize // 2
+        self.in_conv = None if in_c == out_c else nn.Conv2d(in_c, out_c, ksize, 1, ps)
+        self.block1 = nn.Conv2d(out_c, out_c, 3, 1, 1)
+        self.act = nn.ReLU()
+        self.block2 = nn.Conv2d(out_c, out_c, ksize, 1, ps)
+        self.down = down
+        if down:
+            self.down_opt = nn.Sequential(
+                nn.Conv2d(out_c, out_c, ksize, 1, ps),
+                nn.AvgPool2d(2),
+            ) if use_conv else nn.AvgPool2d(2)
+
+    def forward(self, x):
+        if self.down:
+            x = self.down_opt(x)
+        if self.in_conv is not None:
+            x = self.in_conv(x)
+        h = self.block1(x)
+        h = self.act(h)
+        h = self.block2(h)
+        return h + x
+
+
+class _ConcatEncoderWrapper(nn.Module):
     """
-    RWKV Ref Adapter — 将 RefDiffRWKV 的 rf 特征注入 SD2 UNet.
+    接口适配器：将单输入 SR_Encoder(in_channel=6) 包装为 (sr, ref) 双参数接口。
 
-    结构 (Structure):
-        ┌───────────────────────────────────────────┐
-        │ rf1 (B, 384, H,   W)                      │
-        │   └─ Conv1×1(384 → 320, zero_init) ──► a1  │
-        │                                           │
-        │ rf2 (B, 768, H/2, W/2)                    │
-        │   └─ Conv1×1(768 → 640, zero_init) ──► a2  │
-        │                                           │
-        │ rf3 (B, 1536, H/4, W/4)                   │
-        │   └─ Conv1×1(1536 → 1280, zero_init) ──► a3 │
-        └───────────────────────────────────────────┘
+    用于 "cat" 策略 — 确保与 CRefDiffAdapterBase 的统一调用约定一致。
+    SR_Encoder 本体来自 modules.py，此处仅做接口适配。
+    """
 
-    参数 (Parameters):
-        ref_dims: RefDiffRWKV 输出的 rf1/rf2/rf3 通道数，默认 (384, 768, 1536)
-        sd2_dims: SD2 UNet down_blocks[0/1/2] 的通道数，默认 (320, 640, 1280)
+    def __init__(self, out_channel: int = 192):
+        super().__init__()
+        self.encoder = SR_Encoder(out_channel=out_channel, in_channel=6)
 
-    零初始化策略 (Zero-Init Strategy):
-        所有权重初始化为 0，偏置初始化为 0。
-        训练第 0 步时 adapter 输出全零 → ref 不干扰 SD2 UNet 原有生成能力。
-        随着训练进行，权重逐渐学到非零值 → ref 信息逐步注入。
-        这是 T2I-Adapter / ControlNet 等工作的标准做法。
+    def forward(self, sr: torch.Tensor, ref: torch.Tensor, **kwargs):
+        x = torch.cat([sr, ref], dim=1)
+        return self.encoder(x)
+
+
+class CRefDiffAdapterBase(nn.Module):
+    """
+    CRefDiff 系列 Adapter 基类 (LCA / Spade / CosSim / Cat 共用)。
+
+    结构: merge_encoder → conv_in → ResnetBody (三级下采样) → [feat0, feat1, feat2]
+
+    merge_encoder 来自 modules.py (如 SR_Ref_Encoder_LCA / SR_Ref_Encoder_Spade 等)，
+    本类仅负责将其输出送入 SD2 兼容的后处理链。
     """
 
     def __init__(
         self,
-        ref_dims: tuple = (384, 768, 1536),
-        sd2_dims: tuple = (320, 640, 1280),
+        merge_encoder_class,
+        merge_encoder_kwargs: dict,
+        channels: tuple = (320, 640, 1280),
+        nums_rb: int = 2,
+        cin: int = 192,
+        ksize: int = 3,
+        sk: bool = True,
+        use_conv: bool = True,
     ):
         super().__init__()
+        self.channels = channels
+        self.nums_rb = nums_rb
+        self.merge_encoder = merge_encoder_class(**merge_encoder_kwargs)
+        self.conv_in = nn.Conv2d(cin, channels[0], ksize, 1, ksize // 2)
+        self.body = nn.ModuleList()
+        for i in range(len(channels) - 1):
+            for j in range(nums_rb):
+                self.body.append(ResnetBlock_SD2(
+                    channels[i] if j > 0 else channels[i],
+                    channels[i + 1] if j == 0 else channels[i + 1],
+                    down=(j == 0),
+                    ksize=ksize,
+                    sk=sk,
+                    use_conv=use_conv,
+                ))
 
-        ref_dim1, ref_dim2, ref_dim3 = ref_dims
-        sd2_dim1, sd2_dim2, sd2_dim3 = sd2_dims
+    def forward(self, sr: torch.Tensor, ref: torch.Tensor, **kwargs):
+        res = self.merge_encoder(sr, ref, **kwargs)
 
-        # ── 三层 1×1 卷积（逐点通道映射）──
-        # 1×1 Conv is equivalent to a per-pixel linear layer.
-        # It maps channels without changing spatial resolution.
-        # 1×1 卷积等价于逐像素线性变换，只改变通道数，不改变空间尺寸。
+        # merge_encoder 可能返回 (out,) 或 (out, [maps])
+        if isinstance(res, tuple):
+            x = res[0]
+        else:
+            x = res
 
-        self.conv1 = nn.Conv2d(
-            ref_dim1, sd2_dim1,   # 384 → 320
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=True,            # 保留 bias 以便零初始化时输出完全为零
-        )
+        cond_list = []
+        x = self.conv_in(x)
+        cond_list.append(x)
+        for block in self.body:
+            x = block(x)
+            cond_list.append(x)
 
-        self.conv2 = nn.Conv2d(
-            ref_dim2, sd2_dim2,   # 768 → 640
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=True,
-        )
+        if isinstance(res, tuple) and len(res) > 1:
+            return cond_list, res[1:]
+        return cond_list
 
-        self.conv3 = nn.Conv2d(
-            ref_dim3, sd2_dim3,   # 1536 → 1280
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=True,
-        )
 
-        # ── 零初始化 ──
-        # Zero-initialize all weights and biases.
-        # At step 0: adapter(x) = 0 for all x → ref has no effect.
-        # Gradients will push weights away from zero during training.
+# ═══════════════════════════════════════════════════════════════
+#  Part 4: Dual 策略专用实现
+#          (双路独立编码 + 余弦加权融合)
+# ═══════════════════════════════════════════════════════════════
+
+class _DualBranch(nn.Module):
+    """Dual 策略的单分支 — 对 LR 和 Ref 各实例化一个。"""
+
+    def __init__(self, cin: int, channels: tuple, nums_rb: int,
+                 ksize: int, sk: bool, use_conv: bool):
+        super().__init__()
+        self.encoder = SR_Encoder(out_channel=cin, in_channel=3)
+        self.conv_in = nn.Conv2d(cin, channels[0], 3, 1, 1)
+        self.body = nn.ModuleList()
+        for i in range(len(channels) - 1):
+            for j in range(nums_rb):
+                self.body.append(ResnetBlock_SD2(
+                    channels[i] if j > 0 else channels[i],
+                    channels[i + 1] if j == 0 else channels[i + 1],
+                    down=(j == 0),
+                    ksize=ksize,
+                    sk=sk,
+                    use_conv=use_conv,
+                ))
+
+    def forward(self, x):
+        x = self.encoder(x)
+        feats = [self.conv_in(x)]
+        for block in self.body:
+            x = block(x)
+            feats.append(x)
+        return feats
+
+
+class _DualAdapterImpl(nn.Module):
+    """
+    Dual 策略统一封装: 双路独立编码 + 余弦相似度加权融合。
+
+    - 每个分支使用 modules.SR_Encoder 独立编码
+    - 融合权重由 modules.cosine_attention_map 计算
+    - 融合后经 ResnetBlock_SD2 后处理
+    """
+
+    def __init__(self, channels: tuple, nums_rb: int = 2, cin: int = 96,
+                 ksize: int = 3, sk: bool = True, use_conv: bool = True):
+        super().__init__()
+        self.channels = channels
+        self.lr_branch = _DualBranch(cin // 2, channels, nums_rb, ksize, sk, use_conv)
+        self.ref_branch = _DualBranch(cin // 2, channels, nums_rb, ksize, sk, use_conv)
+        self.merger = nn.ModuleList([
+            ResnetBlock_SD2(c, c, False, sk=sk) for c in channels
+        ])
+
+    def forward(self, sr, ref, sim_lamuda=None,
+                return_cos_sim_map=False, **kwargs):
+        lr_feats = self.lr_branch(sr)
+        ref_feats = self.ref_branch(ref)
+
+        cond_list = []
+        cos_maps = []
+        for i in range(len(lr_feats)):
+            cos_sim = (cosine_attention_map(lr_feats[i], ref_feats[i]) + 1) / 2
+            if sim_lamuda is not None:
+                cos_sim = cos_sim * sim_lamuda
+            cond = cos_sim * ref_feats[i] + (1 - cos_sim) * lr_feats[i]
+            cond = self.merger[i](cond)
+            cond_list.append(cond)
+            if return_cos_sim_map:
+                cos_maps.append(cos_sim)
+
+        if return_cos_sim_map:
+            return cond_list, cos_maps
+        return cond_list
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Part 5: RWKV 通道映射适配器
+#          (将 RefDiffRWKV 输出映射到 SD2 UNet 通道数)
+# ═══════════════════════════════════════════════════════════════
+
+class RWKV_ChannelAdapter(nn.Module):
+    """
+    RWKV 通道映射适配器。
+
+    将 RefDiffRWKV 的多尺度输出映射到 SD2 UNet 所需通道:
+        rf1 (384ch)  → sd2_dims[0]  (默认 320)
+        rf2 (768ch)  → sd2_dims[1]  (默认 640)
+        rf3 (1536ch) → sd2_dims[2]  (默认 1280)
+
+    零初始化: 训练初期 ref 特征贡献 ≈ 0，逐步释放。
+    """
+
+    def __init__(self, ref_dims=(384, 768, 1536), sd2_dims=(320, 640, 1280)):
+        super().__init__()
+        self.conv1 = nn.Conv2d(ref_dims[0], sd2_dims[0], 1)
+        self.conv2 = nn.Conv2d(ref_dims[1], sd2_dims[1], 1)
+        self.conv3 = nn.Conv2d(ref_dims[2], sd2_dims[2], 1)
         self._zero_init()
 
     def _zero_init(self):
-        """
-        Initialize all Conv weights and biases to zero.
+        for c in [self.conv1, self.conv2, self.conv3]:
+            nn.init.constant_(c.weight, 0.0)
+            nn.init.constant_(c.bias, 0.0)
 
-        零初始化确保:
-        - 训练初期 adapter 输出 ≡ 0
-        - SD2 UNet 行为等同于无 ref 注入的原始模型
-        - ref 信号随训练逐步"生长"进来
-        """
-        for conv in [self.conv1, self.conv2, self.conv3]:
-            nn.init.constant_(conv.weight, 0.0)
-            nn.init.constant_(conv.bias, 0.0)
+    def forward(self, rf1, rf2, rf3):
+        return self.conv1(rf1), self.conv2(rf2), self.conv3(rf3)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Part 6: 统一入口 SD2_RefAdapter — 6 种策略一键切换
+# ═══════════════════════════════════════════════════════════════
+
+class SD2_RefAdapter(nn.Module):
+    """
+    ═══════════════════════════════════════════════════════════════
+    SD2 统一 Ref 特征融合适配器 — 6 种策略一键切换
+    ═══════════════════════════════════════════════════════════════
+
+    策略一览:
+
+    ┌────────┬─────────────────┬───────────────────┬──────────────────┐
+    │ ID     │ 策略名          │ 融合机制            │ 范式              │
+    ├────────┼─────────────────┼───────────────────┼──────────────────┤
+    │  ①     │ "lca"          │ CAA块              │ CNN+Attention    │
+    │        │                 │ LCA+MaskAttn×3     │ Latent空间       │
+    ├────────┼─────────────────┼───────────────────┼──────────────────┤
+    │  ②     │ "spade"         │ SPADE调制          │ CNN+SPADE        │
+    ├────────┼─────────────────┼───────────────────┼──────────────────┤
+    │  ③     │ "dual"          │ 双路+余弦加权       │ CNN双分支        │
+    ├────────┼─────────────────┼───────────────────┼──────────────────┤
+    │  ④     │ "cos_sim"       │ 内嵌余弦相似度      │ CNN单编码器      │
+    ├────────┼─────────────────┼───────────────────┼──────────────────┤
+    │  ⑤     │ "cat"           │ 拼接单编码器        │ CNN基线          │
+    ├────────┼─────────────────┼───────────────────┼──────────────────┤
+    │  ⑥     │ "rwkv"          │ WKV扫描+门控       │ RWKV序列         │
+    │        │                 │ +显式mask          │ Pixel空间        │
+    └────────┴─────────────────┴───────────────────┴──────────────────┘
+
+    统一接口:
+        adapter = SD2_RefAdapter(strategy="rwkv")
+        f320, f640, f1280 = adapter(LR=lr_img, Ref=ref_img)
+
+    Args:
+        strategy:    策略名 ("lca" / "spade" / "dual" / "cos_sim" / "cat" / "rwkv")
+        channels:    SD2 UNet 目标通道数 (默认 [320, 640, 1280])
+        sd2_dims:    SD2 UNet 通道数 (仅 rwkv 需要, 默认同 channels)
+        rwkv_cfg:    RWKV 超参数字典 (仅 rwkv 需要)
+        **kwargs:    传递给具体 Adapter 的额外参数
+    """
+
+    STRATEGIES = ["lca", "spade", "dual", "cos_sim", "cat", "rwkv"]
+
+    # CRefDiff 编码器映射表 — 所有 encoder 类均来自 modules.py
+    # "dual" 条目仅作参考，实际使用 _DualAdapterImpl
+    # "cat"  使用 _ConcatEncoderWrapper 做接口适配（内部仍调用 modules.SR_Encoder）
+    _ENCODER_MAP = {
+        "lca":     (SR_Ref_Encoder_LCA,     {"out_channel": 192, "in_sr_channel": 3, "in_ref_channel": 3}),
+        "spade":   (SR_Ref_Encoder_Spade,    {"out_channel": 192}),
+        "dual":    (SR_Encoder,              {"out_channel": 192, "in_channel": 3}),
+        "cos_sim": (SR_Ref_Encoder_Cos_Sim,  {"out_channel": 192}),
+        "cat":     (_ConcatEncoderWrapper,   {"out_channel": 192}),
+    }
+
+    def __init__(
+        self,
+        strategy: str = "rwkv",
+        channels: tuple = (320, 640, 1280),
+        sd2_dims: Optional[tuple] = None,
+        rwkv_cfg: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+
+        if strategy not in self.STRATEGIES:
+            raise ValueError(
+                f"Unknown strategy '{strategy}'. Must be one of {self.STRATEGIES}"
+            )
+
+        self.strategy = strategy
+        self.channels = channels
+        self.sd2_dims = sd2_dims or channels
+
+        if strategy == "rwkv":
+            # ═══ RWKV 路径: RefDiffRWKV → RWKV_ChannelAdapter ═══
+            cfg = rwkv_cfg or {}
+            self.ref_body = RefDiffRWKV(
+                patch_size=cfg.get("patch_size", 4),
+                embed_dim=cfg.get("embed_dim", 384),
+                channels=cfg.get("channels", 3),
+                upsample_mode=cfg.get("upsample_mode", "bilinear"),
+            )
+            self.channel_adapter = RWKV_ChannelAdapter(
+                ref_dims=cfg.get("ref_dims", (384, 768, 1536)),
+                sd2_dims=self.sd2_dims,
+            )
+            self.adapter_type = "rwkv"
+
+        elif strategy == "dual":
+            # ═══ Dual 路径: 双路独立编码 + 余弦加权 ═══
+            self.core = _DualAdapterImpl(
+                channels=channels,
+                nums_rb=kwargs.get("nums_rb", 2),
+                cin=kwargs.get("cin", 192),
+                ksize=kwargs.get("ksize", 3),
+                sk=kwargs.get("sk", True),
+                use_conv=kwargs.get("use_conv", True),
+            )
+            self.adapter_type = "crefdiff"
+
+        else:
+            # ═══ 其他 CRefDiff 路径: 统一基类 ═══
+            encoder_cls, encoder_kw = self._ENCODER_MAP[strategy]
+            # 注意: 不做 setdefault("use_map", ...) 注入 ——
+            # 各 encoder 接受的参数不同，额外参数应在 strategy 专属 kwargs 中显式传入
+            self.core = CRefDiffAdapterBase(
+                merge_encoder_class=encoder_cls,
+                merge_encoder_kwargs=encoder_kw,
+                channels=channels,
+                nums_rb=kwargs.get("nums_rb", 2),
+                cin=kwargs.get("cin", 192),
+                ksize=kwargs.get("ksize", 3),
+                sk=kwargs.get("sk", True),
+                use_conv=kwargs.get("use_conv", True),
+            )
+            self.adapter_type = "crefdiff"
 
     def forward(
         self,
-        rf1: torch.Tensor,   # (B, 384, H,   W)   — RefDiffRWKV 第一层输出
-        rf2: torch.Tensor,   # (B, 768, H/2, W/2) — RefDiffRWKV 第二层输出
-        rf3: torch.Tensor,   # (B, 1536, H/4, W/4)— RefDiffRWKV 第三层输出
-    ):
+        LR: torch.Tensor,
+        Ref: torch.Tensor,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, ...]:
         """
-        Forward pass — 逐层通道映射.
+        统一前向传播。
 
         Args:
-            rf1: (B, 384, H,   W)    来自 RefMultiScaleProcessor 的 f1
-            rf2: (B, 768, H/2, W/2)  来自 RefMultiScaleProcessor 的 f2
-            rf3: (B, 1536, H/4, W/4) 来自 RefMultiScaleProcessor 的 f3
+            LR:  低分辨率图像 (B, 3, h, w)
+            Ref: 参考图像 (B, 3, H, W)
+            **kwargs:
+                - sim_lamuda:           相似度缩放系数 (lca / rwkv / dual / cos_sim)
+                - return_cos_sim_map:   是否返回余弦相似度图
+                - return_learned_sim_map: 是否返回学习的 mask 图
 
         Returns:
-            a1: (B, 320, H,   W)     → 注入 SD2 down_blocks[0]
-            a2: (B, 640, H/2, W/2)   → 注入 SD2 down_blocks[1]
-            a3: (B, 1280, H/4, W/4)  → 注入 SD2 down_blocks[2]
-
-        注 (Note):
-            输出特征图分辨率与输入一致，不做上/下采样。
-            空间对齐假设：RefDiffRWKV 的 patch_h/patch_w 与 SD2 UNet
-            对应层的特征图分辨率已经匹配（均为 H/8 的 latent 空间）。
+            (feat_ch1, feat_ch2, feat_ch3) 三尺度控制信号，
+            通道数由 channels / sd2_dims 决定。
         """
-        a1 = self.conv1(rf1)   # (B, 384, H,   W)  → (B, 320, H,   W)
-        a2 = self.conv2(rf2)   # (B, 768, H/2, W/2)→ (B, 640, H/2, W/2)
-        a3 = self.conv3(rf3)   # (B, 1536,H/4, W/4)→ (B, 1280,H/4, W/4)
+        if self.strategy == "rwkv":
+            rf1, rf2, rf3 = self.ref_body(LR, Ref)
+            return self.channel_adapter(rf1, rf2, rf3)
 
-        return a1, a2, a3
+        elif self.strategy == "dual":
+            return self.core(LR, Ref, **kwargs)
 
-    def get_parameter_count(self) -> dict:
-        """
-        Count trainable parameters per layer (for logging).
-        统计各层可训练参数量（用于日志输出）。
+        else:
+            return self.core(sr=LR, ref=Ref, **kwargs)
 
-        Returns:
-            dict: {"conv1": N1, "conv2": N2, "conv3": N3, "total": N_total}
-        """
-        counts = {}
-        total = 0
-        for name in ["conv1", "conv2", "conv3"]:
-            conv = getattr(self, name)
-            n = sum(p.numel() for p in conv.parameters() if p.requires_grad)
-            counts[name] = n
-            total += n
-        counts["total"] = total
-        return counts
+    def get_info(self) -> dict:
+        """返回当前配置摘要。"""
+        info = {
+            "strategy": self.strategy,
+            "type": self.adapter_type,
+            "channels": self.channels,
+            "sd2_dims": self.sd2_dims,
+            "params": sum(p.numel() for p in self.parameters()),
+        }
+        if self.strategy == "rwkv":
+            info["body_params"] = sum(
+                p.numel() for p in self.ref_body.parameters()
+            )
+            info["adapter_params"] = sum(
+                p.numel() for p in self.channel_adapter.parameters()
+            )
+        return info
+
+    def __repr__(self):
+        i = self.get_info()
+        return (
+            f"SD2_RefAdapter(strategy={self.strategy!r}, "
+            f"type={i['type']}, params={i['params']:,})"
+        )
 
 
-# ─────────────────────────────────────────────────────────────
-# 测试代码 (Test / Sanity Check)
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  Part 7: 工具函数 & 测试入口
+# ═══════════════════════════════════════════════════════════════
+
+def build_all_adapters(
+    channels=(320, 640, 1280),
+    sd2_dims=None,
+    rwkv_cfg=None,
+    **common_kw,
+) -> dict:
+    """一键构建全部 6 种策略的 Adapter。"""
+    models = {}
+    for s in SD2_RefAdapter.STRATEGIES:
+        try:
+            # 每个 strategy 独立的 kwargs，避免参数冲突
+            kw = dict(**common_kw)
+            if s == "rwkv":
+                kw["rwkv_cfg"] = rwkv_cfg or {}
+                kw["sd2_dims"] = sd2_dims or channels
+            models[s] = SD2_RefAdapter(
+                strategy=s,
+                channels=channels,
+                **kw,  # 所有参数通过 kw 传递，避免重复
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to build '{s}': {e}")
+            models[s] = None
+    return models
+
+
+def print_comparison(models: dict):
+    """打印各策略参数量对比表。"""
+    print("=" * 80)
+    print(f"{'Strategy':<12} {'Type':<12} {'Params':>12} {'Status'}")
+    print("-" * 80)
+    for name in SD2_RefAdapter.STRATEGIES:
+        m = models.get(name)
+        if m is None:
+            print(f"{name:<12} {'N/A':<12} {'N/A':>12} ❌ Build failed")
+        else:
+            i = m.get_info()
+            print(f"{name:<12} {i['type']:<12} {i['params']:>12,} ✅ Ready")
+    print("=" * 80)
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("\n" + "=" * 80)
+    print("  SD2_RefAdapter — 6合1 统一 Ref 特征融合框架 测试")
+    print("=" * 80)
 
-    # 构造适配器
-    adapter = RWKV_Ref_Adapter(
-        ref_dims=(384, 768, 1536),
-        sd2_dims=(320, 640, 1280),
-    ).to(device)
+    models = build_all_adapters(
+        channels=(320, 640, 1280),
+        rwkv_cfg={"patch_size": 4, "embed_dim": 384},
+    )
+    print_comparison(models)
 
-    # 打印参数量
-    param_counts = adapter.get_parameter_count()
-    print("=" * 60)
-    print("RWKV_Ref_Adapter — Parameter Count (参数量)")
-    print("-" * 60)
-    for k, v in param_counts.items():
-        print(f"  {k}: {v:,}")
-    print("-" * 60)
-    print(f"  Total: ~{param_counts['total'] / 1e6:.1f}M parameters")
-    print("=" * 60)
+    # 测试 RWKV 策略
+    print("\n--- Testing RWKV strategy ---")
+    rwkv_model = models.get("rwkv")
+    if rwkv_model is not None:
+        rwkv_model = rwkv_model.to(device)
+        B = 2
+        LR = torch.randn(B, 3, 48, 48).to(device)
+        Ref = torch.randn(B, 3, 480, 480).to(device)
+        with torch.no_grad():
+            f1, f2, f3 = rwkv_model(LR=LR, Ref=Ref)
+        print(f"  Input:  LR={list(LR.shape)}, Ref={list(Ref.shape)}")
+        print(f"  Output: f1={list(f1.shape)}, f2={list(f2.shape)}, f3={list(f3.shape)}")
+        print(f"  Params: {sum(p.numel() for p in rwkv_model.parameters()):,}")
+        print("  ✅ RWKV test passed!")
+    else:
+        print("  ❌ RWKV build failed!")
 
-    # 模拟 RefDiffRWKV 输出的 rf 特征
-    # 假设 latent 空间分辨率为 60×60 (对应 480×480 输入, patch_size=4 → 120, VAE 8× down → 60)
-    B, H, W = 2, 60, 60  # batch=2, latent resolution=60×60
+    # 测试 CRefDiff 策略
+    print("\n--- Testing CRefDiff strategies ---")
+    for name in ["lca", "spade", "dual", "cos_sim", "cat"]:
+        m = models.get(name)
+        if m is not None:
+            print(f"  ✅ {name}: {m}")
+        else:
+            print(f"  ⚠️  {name}: skipped (module import failed)")
 
-    rf1 = torch.randn(B, 384, H,   W).to(device)   # (2, 384, 60, 60)
-    rf2 = torch.randn(B, 768, H//2, W//2).to(device)  # (2, 768, 30, 30)
-    rf3 = torch.randn(B, 1536, H//4, W//4).to(device) # (2, 1536, 15, 15)
-
-    # 前向推理
-    with torch.no_grad():
-        a1, a2, a3 = adapter(rf1, rf2, rf3)
-
-    print(f"\nInput shapes:")
-    print(f"  rf1: {rf1.shape}")
-    print(f"  rf2: {rf2.shape}")
-    print(f"  rf3: {rf3.shape}")
-    print(f"\nOutput shapes (after zero-init, all values should be 0):")
-    print(f"  a1:  {a1.shape}  | sum = {a1.sum().item():.6f}")
-    print(f"  a2:  {a2.shape}  | sum = {a2.sum().item():.6f}")
-    print(f"  a3:  {a3.shape}  | sum = {a3.sum().item():.6f}")
-
-    # 验证零初始化
-    assert a1.sum().item() == 0.0, "Zero-init failed: conv1 output is not all zeros"
-    assert a2.sum().item() == 0.0, "Zero-init failed: conv2 output is not all zeros"
-    assert a3.sum().item() == 0.0, "Zero-init failed: conv3 output is not all zeros"
-    print("\n✓ Zero-initialization verified — all outputs are exactly zero.")
+    print("\n" + "=" * 80)
+    print("  Usage:")
+    print("  >>> adapter = SD2_RefAdapter(strategy='rwkv')")
+    print("  >>> f320, f640, f1280 = adapter(LR=lr_img, Ref=ref_img)")
+    print("  >>> # Switch:")
+    print("  >>> adapter = SD2_RefAdapter(strategy='lca')")
+    print("=" * 80)
