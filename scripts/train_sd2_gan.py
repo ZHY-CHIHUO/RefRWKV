@@ -1,14 +1,11 @@
 #!/usr/bin/env python
 """
-SD2ControlLDM 训练脚本（RefDiffRWKV + SD2 UNet 端到端扩散超分）
+SD2RefGANSystem 训练脚本
+(G/D 分离：SD2RefGenerator + SD2RefDiscriminator)
 
 用法:
-    python scripts/train_sd2_control.py --config configs/sd2_control_config.yaml
-    python scripts/train_sd2_control.py --config configs/sd2_control_config.yaml --resume checkpoints/.../last.ckpt
-
-注意：
-    - 手动优化模式下 G/D 交替训练使用模型内置 AMP scaler (use_amp)。
-    - Trainer precision 设为 "32"，避免与内置 scaler 双重混合精度冲突。
+    python scripts/train_sd2_gan.py --config configs/sd2_ref_gan_config.yaml
+    python scripts/train_sd2_gan.py --config configs/sd2_ref_gan_config.yaml --resume checkpoints/.../last.ckpt
 """
 
 import sys
@@ -16,6 +13,7 @@ import argparse
 import yaml
 import os
 import shutil
+import math
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -35,11 +33,16 @@ torch.set_float32_matmul_precision("high")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==================== 导入模型和数据集 ====================
-from RefRWKV.models.RefDiffRWKV.sd2_control_ldm import SD2ControlLDM
+from RefRWKV.models.RefDiffRWKV.sd2_ref_generator import SD2RefGenerator
+from RefRWKV.models.RefDiffRWKV.sd2_ref_discriminator import SD2RefDiscriminator
+from RefRWKV.models.RefDiffRWKV.sd2_ref_gan_system import SD2RefGANSystem
 from RefRWKV.models.RefSRWKV import RefSRWKV
 from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
 
 
+# ============================================================
+# SR prior 构建
+# ============================================================
 def build_sr_model(cfg: dict):
     mc = cfg.get("model", {})
     if not mc.get("sr_enabled", False):
@@ -58,7 +61,7 @@ def build_sr_model(cfg: dict):
     )
 
     ckpt_path = sr_cfg.get("ckpt_path")
-    if ckpt_path is not None:
+    if ckpt_path is not None and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             ckpt = ckpt["state_dict"]
@@ -67,15 +70,13 @@ def build_sr_model(cfg: dict):
             for k, v in ckpt.items():
                 k = k.replace("module.", "")
                 if k.startswith("model."):
-                    k = k[len("model.") :]
+                    k = k[len("model."):]
                 state_dict[k] = v
             ckpt = state_dict
         model.load_state_dict(ckpt, strict=False)
         print(f"✅ Loaded SR prior weights from {ckpt_path}")
     elif mc.get("sr_enabled", False):
-        print(
-            "⚠️ sr_enabled=True but sr.ckpt_path is null; using randomly initialized SR prior"
-        )
+        print("⚠️ sr_enabled=True but sr.ckpt_path is null; using randomly initialized SR prior")
 
     if mc.get("sr_fixed", True):
         model.eval()
@@ -115,9 +116,9 @@ def load_weights(model: torch.nn.Module, ckpt_path: str):
 
     new_state_dict = {}
     for k, v in state_dict.items():
-        for pre in ["model.", "model_sr.", "model_diff.", "model_enhance."]:
+        for pre in ["model.", "model_sr.", "model_diff.", "model_enhance.", "generator.", "discriminator."]:
             if k.startswith(pre):
-                k = k[len(pre) :]
+                k = k[len(pre):]
                 break
         new_state_dict[k] = v
 
@@ -129,6 +130,9 @@ def load_weights(model: torch.nn.Module, ckpt_path: str):
     print(f"✅ 从 {ckpt_path} 加载权重完成")
 
 
+# ============================================================
+# 数据加载
+# ============================================================
 def build_dataloaders(cfg: dict):
     """返回 (train_loader, val_loader, test_loader)。"""
     data_cfg = cfg["data"]
@@ -156,7 +160,6 @@ def build_dataloaders(cfg: dict):
         "ref_key": mc.get("ref_key", "ref"),
     }
 
-    # --- 训练集 ---
     train_ds = RefLMDBDataset(
         mode="train",
         augment=data_cfg.get("augment", True),
@@ -164,12 +167,10 @@ def build_dataloaders(cfg: dict):
         **dataset_kwargs,
     )
 
-    # --- 验证集（不做增强）---
     val_ds = RefLMDBDataset(
         mode="val", augment=False, augment_ref=False, **dataset_kwargs
     )
 
-    # --- 测试集 ---
     test_ds = RefLMDBDataset(
         mode="test", augment=False, augment_ref=False, **dataset_kwargs
     )
@@ -182,7 +183,7 @@ def build_dataloaders(cfg: dict):
         pin_memory=True,
         drop_last=True,
         persistent_workers=(data_cfg["num_workers"] > 0),
-        prefetch_factor=data_cfg.get("prefetch_factor", 4),
+        prefetch_factor=data_cfg.get("prefetch_factor", 4) if data_cfg["num_workers"] > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -204,75 +205,103 @@ def build_dataloaders(cfg: dict):
     return train_loader, val_loader, test_loader
 
 
-def build_model(cfg: dict) -> SD2ControlLDM:
-    """根据配置构建 SD2ControlLDM。
-
-    所有可调超参均从配置文件读取，方便实验管理。
-    """
+# ============================================================
+# 模型构建
+# ============================================================
+def build_model(cfg: dict):
+    """构建 Generator + Discriminator + GAN System。"""
     mc = cfg.get("model", {})
 
+    # SR prior（推理 Better Start 用，训练时固定）
     sr_model = build_sr_model(cfg)
 
-    return SD2ControlLDM(
+    # Generator
+    generator = SD2RefGenerator(
         # Data keys
         lr_key=mc.get("lr_key", "lr"),
         ref_key=mc.get("ref_key", "ref"),
         hr_key=mc.get("hr_key", "hr"),
+        # Adapter
+        strategy=mc.get("strategy", "rwkv"),
+        rwkv_cfg=mc.get("rwkv_cfg", {"patch_size": 4, "embed_dim": 192}),
         # SD2
         sd_model_path=mc["sd_model_path"],
         use_lora=mc.get("use_lora", True),
         lora_rank=mc.get("lora_rank", 64),
         lora_target_modules=mc.get("lora_target_modules", None),
         sd_locked=mc.get("sd_locked", True),
-        # SR prior
-        sr_model=sr_model,
-        sr_fixed=mc.get("sr_fixed", True),
-        # RefDiffRWKV
-        patch_size=mc.get("patch_size", 4),
-        embed_dim=mc.get("embed_dim", 384),
-        upsample_mode=mc.get("upsample_mode", "bilinear"),
-        # GlobalSemantic
-        use_semantic=mc.get("use_semantic", False),
+        # DINOv2
+        use_semantic=mc.get("use_semantic", True),
         dinov2_model_name=mc.get("dinov2_model_name", "facebook/dinov2-base"),
         # Diffusion
-        cfg_drop_prob=mc.get("cfg_drop_prob", 0.1),
         num_train_timesteps=mc.get("num_train_timesteps", 1000),
         beta_start=mc.get("beta_start", 0.00085),
         beta_end=mc.get("beta_end", 0.012),
         beta_schedule=mc.get("beta_schedule", "scaled_linear"),
         prediction_type=mc.get("prediction_type", "epsilon"),
-        model_t=mc.get("model_t", (300, 700)),
-        # Loss weights & GAN
+        t_min=mc.get("t_min", 300),
+        t_max=mc.get("t_max", 700),
+        cfg_drop_prob=mc.get("cfg_drop_prob", 0.1),
+        control_scale=mc.get("control_scale", 1.0),
+        # Optimizer (for standalone usage)
         learning_rate=mc.get("learning_rate", 1e-4),
-        lr_D=mc.get("lr_D", 5e-6),
-        lr_D_texture=mc.get("lr_D_texture", 1e-6),
-        lambda_gan_texture=mc.get("lambda_gan_texture", 0.5),
-        disc_trainable_stages=mc.get("disc_trainable_stages", 1),
-        l_simple_weight=mc.get("l_simple_weight", 1.0),
-        lambda_lpips=mc.get("lambda_lpips", 0.3),
-        lambda_gan=mc.get("lambda_gan", 0.3),
-        use_freq=mc.get("use_freq", True),
         weight_decay=mc.get("weight_decay", 1e-3),
-        # AMP（手动优化模式下独立于 Trainer precision）
-        use_amp=mc.get("use_amp", True),
-        # Validation
-        sample_steps=mc.get("sample_steps", 50),
-        fr_metrics=mc.get("fr_metrics", None),
-        iqa_device=mc.get("iqa_device", "cuda"),
-        # Debug
-        debug_nan=mc.get("debug_nan", True),
-        accumulate_grad_batches=mc.get("accumulate_grad_batches", 8),
     )
 
+    # Discriminator（可选，设为 None 则退化为纯 diffusion baseline）
+    discriminator = None
+    if mc.get("use_discriminator", True):
+        discriminator = SD2RefDiscriminator(
+            use_semantic_d=mc.get("use_semantic_d", True),
+            use_texture_d=mc.get("use_texture_d", True),
+            semantic_alpha=mc.get("semantic_alpha", 0.8),
+            semantic_use_freq=mc.get("semantic_use_freq", True),
+            semantic_trainable_stages=mc.get("semantic_trainable_stages", 1),
+            semantic_precision=mc.get("semantic_precision", "fp32"),
+            texture_base_ch=mc.get("texture_base_ch", 48),
+            texture_num_scales=mc.get("texture_num_scales", 4),
+            texture_use_spectral=mc.get("texture_use_spectral", True),
+            lr_semantic=mc.get("lr_D", 5e-6),
+            lr_texture=mc.get("lr_D_texture", 1e-6),
+            weight_decay=mc.get("d_weight_decay", 1e-3),
+            betas=mc.get("d_betas", [0.5, 0.999]),
+        )
 
+    # GAN System
+    system = SD2RefGANSystem(
+        generator=generator,
+        discriminator=discriminator,
+        # Loss weights
+        lambda_gan_semantic=mc.get("lambda_gan", 0.0),
+        lambda_gan_texture=mc.get("lambda_gan_texture", 0.0),
+        lambda_lpips=mc.get("lambda_lpips", 0.0),
+        # Training control
+        accumulate_grad_batches=mc.get("accumulate_grad_batches", 8),
+        use_amp=mc.get("use_amp", True),
+        # Optimizers
+        g_lr=mc.get("learning_rate", 1e-4),
+        g_weight_decay=mc.get("weight_decay", 1e-3),
+        d_lr_sem=mc.get("lr_D", 5e-6),
+        d_lr_tex=mc.get("lr_D_texture", 1e-6),
+        d_weight_decay=mc.get("d_weight_decay", 1e-3),
+        betas=mc.get("d_betas", [0.5, 0.999]),
+        # Validation
+        sample_steps=mc.get("sample_steps", 50),
+        fr_metrics=mc.get("fr_metrics", ["psnr", "ssim", "lpips", "dists"]),
+        # Better Start SR model
+        sr_model=sr_model,
+    )
+
+    return system
+
+
+# ============================================================
+# Trainer 构建
+# ============================================================
 def build_trainer(
     cfg: dict, exp_name: str, checkpoint_dir: str, log_dir: str, max_epochs: int
 ):
-    """构建 PyTorch Lightning Trainer。
-
-    注意：手动优化 + 内置 AMP scaler 时 trainer precision 应设为 "32"，
-    避免 Lightning 注入额外的 autocast 导致双重混合精度。
-    """
+    """构建 PyTorch Lightning Trainer。"""
     train_cfg = cfg.get("train", {})
     full_checkpoint_dir = os.path.join(checkpoint_dir, exp_name)
     os.makedirs(full_checkpoint_dir, exist_ok=True)
@@ -282,15 +311,15 @@ def build_trainer(
     callbacks = [
         NaNMonitorCallback(),
         EarlyStopping(
-            monitor="val/loss",
+            monitor="val/loss_diff",
             patience=train_cfg.get("early_stopping_patience", 30),
             mode="min",
             verbose=True,
         ),
         ModelCheckpoint(
             dirpath=full_checkpoint_dir,
-            filename="{epoch:04d}-val_loss={val_loss:.6f}",
-            monitor="val/loss",
+            filename="{epoch:04d}-val_loss={val/loss_diff:.6f}",
+            monitor="val/loss_diff",
             save_top_k=train_cfg.get("save_top_k", 3),
             mode="min",
             save_last=True,
@@ -305,6 +334,7 @@ def build_trainer(
         max_epochs=max_epochs,
         log_every_n_steps=train_cfg.get("log_every_n_steps", 20),
         val_check_interval=train_cfg.get("val_check_interval", 0.5),
+        gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
         callbacks=callbacks,
         logger=logger,
         enable_progress_bar=True,
@@ -317,76 +347,65 @@ def build_trainer(
 # 训练函数
 # ============================================================
 def train(cfg: dict, resume_ckpt: str = None):
-    """训练 SD2ControlLDM。"""
+    """训练 SD2RefGANSystem。"""
     train_cfg = cfg["train"]
     output_cfg = cfg.get("output", {})
     mc = cfg.get("model", {})
 
-    # ── 开启自动异常检测（调试用，训练慢 10-20%）──
     if train_cfg.get("detect_anomaly", False):
         torch.autograd.set_detect_anomaly(True)
         print("⚠️  autograd 异常检测已开启，训练速度会降低")
 
-    checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints/sd2_control")
-    log_dir = output_cfg.get("log_dir", "logs/sd2_control")
-    exp_name = output_cfg.get("experiment_name", "sd2_control")
+    checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints/sd2_ref_gan")
+    log_dir = output_cfg.get("log_dir", "logs/sd2_ref_gan")
+    exp_name = output_cfg.get("experiment_name", "sd2_ref_gan")
 
-    # 构建模型
-    model = build_model(cfg)
+    # 构建 system
+    system = build_model(cfg)
 
     # 可选加载预训练权重
     pretrained = cfg.get("pretrained", {})
     if pretrained.get("sd2_control_ckpt") and not resume_ckpt:
-        load_weights(model, pretrained["sd2_control_ckpt"])
+        print(f"🔁 从 {pretrained['sd2_control_ckpt']} 加载预训练权重")
+        load_weights(system, pretrained["sd2_control_ckpt"])
 
-    # 构建数据
+    # 数据
     train_loader, val_loader, test_loader = build_dataloaders(cfg)
 
-    # 构建 Trainer
+    # Trainer
     max_epochs = train_cfg.get("max_epochs", 100)
     trainer, full_ckpt_dir = build_trainer(
         cfg, exp_name, checkpoint_dir, log_dir, max_epochs
     )
 
-    # 自动检测断点续训
+    # 断点续训
     if resume_ckpt is None:
         last_ckpt = os.path.join(full_ckpt_dir, "last.ckpt")
         if os.path.exists(last_ckpt):
             resume_ckpt = last_ckpt
             print(f"🔁 检测到上次训练记录，从 {last_ckpt} 恢复")
 
-    # ── 打印训练摘要 ──
+    # 打印训练摘要
     print(f"{'='*60}")
-    print(f"  SD2ControlLDM 训练")
+    print(f"  SD2RefGANSystem 训练")
     print(f"  数据根目录    : {cfg['data']['root']}")
-    print(
-        f"  Batch size    : {cfg['data']['batch_size']} × "
-        f"accumulate {mc.get('accumulate_grad_batches', 8)}"
-    )
+    print(f"  Batch size    : {cfg['data']['batch_size']} x accumulate {mc.get('accumulate_grad_batches', 8)}")
     print(f"  训练样本数    : {len(train_loader.dataset)}")
     print(f"  验证样本数    : {len(val_loader.dataset)}")
     print(f"  测试样本数    : {len(test_loader.dataset)}")
-    print(f"  Trainer prec  : {train_cfg.get('precision', '32')}")
-    print(f"  手动 AMP      : {mc.get('use_amp', True)}")
+    print(f"  Strategy      : {mc.get('strategy', 'rwkv')}")
+    print(f"  RWKN embed_dim: {mc.get('rwkv_cfg', {}).get('embed_dim', 192)}")
+    print(f"  使用 Discriminator : {mc.get('use_discriminator', True)}")
+    print(f"  GAN λ (sem/tex) : {mc.get('lambda_gan', 0.0)} / {mc.get('lambda_gan_texture', 0.0)}")
+    print(f"  LPIPS λ       : {mc.get('lambda_lpips', 0.0)}")
+    print(f"  LR (G/D_sem/D_tex): {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 5e-6)} / {mc.get('lr_D_texture', 1e-6)}")
     print(f"  最大 epoch    : {max_epochs}")
-    print(f"  LoRA rank     : {mc.get('lora_rank', 64)}")
-    print(
-        f"  LR (G / D_sem / D_tex) : {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 1e-4)} / {mc.get('lr_D_texture', 1e-4)}"
-    )
-    print(f"  LPIPS λ       : {mc.get('lambda_lpips', 0.1)}")
-    print(
-        f"  GAN λ (sem / tex) : {mc.get('lambda_gan', 0.005)} / {mc.get('lambda_gan_texture', 0.5)}"
-    )
-    print(f"  Freq D        : {mc.get('use_freq', True)}")
-    print(f"  D stages      : {mc.get('disc_trainable_stages', 1)}")
-    print(f"  model_t       : {mc.get('model_t', 200)}")
     print(f"  CFG dropout   : {mc.get('cfg_drop_prob', 0.1)}")
-    print(f"  Semantic      : {mc.get('use_semantic', False)}")
-    print(f"  NaN debug     : {mc.get('debug_nan', True)}")
+    print(f"  Semantic      : {mc.get('use_semantic', True)}")
+    print(f"  AMP           : {mc.get('use_amp', True)}")
     print(f"{'='*60}")
 
-    # 开始训练
-    trainer.fit(model, train_loader, val_loader, ckpt_path=resume_ckpt)
+    trainer.fit(system, train_loader, val_loader, ckpt_path=resume_ckpt)
 
     return (
         trainer.checkpoint_callback.best_model_path,
@@ -398,7 +417,7 @@ def train(cfg: dict, resume_ckpt: str = None):
 # 主入口
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="SD2ControlLDM 训练")
+    parser = argparse.ArgumentParser(description="SD2RefGANSystem 训练")
     parser.add_argument("--config", type=str, required=True, help="配置文件路径")
     parser.add_argument(
         "--resume", type=str, default=None, help="恢复训练的 checkpoint 路径"
@@ -407,7 +426,7 @@ def main():
 
     cfg = load_config(args.config)
 
-    # 复制配置文件到 checkpoint 目录
+    # 复制配置文件
     output_cfg = cfg.get("output", {})
     checkpoint_dir = output_cfg.get("checkpoint_dir", "checkpoints")
     log_dir = output_cfg.get("log_dir", "logs")
@@ -425,7 +444,7 @@ def main():
     print(f"{'='*60}")
     print(f"  ✅ 训练完成")
     print(f"  最佳模型 : {best_ckpt}")
-    print(f"  最佳 val/loss : {best_score:.6f}")
+    print(f"  最佳 val/loss_diff : {best_score:.6f}")
     print(f"{'='*60}")
 
 

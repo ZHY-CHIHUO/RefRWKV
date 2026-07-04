@@ -1,15 +1,23 @@
-# RefDiffRWKV/discriminator.py
+"""
+sd2_ref_discriminator.py — 双判别器：语义 D + 纹理一致性 D
+与 SD2RefGenerator 分离，独立 LightningModule
+"""
 
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
+from pytorch_lightning import LightningModule
+from typing import Optional, List, Tuple
+
 import open_clip
 from vision_aided_loss.cv_discriminator import BlurPool, spectral_norm
 from vision_aided_loss.cv_losses import multilevel_loss
 
-import os
 
-
-def haar_highpass(x):
+# ══════════════════════════════════════════════════════════════
+#  Haar 小波高频分解
+# ══════════════════════════════════════════════════════════════
+def haar_highpass(x: torch.Tensor) -> torch.Tensor:
     """Haar 小波高频分解"""
     B, C, H, W = x.shape
 
@@ -21,7 +29,6 @@ def haar_highpass(x):
         W = W - 1
 
     x = x.reshape(B, C, H // 2, 2, W // 2, 2)
-
     x00 = x[:, :, :, 0, :, 0]
     x01 = x[:, :, :, 0, :, 1]
     x10 = x[:, :, :, 1, :, 0]
@@ -38,8 +45,6 @@ def haar_highpass(x):
 # ══════════════════════════════════════════════════════════════
 #  Backbone: ConvNeXt-Base-W
 # ══════════════════════════════════════════════════════════════
-
-
 def _visual_forward(model, image, return_feats=False, return_pooled_feats=False):
     x, intermediates = model.trunk.forward_intermediates(
         image,
@@ -84,17 +89,16 @@ class ImageOpenCLIPConvNext(nn.Module):
     def encode_image(self, image, return_feats=False, return_pooled_feats=False):
         return _visual_forward(self.model, image, return_feats, return_pooled_feats)
 
-# ══════════════════════════════════════════════════════════════
-#  MultiLevelDConv — 已适配实际特征通道
-# ══════════════════════════════════════════════════════════════
 
-
+# ══════════════════════════════════════════════════════════════
+#  MultiLevelDConv
+# ══════════════════════════════════════════════════════════════
 class MultiLevelDConv(nn.Module):
     def __init__(
         self,
         level=3,
-        in_ch1=(256, 512),  # ← 关键修复：匹配 ConvNeXt-Base-W 的实际特征
-        in_ch2=640,  # ← pooled feature 维度
+        in_ch1=(256, 512),
+        in_ch2=640,
         out_ch=256,
         num_classes=0,
         activation=nn.LeakyReLU(0.2, inplace=True),
@@ -153,10 +157,8 @@ class MultiLevelDConv(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  ImageConvNextDiscriminator
+#  ImageConvNextDiscriminator（语义判别器）
 # ══════════════════════════════════════════════════════════════
-
-
 class ImageConvNextDiscriminator(nn.Module):
     def __init__(self, alpha=0.8, precision="fp32", use_freq=True, trainable_stages=1):
         super().__init__()
@@ -169,7 +171,7 @@ class ImageConvNextDiscriminator(nn.Module):
         )
 
         self.decoder = MultiLevelDConv(
-            level=3, in_ch1=[256, 512], in_ch2=640, out_ch=256, down=2  # ← 与上面一致
+            level=3, in_ch1=[256, 512], in_ch2=640, out_ch=256, down=2
         )
 
         if use_freq:
@@ -235,8 +237,6 @@ class ImageConvNextDiscriminator(nn.Module):
             x = (x - self.image_mean[:, None, None]) / self.image_std[:, None, None]
 
         features = self.model.encode_image(x, return_pooled_feats=True)
-        # print(f"[Debug] Features shapes: {[f.shape for f in features]}")  # 调试时打开
-
         features = self.decoder(features)
 
         loss_fn = multilevel_loss(alpha=self.gan_alpha)
@@ -248,10 +248,8 @@ class ImageConvNextDiscriminator(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  TextureConsistencyDiscriminator（保持不变）
+#  TextureConsistencyDiscriminator（纹理一致性判别器）
 # ══════════════════════════════════════════════════════════════
-
-
 class TextureConsistencyDiscriminator(nn.Module):
     def __init__(self, in_ch=3, base_ch=48, num_scales=4, use_spectral=True):
         super().__init__()
@@ -312,3 +310,188 @@ class TextureConsistencyDiscriminator(nn.Module):
         weighted = (weights.unsqueeze(1).unsqueeze(2) * logits_stacked).sum(dim=0)
 
         return torch.clamp(weighted, -5.0, 5.0), per_scale_logits
+
+
+# ══════════════════════════════════════════════════════════════
+#  SD2RefDiscriminator — LightningModule 封装
+# ══════════════════════════════════════════════════════════════
+class SD2RefDiscriminator(LightningModule):
+    """
+    双判别器封装：
+      - 语义判别器 D_sem：ImageConvNextDiscriminator
+      - 纹理判别器 D_tex：TextureConsistencyDiscriminator
+    """
+
+    def __init__(
+        self,
+        use_semantic_d: bool = True,
+        use_texture_d: bool = True,
+        semantic_alpha: float = 0.8,
+        semantic_use_freq: bool = True,
+        semantic_trainable_stages: int = 1,
+        semantic_precision: str = "fp32",
+        texture_base_ch: int = 48,
+        texture_num_scales: int = 4,
+        texture_use_spectral: bool = True,
+        lr_semantic: float = 5e-6,
+        lr_texture: float = 1e-6,
+        weight_decay: float = 1e-3,
+        betas: Tuple[float, float] = (0.5, 0.999),
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.use_semantic_d = use_semantic_d
+        self.use_texture_d = use_texture_d
+
+        if use_semantic_d:
+            self.D_sem = ImageConvNextDiscriminator(
+                alpha=semantic_alpha,
+                precision=semantic_precision,
+                use_freq=semantic_use_freq,
+                trainable_stages=semantic_trainable_stages,
+            )
+        else:
+            self.D_sem = None
+
+        if use_texture_d:
+            self.D_tex = TextureConsistencyDiscriminator(
+                in_ch=3,
+                base_ch=texture_base_ch,
+                num_scales=texture_num_scales,
+                use_spectral=texture_use_spectral,
+            )
+        else:
+            self.D_tex = None
+
+        self._d_sem_accum_count = 0
+        self._d_tex_accum_count = 0
+
+    def compute_g_loss(
+        self,
+        fake: torch.Tensor,
+        ref: Optional[torch.Tensor] = None,
+        lambda_semantic: float = 1.0,
+        lambda_texture: float = 1.0,
+    ) -> torch.Tensor:
+        loss = 0.0
+
+        if self.use_semantic_d and lambda_semantic > 0:
+            loss_sem = self.D_sem(fake, for_real=False, for_G=True)
+            loss = loss + lambda_semantic * loss_sem
+
+        if self.use_texture_d and lambda_texture > 0 and ref is not None:
+            fake_logit, _ = self.D_tex(fake, ref)
+            loss = loss + lambda_texture * (-fake_logit.mean())
+
+        return loss
+
+    def compute_d_loss(
+        self,
+        real: torch.Tensor,
+        fake: torch.Tensor,
+        ref: Optional[torch.Tensor] = None,
+        lambda_semantic: float = 1.0,
+        lambda_texture: float = 1.0,
+    ) -> torch.Tensor:
+        loss = 0.0
+
+        if self.use_semantic_d and lambda_semantic > 0:
+            loss_sem_real = self.D_sem(real, for_real=True, for_G=False)
+            loss_sem_fake = self.D_sem(fake.detach(), for_real=False, for_G=False)
+            loss = loss + lambda_semantic * (loss_sem_real + loss_sem_fake)
+
+        if self.use_texture_d and lambda_texture > 0 and ref is not None:
+            real_logit, _ = self.D_tex(real, ref)
+            fake_logit, _ = self.D_tex(fake.detach(), ref)
+            loss_tex = F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()
+            loss = loss + lambda_texture * loss_tex
+
+        return loss
+
+    def forward(
+        self,
+        real: torch.Tensor,
+        fake: torch.Tensor,
+        ref: Optional[torch.Tensor] = None,
+        mode: str = "both",
+    ) -> Tuple[torch.Tensor, dict]:
+        log_dict = {}
+
+        if mode in ["both", "semantic"] and self.use_semantic_d:
+            loss_sem = self.compute_d_loss(
+                real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
+            )
+            log_dict["loss_D_sem"] = loss_sem.detach()
+
+        if mode in ["both", "texture"] and self.use_texture_d and ref is not None:
+            loss_tex = self.compute_d_loss(
+                real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
+            )
+            log_dict["loss_D_tex"] = loss_tex.detach()
+
+        loss_D = sum(log_dict.values())
+        log_dict["loss_D_total"] = loss_D.detach()
+
+        return loss_D, log_dict
+
+    def training_step(self, batch, batch_idx, optimizer_idx=None):
+        real = batch["hr"]
+        fake = batch["sr"].detach()
+        ref = batch.get("ref", None)
+
+        if optimizer_idx == 0 and self.use_semantic_d:
+            loss = self.compute_d_loss(
+                real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
+            )
+            self.log("train/D_sem", loss, on_step=True, prog_bar=True)
+            return loss
+
+        if optimizer_idx == 1 and self.use_texture_d and ref is not None:
+            loss = self.compute_d_loss(
+                real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
+            )
+            self.log("train/D_tex", loss, on_step=True, prog_bar=True)
+            return loss
+
+        if optimizer_idx is None:
+            loss = self.compute_d_loss(real, fake, ref=ref)
+            self.log("train/D_total", loss, on_step=True, prog_bar=True)
+            return loss
+
+        return None
+
+    def configure_optimizers(self):
+        opts = []
+
+        if self.use_semantic_d:
+            params_sem = [p for p in self.D_sem.parameters() if p.requires_grad]
+            opts.append(
+                torch.optim.AdamW(
+                    params_sem,
+                    lr=self.hparams.lr_semantic,
+                    betas=self.hparams.betas,
+                    weight_decay=self.hparams.weight_decay,
+                )
+            )
+
+        if self.use_texture_d:
+            params_tex = list(self.D_tex.parameters())
+            opts.append(
+                torch.optim.AdamW(
+                    params_tex,
+                    lr=self.hparams.lr_texture,
+                    betas=self.hparams.betas,
+                    weight_decay=self.hparams.weight_decay,
+                )
+            )
+
+        return opts
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["d_sem_accum_count"] = self._d_sem_accum_count
+        checkpoint["d_tex_accum_count"] = self._d_tex_accum_count
+
+    def on_load_checkpoint(self, checkpoint):
+        self._d_sem_accum_count = checkpoint.get("d_sem_accum_count", 0)
+        self._d_tex_accum_count = checkpoint.get("d_tex_accum_count", 0)
