@@ -90,7 +90,7 @@ class SD2RefGANSystem(LightningModule):
             from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
             self.iqa = IQAEngine(
-                device="cpu",
+                device="cuda",
                 nr_metrics=[],
                 fr_metrics=fr_metrics or ["psnr", "ssim", "lpips", "dists"],
                 use_y_channel=True,
@@ -338,6 +338,14 @@ class SD2RefGANSystem(LightningModule):
     def validation_step(self, batch, batch_idx):
         lr, ref, hr = self.generator.get_input(batch)
 
+        loss_diff, _ = self.generator.p_losses(lr, ref, hr)
+        self.log(
+            "val/loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
+        )
+        self.log(
+            "val-loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
+        )
+
         with torch.no_grad():
             val_results = self.generator.log_images(
                 batch, steps=self.sample_steps, sr_model=self.sr_model
@@ -345,11 +353,18 @@ class SD2RefGANSystem(LightningModule):
 
         # 计算指标
         if self.iqa is not None:
-            sr = val_results["samples"]
-            hq = val_results["hq"]
-            metrics = self.iqa(sr, hq)
-            for k, v in metrics.items():
-                self.log(f"val/{k}", v, on_epoch=True, prog_bar=True)
+            sr_batch = val_results["samples"]  # (B, C, H, W), [0,1]
+            hq_batch = val_results["hq"]
+            agg = {}
+            for i in range(len(sr_batch)):
+                sr_np = sr_batch[i].cpu().numpy()  # (C, H, W)
+                hq_np = hq_batch[i].cpu().numpy()
+                m = self.iqa.evaluate_single(sr_np, hq_np)
+                for k, v in m.items():
+                    agg[k] = agg.get(k, 0.0) + v
+            n = len(sr_batch)
+            for k, v in agg.items():
+                self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
 
         # 保存图像
         save_dir = os.path.join(
@@ -363,9 +378,8 @@ class SD2RefGANSystem(LightningModule):
         for i in range(len(hr_batch_tensor)):
             curr_hr = hr_batch_tensor[i].numpy().astype(np.float64)
             curr_sr = sr_batch_tensor[i].numpy().astype(np.float64)
-            curr_psnr = 20 * math.log10(
-                1.0 / math.sqrt(np.mean((curr_hr - curr_sr) ** 2))
-            )
+            mse = np.mean((curr_hr - curr_sr) ** 2)
+            curr_psnr = 20 * math.log10(1.0 / math.sqrt(max(mse, 1e-10)))
             this_psnr += curr_psnr
         this_psnr /= len(hr_batch_tensor)
         self.log("val/psnr", this_psnr, on_epoch=True, prog_bar=True)
@@ -384,3 +398,7 @@ class SD2RefGANSystem(LightningModule):
     def on_validation_epoch_start(self):
         if self.discriminator is not None:
             self.discriminator.eval()
+
+    def on_fit_start(self):
+        if self.sr_model is not None:
+            self.sr_model.to(self.device)

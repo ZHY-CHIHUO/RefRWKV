@@ -318,7 +318,7 @@ def build_trainer(
         ),
         ModelCheckpoint(
             dirpath=full_checkpoint_dir,
-            filename="{epoch:04d}-val_loss={val/loss_diff:.6f}",
+            filename="{epoch:04d}-val_loss={val-loss_diff:.6f}",
             monitor="val/loss_diff",
             save_top_k=train_cfg.get("save_top_k", 3),
             mode="min",
@@ -334,7 +334,7 @@ def build_trainer(
         max_epochs=max_epochs,
         log_every_n_steps=train_cfg.get("log_every_n_steps", 20),
         val_check_interval=train_cfg.get("val_check_interval", 0.5),
-        gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
+        gradient_clip_val=None,
         callbacks=callbacks,
         logger=logger,
         enable_progress_bar=True,

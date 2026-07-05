@@ -13,7 +13,7 @@ sys.path.insert(0, root_dir)
 from models.RefSRWKV import RUN_CUDA, OmniShift
 
 # 参考 SR_Ref_Encoder_LCA，导入其融合模块
-from modules import LocalCrossAttention, MaskAttention
+from .modules import LocalCrossAttention, MaskAttention
 
 
 def get_2d_sincos_pos_embed(embed_dim, h, w, cls_token=False, extra_tokens=0):

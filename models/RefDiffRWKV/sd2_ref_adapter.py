@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List
 
-from modules import (
+from .modules import (
     cosine_attention_map,
     ConvBlock,
     Resblock,
@@ -16,7 +16,7 @@ from modules import (
     ImplicitPromptModule,
 )
 
-from RefDiffRWKV import RefDiffRWKV
+from .RefDiffRWKV import RefDiffRWKV
 
 
 class ResnetBlock_SD2(nn.Module):

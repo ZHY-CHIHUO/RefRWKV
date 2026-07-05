@@ -300,7 +300,7 @@ class GlobalSemanticModule(nn.Module):
     def __init__(
         self,
         dinov2_model_name: str = "facebook/dinov2-base",
-        base_dim: int = 128,
+        base_dim: int = 768,
         token_schedule: tuple = (32, 16, 8, 4),
         level_names: tuple = ("e1", "e2", "e3", "latent"),
         hidden_rate: int = 4,
