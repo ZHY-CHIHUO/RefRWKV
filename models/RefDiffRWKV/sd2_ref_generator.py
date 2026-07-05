@@ -396,7 +396,7 @@ class SD2RefGenerator(LightningModule):
             "lq": (lr + 1.0) / 2.0,
             "ref": (ref + 1.0) / 2.0,
             "hq": (hr + 1.0) / 2.0,
-            "samples": (samples + 1.0) / 2.0,
+            "samples": torch.clamp((samples + 1.0) / 2.0, 0.0, 1.0),
         }
 
     @torch.no_grad()
