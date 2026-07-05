@@ -2,6 +2,7 @@
 """
 RefSRWKV (Improved): Reference-based Super-Resolution with RWKV Backbone.
 """
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -638,37 +639,48 @@ class RefSRWKV(nn.Module):
 class LitRefSRWKV(pl.LightningModule):
     def __init__(
         self,
-        model_sr: nn.Module,
-        learning_rate: float = 1e-4,
-        warmup_steps: int = 100,
-        loss_fn: nn.Module = None,
-    ):
+        model_sr,
+        learning_rate=1e-4,
+        warmup_steps=100,
+        loss_fn=None,
+        lr_key="lr",
+        hr_key="hr",
+        ref_key="ref",
+    ):  # ← 增加 key 参数
         super().__init__()
         self.save_hyperparameters(ignore=["model_sr", "loss_fn"])
-
         self.model_sr = model_sr
         self.criterion = loss_fn or nn.L1Loss()
         self._step_count = 0
+        self.lr_key = lr_key
+        self.hr_key = hr_key
+        self.ref_key = ref_key
+
+    def _unpack_batch(self, batch):
+        """兼容 tuple 和 dict 两种 batch 格式。"""
+        if isinstance(batch, dict):
+            return batch[self.lr_key], batch[self.hr_key], batch[self.ref_key]
+        return batch[0], batch[1], batch[2]
 
     def forward(self, lr, ref):
         return self.model_sr(lr, ref)
 
     def training_step(self, batch, batch_idx):
-        lr, hr, ref = batch
+        lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
         loss = self.criterion(output, hr)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        lr, hr, ref = batch
+        lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
         loss = self.criterion(output, hr)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def test_step(self, batch, batch_idx):
-        lr, hr, ref = batch
+        lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
         loss = self.criterion(output, hr)
         self.log("test_loss", loss, on_step=False, on_epoch=True)
