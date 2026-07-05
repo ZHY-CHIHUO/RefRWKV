@@ -13,12 +13,13 @@ import open_clip
 from vision_aided_loss.cv_discriminator import BlurPool, spectral_norm
 from vision_aided_loss.cv_losses import multilevel_loss
 
-
 # ══════════════════════════════════════════════════════════════
 #  Haar 小波高频分解
 # ══════════════════════════════════════════════════════════════
+
+
 def haar_highpass(x: torch.Tensor) -> torch.Tensor:
-    """Haar 小波高频分解"""
+    """Haar 小波高频分解。输入需为 3 通道 RGB，输出 9 通道 (LH/HL/HH x3)。"""
     B, C, H, W = x.shape
 
     if H % 2 != 0:
@@ -45,6 +46,8 @@ def haar_highpass(x: torch.Tensor) -> torch.Tensor:
 # ══════════════════════════════════════════════════════════════
 #  Backbone: ConvNeXt-Base-W
 # ══════════════════════════════════════════════════════════════
+
+
 def _visual_forward(model, image, return_feats=False, return_pooled_feats=False):
     x, intermediates = model.trunk.forward_intermediates(
         image,
@@ -93,6 +96,8 @@ class ImageOpenCLIPConvNext(nn.Module):
 # ══════════════════════════════════════════════════════════════
 #  MultiLevelDConv
 # ══════════════════════════════════════════════════════════════
+
+
 class MultiLevelDConv(nn.Module):
     def __init__(
         self,
@@ -159,6 +164,8 @@ class MultiLevelDConv(nn.Module):
 # ══════════════════════════════════════════════════════════════
 #  ImageConvNextDiscriminator（语义判别器）
 # ══════════════════════════════════════════════════════════════
+
+
 class ImageConvNextDiscriminator(nn.Module):
     def __init__(self, alpha=0.8, precision="fp32", use_freq=True, trainable_stages=1):
         super().__init__()
@@ -227,6 +234,9 @@ class ImageConvNextDiscriminator(nn.Module):
         return self
 
     def forward(self, x, for_real=True, for_G=False, return_logits=False):
+        # haar 高频依赖 3 通道 RGB 输入
+        assert x.shape[1] == 3, f"语义 D 期望 3 通道输入，收到 {x.shape[1]}"
+
         if self.use_freq:
             x = haar_highpass(x)
             x = (x - x.mean(dim=[2, 3], keepdim=True)) / (
@@ -250,6 +260,8 @@ class ImageConvNextDiscriminator(nn.Module):
 # ══════════════════════════════════════════════════════════════
 #  TextureConsistencyDiscriminator（纹理一致性判别器）
 # ══════════════════════════════════════════════════════════════
+
+
 class TextureConsistencyDiscriminator(nn.Module):
     def __init__(self, in_ch=3, base_ch=48, num_scales=4, use_spectral=True):
         super().__init__()
@@ -296,6 +308,12 @@ class TextureConsistencyDiscriminator(nn.Module):
         return feats
 
     def forward(self, image, ref):
+        # 逐尺度 abs 差要求 image / ref 空间尺寸一致，不一致则把 ref 对齐到 image
+        if image.shape[-2:] != ref.shape[-2:]:
+            ref = F.interpolate(
+                ref, size=image.shape[-2:], mode="bilinear", align_corners=False
+            )
+
         feats_image = self._extract_features(image)
         feats_ref = self._extract_features(ref)
 
@@ -315,24 +333,32 @@ class TextureConsistencyDiscriminator(nn.Module):
 # ══════════════════════════════════════════════════════════════
 #  SD2RefDiscriminator — LightningModule 封装
 # ══════════════════════════════════════════════════════════════
+
+
 class SD2RefDiscriminator(LightningModule):
     """
     双判别器封装：
       - 语义判别器 D_sem：ImageConvNextDiscriminator
       - 纹理判别器 D_tex：TextureConsistencyDiscriminator
+
+    与 SD2RefGenerator 解耦，可单独实例化、单独保存 checkpoint。
+    通过 compute_g_loss / compute_d_loss 向生成器提供 GAN loss 接口。
     """
 
     def __init__(
         self,
         use_semantic_d: bool = True,
         use_texture_d: bool = True,
+        # 语义 D 参数
         semantic_alpha: float = 0.8,
         semantic_use_freq: bool = True,
         semantic_trainable_stages: int = 1,
         semantic_precision: str = "fp32",
+        # 纹理 D 参数
         texture_base_ch: int = 48,
         texture_num_scales: int = 4,
         texture_use_spectral: bool = True,
+        # 优化器参数
         lr_semantic: float = 5e-6,
         lr_texture: float = 1e-6,
         weight_decay: float = 1e-3,
@@ -344,6 +370,7 @@ class SD2RefDiscriminator(LightningModule):
         self.use_semantic_d = use_semantic_d
         self.use_texture_d = use_texture_d
 
+        # 语义判别器
         if use_semantic_d:
             self.D_sem = ImageConvNextDiscriminator(
                 alpha=semantic_alpha,
@@ -354,6 +381,7 @@ class SD2RefDiscriminator(LightningModule):
         else:
             self.D_sem = None
 
+        # 纹理判别器
         if use_texture_d:
             self.D_tex = TextureConsistencyDiscriminator(
                 in_ch=3,
@@ -364,8 +392,41 @@ class SD2RefDiscriminator(LightningModule):
         else:
             self.D_tex = None
 
+        # 累积梯度计数（如需手动优化可复用）
         self._d_sem_accum_count = 0
         self._d_tex_accum_count = 0
+
+    # ═══════════════════════════════════════════════════════
+    #  train / eval / requires_grad_ 重写
+    #  关键：转发到 D_sem 的自定义实现，避免默认 nn.Module 行为
+    #  把冻结的 laion2b CLIP backbone 整体解冻。
+    # ═══════════════════════════════════════════════════════
+
+    def train(self, mode: bool = True):
+        self.training = mode
+        if self.D_sem is not None:
+            self.D_sem.train(mode)  # 自定义：只切 decoder + 可训练 stage
+        if self.D_tex is not None:
+            self.D_tex.train(mode)  # 默认行为即可
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+    def requires_grad_(self, requires_grad: bool = True):
+        if self.D_sem is not None:
+            self.D_sem.requires_grad_(requires_grad)  # 自定义：保护 CLIP trunk
+        if self.D_tex is not None:
+            self.D_tex.requires_grad_(requires_grad)
+        return self
+
+    def _zero_loss(self, ref_tensor: torch.Tensor) -> torch.Tensor:
+        """返回与输入同 device/dtype 的 0 张量，避免返回 python float。"""
+        return torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+    # ═══════════════════════════════════════════════════════
+    #  生成器侧接口：只计算 G 的 GAN loss，不更新 D
+    # ═══════════════════════════════════════════════════════
 
     def compute_g_loss(
         self,
@@ -374,10 +435,11 @@ class SD2RefDiscriminator(LightningModule):
         lambda_semantic: float = 1.0,
         lambda_texture: float = 1.0,
     ) -> torch.Tensor:
-        loss = 0.0
+        """生成器的 GAN loss。调用前需确保 D 处于 eval / requires_grad(False)。"""
+        loss = self._zero_loss(fake)
 
         if self.use_semantic_d and lambda_semantic > 0:
-            loss_sem = self.D_sem(fake, for_real=False, for_G=True)
+            loss_sem = self.D_sem(fake, for_real=False, for_G=True).mean()
             loss = loss + lambda_semantic * loss_sem
 
         if self.use_texture_d and lambda_texture > 0 and ref is not None:
@@ -385,6 +447,10 @@ class SD2RefDiscriminator(LightningModule):
             loss = loss + lambda_texture * (-fake_logit.mean())
 
         return loss
+
+    # ═══════════════════════════════════════════════════════
+    #  判别器侧接口：计算 D 的 GAN loss
+    # ═══════════════════════════════════════════════════════
 
     def compute_d_loss(
         self,
@@ -394,11 +460,14 @@ class SD2RefDiscriminator(LightningModule):
         lambda_semantic: float = 1.0,
         lambda_texture: float = 1.0,
     ) -> torch.Tensor:
-        loss = 0.0
+        """判别器 loss：real 判真，fake 判假。"""
+        loss = self._zero_loss(real)
 
         if self.use_semantic_d and lambda_semantic > 0:
-            loss_sem_real = self.D_sem(real, for_real=True, for_G=False)
-            loss_sem_fake = self.D_sem(fake.detach(), for_real=False, for_G=False)
+            loss_sem_real = self.D_sem(real, for_real=True, for_G=False).mean()
+            loss_sem_fake = self.D_sem(
+                fake.detach(), for_real=False, for_G=False
+            ).mean()
             loss = loss + lambda_semantic * (loss_sem_real + loss_sem_fake)
 
         if self.use_texture_d and lambda_texture > 0 and ref is not None:
@@ -409,6 +478,10 @@ class SD2RefDiscriminator(LightningModule):
 
         return loss
 
+    # ═══════════════════════════════════════════════════════
+    #  Lightning 训练接口
+    # ═══════════════════════════════════════════════════════
+
     def forward(
         self,
         real: torch.Tensor,
@@ -416,52 +489,51 @@ class SD2RefDiscriminator(LightningModule):
         ref: Optional[torch.Tensor] = None,
         mode: str = "both",
     ) -> Tuple[torch.Tensor, dict]:
+        """
+        前向返回 D loss 与详细日志。
+        mode: "both" | "semantic" | "texture"
+        返回的 loss_D 可反传（log_dict 内为 detach 值）。
+        """
         log_dict = {}
+        loss_D = self._zero_loss(real)
 
         if mode in ["both", "semantic"] and self.use_semantic_d:
             loss_sem = self.compute_d_loss(
                 real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
             )
+            loss_D = loss_D + loss_sem
             log_dict["loss_D_sem"] = loss_sem.detach()
 
         if mode in ["both", "texture"] and self.use_texture_d and ref is not None:
             loss_tex = self.compute_d_loss(
                 real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
             )
+            loss_D = loss_D + loss_tex
             log_dict["loss_D_tex"] = loss_tex.detach()
 
-        loss_D = sum(log_dict.values())
         log_dict["loss_D_total"] = loss_D.detach()
-
         return loss_D, log_dict
 
-    def training_step(self, batch, batch_idx, optimizer_idx=None):
+    def training_step(self, batch, batch_idx):
+        """
+        独立训练 D 时的回退接口（实际 GAN 训练走 sd2_ref_gan_system 的手动优化）。
+        期望 batch 含 "hr" / "sr"(已 detach) / "ref"(可选)。
+        新版 Lightning 已移除 optimizer_idx，这里统一计算总 D loss。
+        """
         real = batch["hr"]
         fake = batch["sr"].detach()
         ref = batch.get("ref", None)
 
-        if optimizer_idx == 0 and self.use_semantic_d:
-            loss = self.compute_d_loss(
-                real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
-            )
-            self.log("train/D_sem", loss, on_step=True, prog_bar=True)
-            return loss
-
-        if optimizer_idx == 1 and self.use_texture_d and ref is not None:
-            loss = self.compute_d_loss(
-                real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
-            )
-            self.log("train/D_tex", loss, on_step=True, prog_bar=True)
-            return loss
-
-        if optimizer_idx is None:
-            loss = self.compute_d_loss(real, fake, ref=ref)
-            self.log("train/D_total", loss, on_step=True, prog_bar=True)
-            return loss
-
-        return None
+        loss, log_dict = self.forward(real, fake, ref=ref, mode="both")
+        self.log_dict(
+            {f"train/{k}": v for k, v in log_dict.items()},
+            on_step=True,
+            prog_bar=True,
+        )
+        return loss
 
     def configure_optimizers(self):
+        """返回两个独立优化器，分别对应 semantic D 和 texture D。"""
         opts = []
 
         if self.use_semantic_d:
@@ -488,6 +560,10 @@ class SD2RefDiscriminator(LightningModule):
 
         return opts
 
+    # ═══════════════════════════════════════════════════════
+    #  checkpoint 状态持久化
+    # ═══════════════════════════════════════════════════════
+
     def on_save_checkpoint(self, checkpoint):
         checkpoint["d_sem_accum_count"] = self._d_sem_accum_count
         checkpoint["d_tex_accum_count"] = self._d_tex_accum_count
@@ -495,3 +571,39 @@ class SD2RefDiscriminator(LightningModule):
     def on_load_checkpoint(self, checkpoint):
         self._d_sem_accum_count = checkpoint.get("d_sem_accum_count", 0)
         self._d_tex_accum_count = checkpoint.get("d_tex_accum_count", 0)
+
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ====== 构造模型 ======
+    model = SD2RefDiscriminator(
+        use_semantic_d=True,
+        use_texture_d=True,
+    ).to(device)
+
+    model.eval()
+
+    # ====== 假数据 ======
+    B, C, H, W = 2, 3, 480, 480
+
+    real = torch.randn(B, C, H, W, device=device)
+    fake = torch.randn(B, C, H, W, device=device)
+    ref = torch.randn(B, C, H, W, device=device)
+
+    # ====== D loss ======
+    d_loss = model.compute_d_loss(real, fake, ref=ref)
+    print("D loss:", d_loss.item())
+
+    # ====== G loss ======
+    g_loss = model.compute_g_loss(fake, ref=ref)
+    print("G loss:", g_loss.item())
+
+    # ====== forward（联合） ======
+    loss, logs = model(real, fake, ref=ref, mode="both")
+    print("forward loss:", loss.item())
+    print("logs:", {k: v.item() for k, v in logs.items()})
+
+    # ====== 反向检查 ======
+    loss.backward()
+    print("backward ok")

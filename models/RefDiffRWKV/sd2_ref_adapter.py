@@ -13,8 +13,6 @@ from modules import (
     Downsample,
     SR_Encoder,
     SR_Ref_Encoder_LCA,
-    SR_Ref_Encoder_Spade,
-    SR_Ref_Encoder_Cos_Sim,
     ImplicitPromptModule,
 )
 
@@ -204,16 +202,14 @@ class _DualAdapterImpl(nn.Module):
 
 
 class SD2_RefAdapter(nn.Module):
-    STRATEGIES = ["lca", "spade", "dual", "cos_sim", "cat", "rwkv"]
+    STRATEGIES = ["lca", "dual", "cat", "rwkv"]
 
     _ENCODER_MAP = {
         "lca": (
             SR_Ref_Encoder_LCA,
             {"out_channel": 192, "in_sr_channel": 3, "in_ref_channel": 3},
         ),
-        "spade": (SR_Ref_Encoder_Spade, {"out_channel": 192}),
         "dual": (SR_Encoder, {"out_channel": 192, "in_channel": 3}),
-        "cos_sim": (SR_Ref_Encoder_Cos_Sim, {"out_channel": 192}),
         "cat": (_ConcatEncoderWrapper, {"out_channel": 192}),
         "rwkv": (RefDiffRWKV, {"out_channel": 192}),
     }
@@ -376,7 +372,7 @@ if __name__ == "__main__":
         print("  ❌ RWKV build failed!")
 
     print("\n--- Testing CRefDiff strategies ---")
-    for name in ["lca", "spade", "dual", "cos_sim", "cat"]:
+    for name in ["lca", "dual", "cat"]:
         m = models.get(name)
         if m is not None:
             print(f"  ✅ {name}: {m}")

@@ -153,6 +153,7 @@ class VRWKV_ChannelMix(nn.Module):
 
 class Downsample(nn.Module):
     """空间减半、通道翻倍。H/4 x W/4 -> H/8 x W/8, C -> 2C。"""
+
     def __init__(self, n_feat):
         super().__init__()
         self.body = nn.Sequential(
@@ -257,6 +258,9 @@ class RefDiffRWKV(nn.Module):
         scale2:  60x60  (H/8)
         scale3:  60x60  (H/8)
     输出: 60x60
+
+    注意：数据集尺寸固定（Ref = ref_size × ref_size），位置编码在 __init__
+    中预计算并 register_buffer，前向直接取用，避免每次 numpy 计算与 CPU→GPU 拷贝。
     """
 
     def __init__(
@@ -266,11 +270,13 @@ class RefDiffRWKV(nn.Module):
         patch_size: int = 4,
         embed_dim: int = 384,
         upsample_mode: str = "bilinear",
+        ref_size: int = 480,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.out_channel = out_channel
+        self.ref_size = ref_size
 
         if upsample_mode == "bilinear":
             self.lr_upsampler = lr_upsample_bilinear
@@ -299,7 +305,9 @@ class RefDiffRWKV(nn.Module):
         self.lca1 = LocalCrossAttention(embed_dim, window_size=8, num_heads=4)
         self.mask1 = MaskAttention(embed_dim)
         # H/4 -> H/8, 通道 embed_dim -> 2*embed_dim
-        self.down1 = Downsample(embed_dim)
+        # SR(融合后) 与 Ref(纯特征) 语义不同，各用一套下采样权重
+        self.down1 = Downsample(embed_dim)  # 作用于融合后的 SR 分支
+        self.down1_ref = Downsample(embed_dim)  # 作用于 Ref 分支
 
         # ===================== Scale 2: H/8 =====================
         self.lr_block2 = RWKVBlock(embed_dim * 2)
@@ -315,6 +323,15 @@ class RefDiffRWKV(nn.Module):
 
         # 输出投影：concat(LCA, Mask) -> out_channel
         self.last_linear = nn.Conv2d(embed_dim * 4, out_channel, 1, bias=False)
+
+        # ===== 预计算固定尺寸的 sincos 位置编码 =====
+        # 数据集尺寸固定：Ref = ref_size × ref_size，patch_h/patch_w 固定
+        patch_h = ref_size // patch_size
+        patch_w = ref_size // patch_size
+        pos_embed_np = get_2d_sincos_pos_embed(embed_dim, patch_h, patch_w)
+        pos_embed = torch.from_numpy(pos_embed_np).float().unsqueeze(0)  # [1, N, C]
+        # persistent=False：可随时重算，不写入 state_dict，避免污染 checkpoint
+        self.register_buffer("pos_embed", pos_embed, persistent=False)
 
     @staticmethod
     def _to_spatial(tokens, H, W):
@@ -361,6 +378,11 @@ class RefDiffRWKV(nn.Module):
         assert (
             H % self.patch_size == 0 and W % self.patch_size == 0
         ), f"Input size {H}x{W} must be divisible by patch_size {self.patch_size}"
+        # 位置编码为固定尺寸预计算，校验输入与预设一致
+        assert H == self.ref_size and W == self.ref_size, (
+            f"输入 Ref 尺寸 {H}x{W} 与预设 ref_size={self.ref_size} 不一致，"
+            f"预计算的 pos_embed 无法对齐"
+        )
 
         patch_h = H // self.patch_size
         patch_w = W // self.patch_size
@@ -372,13 +394,9 @@ class RefDiffRWKV(nn.Module):
         sr_tokens = self.lr_patch_embed(LR_up)
         ref_tokens = self.ref_patch_embed(Ref)
 
-        # 位置编码（仅加一次）
-        pos_embed_np = get_2d_sincos_pos_embed(self.embed_dim, patch_h, patch_w)
-        pos_embed = (
-            torch.from_numpy(pos_embed_np).float().to(Ref.device).unsqueeze(0)
-        )
-        sr_tokens = sr_tokens + pos_embed
-        ref_tokens = ref_tokens + pos_embed
+        # 位置编码：__init__ 预计算好的 buffer，随模型自动在正确 device/dtype 上
+        sr_tokens = sr_tokens + self.pos_embed
+        ref_tokens = ref_tokens + self.pos_embed
 
         # 用于收集返回的 map
         cos_maps = []
@@ -405,9 +423,9 @@ class RefDiffRWKV(nn.Module):
         # 先融合再下采样，对应 LCA 的 sr_cond = lca + mask
         sr_fused = sr_cond1 + sr_cond2
 
-        # LR 分支下采样；Ref 分支也要继续编码
+        # LR(融合后) 与 Ref 分支各用独立的下采样权重
         sr_fused = self.down1(sr_fused)
-        ref_feat = self.down1(ref_feat)
+        ref_feat = self.down1_ref(ref_feat)
         patch_h2, patch_w2 = patch_h // 2, patch_w // 2
 
         sr_tokens = self._to_tokens(sr_fused)
@@ -476,6 +494,7 @@ class RefDiffRWKV(nn.Module):
             patch_size=getattr(args, "patch_size", 4),
             embed_dim=getattr(args, "embed_dim", 384),
             upsample_mode=getattr(args, "upsample_mode", "bilinear"),
+            ref_size=getattr(args, "ref_size", 480),
         )
 
     def get_parameter_count(self) -> dict:
@@ -501,7 +520,7 @@ class RefDiffRWKV(nn.Module):
             "lca_mask": nn.ModuleList(
                 [self.lca1, self.mask1, self.lca2, self.mask2, self.lca3, self.mask3]
             ),
-            "down1": self.down1,
+            "down1": nn.ModuleList([self.down1, self.down1_ref]),
             "last_linear": self.last_linear,
         }
 
