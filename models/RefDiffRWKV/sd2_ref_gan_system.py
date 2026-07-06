@@ -343,7 +343,7 @@ class SD2RefGANSystem(LightningModule):
             "val/loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
         )
         self.log(
-            "val-loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
+            "val_loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
         )
 
         with torch.no_grad():
@@ -351,13 +351,13 @@ class SD2RefGANSystem(LightningModule):
                 batch, steps=self.sample_steps, sr_model=self.sr_model
             )
 
-        # 计算指标
+        # 计算指标 — 扩散采样结果
         if self.iqa is not None:
             sr_batch = val_results["samples"]  # (B, C, H, W), [0,1]
             hq_batch = val_results["hq"]
             agg = {}
             for i in range(len(sr_batch)):
-                sr_np = sr_batch[i].cpu().numpy()  # (C, H, W)
+                sr_np = sr_batch[i].cpu().numpy()
                 hq_np = hq_batch[i].cpu().numpy()
                 m = self.iqa.evaluate_single(sr_np, hq_np)
                 for k, v in m.items():
@@ -365,6 +365,21 @@ class SD2RefGANSystem(LightningModule):
             n = len(sr_batch)
             for k, v in agg.items():
                 self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
+
+        # ── 新增：SR prior 单独评估 ──
+        if self.iqa is not None and self.sr_model is not None:
+            with torch.no_grad():
+                sr_prior_pixel = self.sr_model(lr, ref)  # [-1, 1]
+                sr_prior_01 = torch.clamp((sr_prior_pixel + 1.0) / 2.0, 0.0, 1.0)
+            agg_sr = {}
+            for i in range(len(sr_prior_01)):
+                sr_np = sr_prior_01[i].cpu().numpy()
+                hq_np = hq_batch[i].cpu().numpy()
+                m = self.iqa.evaluate_single(sr_np, hq_np)
+                for k, v in m.items():
+                    agg_sr[k] = agg_sr.get(k, 0.0) + v
+            for k, v in agg_sr.items():
+                self.log(f"val/sr_{k}", v / n, on_epoch=True, prog_bar=True)
 
         # 保存图像
         save_dir = os.path.join(
