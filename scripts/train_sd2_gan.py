@@ -5,7 +5,7 @@ SD2RefGANSystem 训练脚本
 
 用法:
     python scripts/train_sd2_gan.py --config configs/sd2_ref_gan_config.yaml
-    python scripts/train_sd2_gan.py --config configs/sd2_ref_gan_config.yaml --resume checkpoints/.../last.ckpt
+    python scripts/train_sd2_gan.py --config configs/sd2_ref_gan_config.yaml --resume checkpoints/sd2_ref_gan/last.ckpt
 """
 
 import sys
