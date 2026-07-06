@@ -70,13 +70,15 @@ def build_sr_model(cfg: dict):
             for k, v in ckpt.items():
                 k = k.replace("module.", "")
                 if k.startswith("model."):
-                    k = k[len("model."):]
+                    k = k[len("model.") :]
                 state_dict[k] = v
             ckpt = state_dict
         model.load_state_dict(ckpt, strict=False)
         print(f"✅ Loaded SR prior weights from {ckpt_path}")
     elif mc.get("sr_enabled", False):
-        print("⚠️ sr_enabled=True but sr.ckpt_path is null; using randomly initialized SR prior")
+        print(
+            "⚠️ sr_enabled=True but sr.ckpt_path is null; using randomly initialized SR prior"
+        )
 
     if mc.get("sr_fixed", True):
         model.eval()
@@ -101,6 +103,74 @@ class NaNMonitorCallback(Callback):
                 print(f"[Inf grad] {name} | step={trainer.global_step}")
 
 
+class BestAllMetricsCallback(Callback):
+    """四个验证指标全部刷新（PSNR↑, SSIM↑, LPIPS↓, DISTS↓）时保留验证图。"""
+
+    def __init__(self):
+        self.best_psnr = -float("inf")
+        self.best_ssim = -float("inf")
+        self.best_lpips = float("inf")
+        self.best_dists = float("inf")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        psnr = metrics.get("val/psnr")
+        ssim = metrics.get("val/ssim")
+        lpips = metrics.get("val/lpips")
+        dists = metrics.get("val/dists")
+
+        if None in (psnr, ssim, lpips, dists):
+            return
+
+        psnr_v = psnr.item()
+        ssim_v = ssim.item()
+        lpips_v = lpips.item()
+        dists_v = dists.item()
+
+        improved = (
+            psnr_v > self.best_psnr
+            and ssim_v > self.best_ssim
+            and lpips_v < self.best_lpips
+            and dists_v < self.best_dists
+        )
+
+        log_dir = trainer.logger.save_dir if trainer.logger else "."
+        tmp_dir = os.path.join(log_dir, "validation_tmp")
+
+        if improved:
+            self.best_psnr = psnr_v
+            self.best_ssim = ssim_v
+            self.best_lpips = lpips_v
+            self.best_dists = dists_v
+
+            target_dir = os.path.join(
+                log_dir, f"validation_best_step_{trainer.global_step}"
+            )
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+            if os.path.exists(tmp_dir):
+                shutil.move(tmp_dir, target_dir)
+
+            pl_module.log("val/best_saved_step", float(trainer.global_step))
+        else:
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+
+    def state_dict(self):
+        return {
+            "best_psnr": self.best_psnr,
+            "best_ssim": self.best_ssim,
+            "best_lpips": self.best_lpips,
+            "best_dists": self.best_dists,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.best_psnr = state_dict.get("best_psnr", -float("inf"))
+        self.best_ssim = state_dict.get("best_ssim", -float("inf"))
+        self.best_lpips = state_dict.get("best_lpips", float("inf"))
+        self.best_dists = state_dict.get("best_dists", float("inf"))
+
+
 # ============================================================
 # 工具函数
 # ============================================================
@@ -116,9 +186,16 @@ def load_weights(model: torch.nn.Module, ckpt_path: str):
 
     new_state_dict = {}
     for k, v in state_dict.items():
-        for pre in ["model.", "model_sr.", "model_diff.", "model_enhance.", "generator.", "discriminator."]:
+        for pre in [
+            "model.",
+            "model_sr.",
+            "model_diff.",
+            "model_enhance.",
+            "generator.",
+            "discriminator.",
+        ]:
             if k.startswith(pre):
-                k = k[len(pre):]
+                k = k[len(pre) :]
                 break
         new_state_dict[k] = v
 
@@ -183,7 +260,9 @@ def build_dataloaders(cfg: dict):
         pin_memory=True,
         drop_last=True,
         persistent_workers=(data_cfg["num_workers"] > 0),
-        prefetch_factor=data_cfg.get("prefetch_factor", 4) if data_cfg["num_workers"] > 0 else None,
+        prefetch_factor=(
+            data_cfg.get("prefetch_factor", 4) if data_cfg["num_workers"] > 0 else None
+        ),
     )
 
     val_loader = DataLoader(
@@ -310,6 +389,7 @@ def build_trainer(
 
     callbacks = [
         NaNMonitorCallback(),
+        BestAllMetricsCallback(),
         EarlyStopping(
             monitor="val/loss_diff",
             patience=train_cfg.get("early_stopping_patience", 30),
@@ -389,16 +469,22 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"{'='*60}")
     print(f"  SD2RefGANSystem 训练")
     print(f"  数据根目录    : {cfg['data']['root']}")
-    print(f"  Batch size    : {cfg['data']['batch_size']} x accumulate {mc.get('accumulate_grad_batches', 8)}")
+    print(
+        f"  Batch size    : {cfg['data']['batch_size']} x accumulate {mc.get('accumulate_grad_batches', 8)}"
+    )
     print(f"  训练样本数    : {len(train_loader.dataset)}")
     print(f"  验证样本数    : {len(val_loader.dataset)}")
     print(f"  测试样本数    : {len(test_loader.dataset)}")
     print(f"  Strategy      : {mc.get('strategy', 'rwkv')}")
     print(f"  RWKN embed_dim: {mc.get('rwkv_cfg', {}).get('embed_dim', 192)}")
     print(f"  使用 Discriminator : {mc.get('use_discriminator', True)}")
-    print(f"  GAN λ (sem/tex) : {mc.get('lambda_gan', 0.0)} / {mc.get('lambda_gan_texture', 0.0)}")
+    print(
+        f"  GAN λ (sem/tex) : {mc.get('lambda_gan', 0.0)} / {mc.get('lambda_gan_texture', 0.0)}"
+    )
     print(f"  LPIPS λ       : {mc.get('lambda_lpips', 0.0)}")
-    print(f"  LR (G/D_sem/D_tex): {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 5e-6)} / {mc.get('lr_D_texture', 1e-6)}")
+    print(
+        f"  LR (G/D_sem/D_tex): {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 5e-6)} / {mc.get('lr_D_texture', 1e-6)}"
+    )
     print(f"  最大 epoch    : {max_epochs}")
     print(f"  CFG dropout   : {mc.get('cfg_drop_prob', 0.1)}")
     print(f"  Semantic      : {mc.get('use_semantic', True)}")

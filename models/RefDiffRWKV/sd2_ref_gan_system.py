@@ -342,9 +342,6 @@ class SD2RefGANSystem(LightningModule):
         self.log(
             "val/loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
         )
-        self.log(
-            "val_loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
-        )
 
         with torch.no_grad():
             val_results = self.generator.log_images(
@@ -366,7 +363,7 @@ class SD2RefGANSystem(LightningModule):
             for k, v in agg.items():
                 self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
 
-        # ── 新增：SR prior 单独评估 ──
+        # SR prior 单独评估
         if self.iqa is not None and self.sr_model is not None:
             with torch.no_grad():
                 sr_prior_pixel = self.sr_model(lr, ref)  # [-1, 1]
@@ -381,34 +378,26 @@ class SD2RefGANSystem(LightningModule):
             for k, v in agg_sr.items():
                 self.log(f"val/sr_{k}", v / n, on_epoch=True, prog_bar=True)
 
-        # 保存图像
-        save_dir = os.path.join(
-            self.logger.save_dir, "validation", f"step--{self.global_step}"
-        )
-        os.makedirs(save_dir, exist_ok=True)
+        # ── 每 4 张保存一张到临时目录 ──
+        if batch_idx % 4 == 0:
+            import shutil
 
-        hr_batch_tensor = val_results["hq"].detach().cpu()
-        sr_batch_tensor = val_results["samples"].detach().cpu()
-        this_psnr = 0.0
-        for i in range(len(hr_batch_tensor)):
-            curr_hr = hr_batch_tensor[i].numpy().astype(np.float64)
-            curr_sr = sr_batch_tensor[i].numpy().astype(np.float64)
-            mse = np.mean((curr_hr - curr_sr) ** 2)
-            curr_psnr = 20 * math.log10(1.0 / math.sqrt(max(mse, 1e-10)))
-            this_psnr += curr_psnr
-        this_psnr /= len(hr_batch_tensor)
-        self.log("val/psnr", this_psnr, on_epoch=True, prog_bar=True)
+            save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
+            if batch_idx == 0 and os.path.exists(save_dir):
+                shutil.rmtree(save_dir)
+            os.makedirs(save_dir, exist_ok=True)
 
-        for image_key in val_results:
-            os.makedirs(os.path.join(save_dir, image_key), exist_ok=True)
-            image = val_results[image_key].detach().cpu()
-            for i in range(len(image)):
-                curr_img = image[i].permute(1, 2, 0).numpy()
-                curr_img = (curr_img * 255).clip(0, 255).astype(np.uint8)
-                filename = f"{batch_idx}_{i}_{image_key}.png"
-                path = os.path.join(save_dir, image_key, filename)
-                Image.fromarray(curr_img).save(path)
-        return
+            for image_key in val_results:
+                os.makedirs(os.path.join(save_dir, image_key), exist_ok=True)
+                image = val_results[image_key].detach().cpu()
+                for i in range(len(image)):
+                    curr_img = image[i].permute(1, 2, 0).numpy()
+                    curr_img = (curr_img * 255).clip(0, 255).astype(np.uint8)
+                    filename = f"b{batch_idx}_{i}_{image_key}.png"
+                    path = os.path.join(save_dir, image_key, filename)
+                    Image.fromarray(curr_img).save(path)
+
+        return loss_diff
 
     def on_validation_epoch_start(self):
         if self.discriminator is not None:
