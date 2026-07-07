@@ -68,12 +68,18 @@ def build_sr_model(cfg: dict):
         if isinstance(ckpt, dict):
             state_dict = {}
             for k, v in ckpt.items():
-                k = k.replace("module.", "")
-                if k.startswith("model."):
+                if k.startswith("model_sr."):
+                    k = k[len("model_sr.") :]
+                elif k.startswith("model."):
                     k = k[len("model.") :]
+                k = k.replace("module.", "")
                 state_dict[k] = v
             ckpt = state_dict
-        model.load_state_dict(ckpt, strict=False)
+        missing, unexpected = model.load_state_dict(ckpt, strict=False)
+        if missing:
+            print(f"⚠️  SR prior 缺失键 ({len(missing)}): {missing[:3]}")
+        if unexpected:
+            print(f"⚠️  SR prior 多余键 ({len(unexpected)}): {unexpected[:3]}")
         print(f"✅ Loaded SR prior weights from {ckpt_path}")
     elif mc.get("sr_enabled", False):
         print(
