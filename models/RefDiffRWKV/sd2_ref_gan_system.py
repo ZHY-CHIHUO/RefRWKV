@@ -342,6 +342,9 @@ class SD2RefGANSystem(LightningModule):
         self.log(
             "val/loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
         )
+        self.log(
+            "val_loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
+        )
 
         with torch.no_grad():
             val_results = self.generator.log_images(

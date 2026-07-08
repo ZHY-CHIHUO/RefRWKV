@@ -110,7 +110,7 @@ class NaNMonitorCallback(Callback):
 
 
 class BestAllMetricsCallback(Callback):
-    """四个验证指标全部刷新（PSNR↑, SSIM↑, LPIPS↓, DISTS↓）时保留验证图。"""
+    """任一验证指标刷新（PSNR↑, SSIM↑, LPIPS↓, DISTS↓）时保留验证图。"""
 
     def __init__(self):
         self.best_psnr = -float("inf")
@@ -133,30 +133,32 @@ class BestAllMetricsCallback(Callback):
         lpips_v = lpips.item()
         dists_v = dists.item()
 
-        improved = (
-            psnr_v > self.best_psnr
-            and ssim_v > self.best_ssim
-            and lpips_v < self.best_lpips
-            and dists_v < self.best_dists
-        )
+        improved_reasons = []
+        if psnr_v > self.best_psnr:
+            self.best_psnr = psnr_v
+            improved_reasons.append("psnr")
+        if ssim_v > self.best_ssim:
+            self.best_ssim = ssim_v
+            improved_reasons.append("ssim")
+        if lpips_v < self.best_lpips:
+            self.best_lpips = lpips_v
+            improved_reasons.append("lpips")
+        if dists_v < self.best_dists:
+            self.best_dists = dists_v
+            improved_reasons.append("dists")
 
         log_dir = trainer.logger.save_dir if trainer.logger else "."
         tmp_dir = os.path.join(log_dir, "validation_tmp")
 
-        if improved:
-            self.best_psnr = psnr_v
-            self.best_ssim = ssim_v
-            self.best_lpips = lpips_v
-            self.best_dists = dists_v
-
+        if improved_reasons:
+            tag = "+".join(improved_reasons)
             target_dir = os.path.join(
-                log_dir, f"validation_best_step_{trainer.global_step}"
+                log_dir, f"validation_best_step_{trainer.global_step}_{tag}"
             )
             if os.path.exists(target_dir):
                 shutil.rmtree(target_dir)
             if os.path.exists(tmp_dir):
                 shutil.move(tmp_dir, target_dir)
-
             pl_module.log("val/best_saved_step", float(trainer.global_step))
         else:
             if os.path.exists(tmp_dir):
