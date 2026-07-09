@@ -48,6 +48,10 @@ class SD2RefGANSystem(LightningModule):
         fr_metrics: Optional[List[str]] = None,
         # Better Start：推理时用 SR prior 做 warm-start 初始化
         sr_model: Optional[torch.nn.Module] = None,
+        # Better Start + MSE Guidance 推理参数 ──
+        t_start: Optional[int] = None,  # Better Start 加噪目标时间步（None=纯噪声起点）
+        guidance_scale: float = 0.0,  # MSE Guidance 引导强度（0=关闭）
+        t_stop: int = 200,  # MSE Guidance 仅在 t > t_stop 时启用
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["generator", "discriminator", "sr_model"])
@@ -61,6 +65,11 @@ class SD2RefGANSystem(LightningModule):
         self.lambda_lpips = lambda_lpips
         self.accumulate_grad_batches = accumulate_grad_batches
         self.sample_steps = sample_steps
+
+        # ── NEW ──
+        self.t_start = t_start
+        self.guidance_scale = guidance_scale
+        self.t_stop = t_stop
 
         # ═══════════════════════════════════════
         #  手动优化 + AMP + 梯度累积
@@ -163,6 +172,44 @@ class SD2RefGANSystem(LightningModule):
         self._d_sem_accum_count = checkpoint.get("d_sem_accum_count", 0)
         self._d_tex_accum_count = checkpoint.get("d_tex_accum_count", 0)
 
+    def load_state_dict(self, state_dict, strict=True):
+        filtered = {
+            k: v for k, v in state_dict.items() if not k.startswith("sr_model.")
+        }
+        skipped = len(state_dict) - len(filtered)
+        if skipped:
+            print(f"🔒 跳过 {skipped} 个 sr_model 键，使用 build_sr_model 加载的权重")
+        return super().load_state_dict(filtered, strict=False)
+
+    def _override_lr_on_resume(self):
+        """从 checkpoint 恢复后，用 hparams 中的 LR 覆盖 optimizer。"""
+        optimizers = self.optimizers()
+        if not optimizers:
+            return
+
+        # G optimizer（idx 0）
+        target_g_lr = self.hparams.g_lr
+        for pg in optimizers[self._opt_idx["g"]].param_groups:
+            old = pg["lr"]
+            pg["lr"] = target_g_lr
+        print(f"🔧 G  LR: {old:.1e} → {target_g_lr:.1e}")
+
+        # D_sem optimizer（如果有）
+        idx_sem = self._opt_idx.get("d_sem")
+        if idx_sem is not None:
+            for pg in optimizers[idx_sem].param_groups:
+                old = pg["lr"]
+                pg["lr"] = self.hparams.d_lr_sem
+            print(f"🔧 D_sem LR: {old:.1e} → {self.hparams.d_lr_sem:.1e}")
+
+        # D_tex optimizer（如果有）
+        idx_tex = self._opt_idx.get("d_tex")
+        if idx_tex is not None:
+            for pg in optimizers[idx_tex].param_groups:
+                old = pg["lr"]
+                pg["lr"] = self.hparams.d_lr_tex
+            print(f"🔧 D_tex LR: {old:.1e} → {self.hparams.d_lr_tex:.1e}")
+
     # ═══════════════════════════════════════════════════════
     #  训练入口：按 phase 交替 G / D
     # ═══════════════════════════════════════════════════════
@@ -243,7 +290,7 @@ class SD2RefGANSystem(LightningModule):
         return loss.detach() * self.accumulate_grad_batches
 
     # ═══════════════════════════════════════════════════════
-    #  Discriminator Step
+    #  Discriminator Step  （不变——保持旧路径，不加 Better Start / Guidance）
     # ═══════════════════════════════════════════════════════
     def _discriminator_step(self, batch, batch_idx):
         if self.discriminator is None:
@@ -347,8 +394,14 @@ class SD2RefGANSystem(LightningModule):
         )
 
         with torch.no_grad():
+            # 传入 Better Start + MSE Guidance 参数 ──
             val_results = self.generator.log_images(
-                batch, steps=self.sample_steps, sr_model=self.sr_model
+                batch,
+                steps=self.sample_steps,
+                sr_model=self.sr_model,
+                t_start=self.t_start,
+                guidance_scale=self.guidance_scale,
+                t_stop=self.t_stop,
             )
 
         # 计算指标 — 扩散采样结果
@@ -365,21 +418,8 @@ class SD2RefGANSystem(LightningModule):
             n = len(sr_batch)
             for k, v in agg.items():
                 self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
-
-        # SR prior 单独评估
-        if self.iqa is not None and self.sr_model is not None:
-            with torch.no_grad():
-                sr_prior_pixel = self.sr_model(lr, ref)  # [-1, 1]
-                sr_prior_01 = torch.clamp((sr_prior_pixel + 1.0) / 2.0, 0.0, 1.0)
-            agg_sr = {}
-            for i in range(len(sr_prior_01)):
-                sr_np = sr_prior_01[i].cpu().numpy()
-                hq_np = hq_batch[i].cpu().numpy()
-                m = self.iqa.evaluate_single(sr_np, hq_np)
-                for k, v in m.items():
-                    agg_sr[k] = agg_sr.get(k, 0.0) + v
-            for k, v in agg_sr.items():
-                self.log(f"val/sr_{k}", v / n, on_epoch=True, prog_bar=True)
+                if k == "psnr":
+                    self.log(f"val_psnr", v / n, on_epoch=True, prog_bar=True)
 
         # ── 每 4 张保存一张到临时目录 ──
         if batch_idx % 4 == 0:
@@ -406,6 +446,7 @@ class SD2RefGANSystem(LightningModule):
         if self.discriminator is not None:
             self.discriminator.eval()
 
-    def on_fit_start(self):
+    def on_train_start(self):
         if self.sr_model is not None:
             self.sr_model.to(self.device)
+        self._override_lr_on_resume()

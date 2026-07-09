@@ -9,7 +9,9 @@ sd2_ref_generator.py — SD2 Ref-guided Generator (latent ε-prediction)
   3. 借鉴 ControlLDM 的 get_input / p_losses / sample_log / log_images 接口。
 """
 
-import math
+import os
+import numpy as np
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -360,13 +362,101 @@ class SD2RefGenerator(LightningModule):
         return target.shape[-2] // 8, target.shape[-1] // 8
 
     @torch.no_grad()
-    def sample_log(self, lr, ref, steps=50, sr_model=None, hr=None):
+    def sample_log(
+        self,
+        lr,
+        ref,
+        steps=50,
+        sr_model=None,
+        hr=None,
+        t_start=None,  # Better Start: 加噪目标时间步（None=不用，纯噪声）
+        guidance_scale=0.0,  # MSE Guidance: 引导强度（0=不用）
+        t_stop=200,  # MSE Guidance: 只在前几步（t > t_stop）引导
+    ):
+        bsz = lr.shape[0]
+        device = self.device
+
+        # ═══════════════════════════════════════
+        # Step 1: 初始化 x_t
+        # ═══════════════════════════════════════
+        sr_target = None  # MSE Guidance 的 target latent
+
+        if sr_model is not None and t_start is not None:
+            # ── Better Start: SR prior → 加噪到 t_start ──
+            sr_prior = sr_model(lr, ref)
+            sr_latent = self.encode_latent(sr_prior)  # 干净 latent
+            sr_target = sr_latent.detach().clone()  # 保存为 guidance target
+
+            noise = torch.randn_like(sr_latent)
+            t_tensor = torch.full((bsz,), t_start, device=device, dtype=torch.long)
+            x_t = self.noise_scheduler.add_noise(sr_latent, noise, t_tensor)
+
+        elif sr_model is not None:
+            # ── 仅 MSE Guidance（无 Better Start）: 纯噪声起点 ──
+            sr_prior = sr_model(lr, ref)
+            sr_target = self.encode_latent(sr_prior).detach()
+
+            latent_h, latent_w = self._infer_latent_size(ref, hr)
+            x_t = torch.randn(
+                bsz,
+                self.unet.config.in_channels,
+                latent_h,
+                latent_w,
+                device=device,
+                dtype=lr.dtype,
+            )
+
+        else:
+            # ── 原始纯噪声路径 ──
+            latent_h, latent_w = self._infer_latent_size(ref, hr)
+            x_t = torch.randn(
+                bsz,
+                self.unet.config.in_channels,
+                latent_h,
+                latent_w,
+                device=device,
+                dtype=lr.dtype,
+            )
+
+        # ═══════════════════════════════════════
+        # Step 2: 去噪循环
+        # ═══════════════════════════════════════
+        self.noise_scheduler.set_timesteps(steps, device=device)
+
+        # 如果有 Better Start，只取 t <= t_start 的时间步
+        timesteps = self.noise_scheduler.timesteps
+        if t_start is not None:
+            timesteps = [t for t in timesteps if t <= t_start]
+
+        for t in timesteps:
+            t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
+
+            # ── MSE Guidance: 用 SR target 修正去噪方向 ──
+            if sr_target is not None and guidance_scale > 0 and t > t_stop:
+                with torch.enable_grad():
+                    x_t.requires_grad_(True)
+                    noise_pred = self.apply_model(x_t, t_tensor, lr, ref)
+                    pred_x0 = self._predict_x0_from_eps(x_t, t_tensor, noise_pred)
+
+                    loss_guidance = F.mse_loss(pred_x0, sr_target)
+                    grad = torch.autograd.grad(loss_guidance, x_t)[0]
+                    x_t = x_t.detach() - guidance_scale * grad
+                noise_pred = noise_pred.detach()
+            else:
+                noise_pred = self.apply_model(x_t, t_tensor, lr, ref)
+
+            x_t = self.noise_scheduler.step(noise_pred, t, x_t).prev_sample
+
+        return self.decode_latent_eval(x_t)
+
+    @torch.no_grad()
+    def visual_steps(self, lr, ref, steps=50, sr_model=None, hr=None):
+        """返回采样过程中每一步的中间图像 [0, 1]，用于排查蓝色偏等质量问题。"""
         bsz = lr.shape[0]
         device = self.device
 
         if sr_model is not None:
-            with torch.no_grad():
-                sr_prior = sr_model(lr, ref)
+            sr_prior = sr_model(lr, ref)
             x_t = self.encode_latent(sr_prior)
         else:
             latent_h, latent_w = self._infer_latent_size(ref, hr)
@@ -380,13 +470,50 @@ class SD2RefGenerator(LightningModule):
             )
 
         self.noise_scheduler.set_timesteps(steps, device=device)
+        pixel_each_step = []
+
         for t in self.noise_scheduler.timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
             noise_pred = self.apply_model(x_t, t_tensor, lr, ref)
-            # 采样循环内 t 为单一时间步，scheduler.step 接受标量
             x_t = self.noise_scheduler.step(noise_pred, t, x_t).prev_sample
+            # 解码当前步的 latent → pixel
+            current_pixel = self.decode_latent_eval(x_t)
+            current_pixel_01 = torch.clamp((current_pixel + 1.0) / 2.0, 0.0, 1.0)
+            pixel_each_step.append(current_pixel_01)
 
-        return self.decode_latent_eval(x_t)
+        return pixel_each_step  # list of (B,C,H,W) tensors, 从第一步到最后一步
+
+    @torch.no_grad()
+    def validation_inference(self, batch, save_dir, steps=50, sr_model=None):
+        """验证推理，记录推理时间和显存，保存结果图。"""
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+        lr, ref, hr = self.get_input(batch)
+
+        starter = torch.cuda.Event(enable_timing=True)
+        ender = torch.cuda.Event(enable_timing=True)
+
+        starter.record()
+        val_results = self.log_images(batch, steps=steps, sr_model=sr_model)
+        ender.record()
+        torch.cuda.synchronize()
+        elapsed_time = starter.elapsed_time(ender)  # ms
+        max_memory = torch.cuda.memory_allocated() / 1024**2  # MB
+
+        print(f"[Inference Time] {elapsed_time:.2f} ms")
+        print(f"[Current Memory] {max_memory:.2f} MB")
+
+        os.makedirs(save_dir, exist_ok=True)
+        for image_key in val_results:
+            image = val_results[image_key].detach().cpu()
+            for i in range(len(image)):
+                curr_img = image[i].permute(1, 2, 0).numpy()
+                curr_img = (curr_img * 255).clip(0, 255).astype(np.uint8)
+                filename = f"{i}_{image_key}.png"
+                path = os.path.join(save_dir, filename)
+                Image.fromarray(curr_img).save(path)
 
     @torch.no_grad()
     def log_images(self, batch, steps=50, sr_model=None):
