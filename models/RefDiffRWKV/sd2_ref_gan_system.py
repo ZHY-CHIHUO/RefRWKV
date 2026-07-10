@@ -293,7 +293,10 @@ class SD2RefGANSystem(LightningModule):
     #  Discriminator Step  （不变——保持旧路径，不加 Better Start / Guidance）
     # ═══════════════════════════════════════════════════════
     def _discriminator_step(self, batch, batch_idx):
-        if self.discriminator is None:
+        # 如果 D 为空或 GAN loss 都没开，直接切回 G 阶段 ──
+        if self.discriminator is None or (
+            self.lambda_gan_semantic == 0.0 and self.lambda_gan_texture == 0.0
+        ):
             self._gd_phase = 0
             return None
 
@@ -307,13 +310,12 @@ class SD2RefGANSystem(LightningModule):
         # lr, ref, hr ∈ [-1, 1]
 
         # 生成 fake（无梯度，节省显存）
-        self.generator.eval()
+        # 去掉 self.generator.eval() 防止触发底层 SystemError
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 fake = self.generator.generate_sr(
                     lr, ref, steps=self.sample_steps, sr_model=self.sr_model, hr=hr
                 )
-        self.generator.train()
 
         # generate_sr 始终返回 [0, 1] → 映射到 [-1, 1]，与 real/ref 对齐
         fake = fake.detach().float() * 2.0 - 1.0
@@ -419,7 +421,7 @@ class SD2RefGANSystem(LightningModule):
             for k, v in agg.items():
                 self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
                 if k == "psnr":
-                    self.log(f"val_psnr", v / n, on_epoch=True, prog_bar=True)
+                    self.log(f"val_psnr", v / n, on_epoch=True)
 
         # ── 每 4 张保存一张到临时目录 ──
         if batch_idx % 4 == 0:

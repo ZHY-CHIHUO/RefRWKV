@@ -516,9 +516,26 @@ class SD2RefGenerator(LightningModule):
                 Image.fromarray(curr_img).save(path)
 
     @torch.no_grad()
-    def log_images(self, batch, steps=50, sr_model=None):
+    def log_images(
+        self,
+        batch,
+        steps=50,
+        sr_model=None,
+        t_start=None,
+        guidance_scale=0.0,
+        t_stop=200,
+    ):
         lr, ref, hr = self.get_input(batch)
-        samples = self.sample_log(lr, ref, steps=steps, sr_model=sr_model, hr=hr)
+        samples = self.sample_log(
+            lr,
+            ref,
+            steps=steps,
+            sr_model=sr_model,
+            hr=hr,
+            t_start=t_start,
+            guidance_scale=guidance_scale,
+            t_stop=t_stop,
+        )
         return {
             "lq": (lr + 1.0) / 2.0,
             "ref": (ref + 1.0) / 2.0,
@@ -527,9 +544,28 @@ class SD2RefGenerator(LightningModule):
         }
 
     @torch.no_grad()
-    def generate_sr(self, lr, ref, steps=50, sr_model=None, hr=None):
+    def generate_sr(
+        self,
+        lr,
+        ref,
+        steps=50,
+        sr_model=None,
+        hr=None,
+        t_start=None,
+        guidance_scale=0.0,
+        t_stop=200,
+    ):
         """返回 pixel 空间 SR 图像 [0, 1]。"""
-        samples = self.sample_log(lr, ref, steps=steps, sr_model=sr_model, hr=hr)
+        samples = self.sample_log(
+            lr,
+            ref,
+            steps=steps,
+            sr_model=sr_model,
+            hr=hr,
+            t_start=t_start,
+            guidance_scale=guidance_scale,
+            t_stop=t_stop,
+        )
         return (samples + 1.0) / 2.0
 
     # ═══════════════════════════════════════════════════════
