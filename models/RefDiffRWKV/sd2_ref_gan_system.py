@@ -423,7 +423,7 @@ class SD2RefGANSystem(LightningModule):
                 if k == "psnr":
                     self.log(f"val_psnr", v / n, on_epoch=True)
 
-        # ── 每 4 张保存一张到临时目录 ──
+        # ── 每 4 个 batch 保存一张拼接对比图 ──
         if batch_idx % 4 == 0:
             import shutil
 
@@ -432,15 +432,34 @@ class SD2RefGANSystem(LightningModule):
                 shutil.rmtree(save_dir)
             os.makedirs(save_dir, exist_ok=True)
 
-            for image_key in val_results:
-                os.makedirs(os.path.join(save_dir, image_key), exist_ok=True)
-                image = val_results[image_key].detach().cpu()
-                for i in range(len(image)):
-                    curr_img = image[i].permute(1, 2, 0).numpy()
-                    curr_img = (curr_img * 255).clip(0, 255).astype(np.uint8)
-                    filename = f"b{batch_idx}_{i}_{image_key}.png"
-                    path = os.path.join(save_dir, image_key, filename)
-                    Image.fromarray(curr_img).save(path)
+            images_to_concat = []
+            for image_key in ["lq", "ref", "hq", "samples"]:
+                if image_key not in val_results:
+                    continue
+                img = val_results[image_key][0]  # 取第一张, val_batch_size=1
+                img = img.detach().cpu().permute(1, 2, 0).numpy()
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+                pil_img = Image.fromarray(img)
+
+                # lq 是 48×48，上采样到和其他图一致的大小
+                if image_key == "lq":
+                    target_size = val_results["samples"].shape[-2:]  # (480, 480)
+                    pil_img = pil_img.resize(
+                        (target_size[1], target_size[0]),
+                        Image.NEAREST,
+                    )
+
+                images_to_concat.append(pil_img)
+
+            if images_to_concat:
+                total_w = sum(im.width for im in images_to_concat)
+                max_h = max(im.height for im in images_to_concat)
+                combined = Image.new("RGB", (total_w, max_h))
+                x_offset = 0
+                for im in images_to_concat:
+                    combined.paste(im, (x_offset, 0))
+                    x_offset += im.width
+                combined.save(os.path.join(save_dir, f"b{batch_idx}.png"))
 
         return loss_diff
 

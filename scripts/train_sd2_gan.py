@@ -502,7 +502,14 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  AMP           : {mc.get('use_amp', True)}")
     print(f"{'='*60}")
 
-    trainer.fit(system, train_loader, val_loader, ckpt_path=resume_ckpt)
+    if resume_ckpt:
+        ckpt = torch.load(resume_ckpt, map_location="cpu")
+        if "state_dict" in ckpt:
+            system.load_state_dict(ckpt["state_dict"], strict=False)
+            print(f"✅ 加载模型权重 (跳过 optimizer — 结构已变更)")
+            resume_ckpt = None
+
+    trainer.fit(system, train_loader, val_loader)
 
     return (
         trainer.checkpoint_callback.best_model_path,
