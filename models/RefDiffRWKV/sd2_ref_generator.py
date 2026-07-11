@@ -7,6 +7,7 @@ sd2_ref_generator.py — SD2 Ref-guided Generator (latent ε-prediction)
   2. 使用 diffusers 标准 SD2 UNet + T2I-Adapter 风格注入
      (down_intrablock_additional_residuals)，无需自定义 UNet；
   3. 借鉴 ControlLDM 的 get_input / p_losses / sample_log / log_images 接口。
+  4. UNet conv_in 扩展为 8 通道：前 4 为 noisy_latent，后 4 为 sr_latent（条件）。
 """
 
 import os
@@ -19,7 +20,7 @@ from pytorch_lightning import LightningModule
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from typing import Optional, List, Tuple, Dict
 
-# 兼容“作为包导入”和“直接 python 运行本文件”两种方式
+# 兼容"作为包导入"和"直接 python 运行本文件"两种方式
 try:
     from .sd2_ref_adapter import SD2_RefAdapter
     from .globalsemanticmodule import GlobalSemanticModule
@@ -44,7 +45,7 @@ class SD2RefGenerator(LightningModule):
         rwkv_cfg: Optional[dict] = None,
         use_semantic: bool = True,
         dinov2_model_name: str = "facebook/dinov2-base",
-        sem_base_dim: int = 768,  # DINOv2 token 维度（base=768, large=1024）
+        sem_base_dim: int = 768,          # DINOv2 token 维度（base=768, large=1024）
         num_train_timesteps: int = 1000,
         beta_start: float = 0.00085,
         beta_end: float = 0.012,
@@ -59,11 +60,14 @@ class SD2RefGenerator(LightningModule):
         lr_key: str = "lr",
         ref_key: str = "ref",
         hr_key: str = "hr",
-        normalize_input: bool = False,  # True 时 get_input 内做 [0,1]->[-1,1]
+        normalize_input: bool = False,    # True 时 get_input 内做 [0,1]->[-1,1]
         local_files_only: bool = True,
+        # ── NEW: SR prior 注入 ──
+        sr_model: Optional[torch.nn.Module] = None,
+        use_sr_latent_cond: bool = True,  # 是否在训练时把 sr_latent 拼接到 UNet 输入
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["sr_model"])
 
         self.lr_key = lr_key
         self.ref_key = ref_key
@@ -74,6 +78,10 @@ class SD2RefGenerator(LightningModule):
         self.cfg_drop_prob = cfg_drop_prob
         self.control_scale = control_scale
         self.normalize_input = normalize_input
+
+        # ── NEW ──
+        self.sr_model = sr_model
+        self.use_sr_latent_cond = use_sr_latent_cond
 
         # ═══════════════════════════════════════
         #  VAE（冻结）
@@ -92,6 +100,12 @@ class SD2RefGenerator(LightningModule):
             sd_model_path, subfolder="unet", local_files_only=local_files_only
         )
         self.unet.enable_gradient_checkpointing()
+
+        # ── NEW ──
+        # 先扩展 conv_in 再注入 LoRA：LoRA 只钩 attention，不影响 conv_in
+        # 但 conv_in 的替换需要在 freeze 之前完成
+        self._expand_conv_in_for_sr_latent()
+
         if use_lora:
             self._inject_lora(lora_rank, lora_target_modules)
         if sd_locked:
@@ -127,7 +141,6 @@ class SD2RefGenerator(LightningModule):
             self.global_semantic.eval()
             self.global_semantic.requires_grad_(False)
 
-        # sem_proj 在 __init__ 就显式建好，保证被 configure_optimizers 纳入、DDP 同步
         self.sem_proj: Optional[nn.Linear] = (
             nn.Linear(sem_base_dim, self.cross_attn_dim) if self.use_semantic else None
         )
@@ -137,6 +150,30 @@ class SD2RefGenerator(LightningModule):
         # ═══════════════════════════════════════
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+
+    # ═══════════════════════════════════════════════════════
+    #  NEW: UNet conv_in 4→8 通道扩展
+    # ═══════════════════════════════════════════════════════
+    def _expand_conv_in_for_sr_latent(self):
+        """把 UNet conv_in 从 4 通道扩展到 8 通道。
+        前 4 通道保留 SD2 预训练权重，后 4 通道零初始化（InstructPix2Pix 范式）。
+        """
+        old_conv = self.unet.conv_in
+        old_weight = old_conv.weight.data  # [320, 4, 3, 3]
+
+        new_conv = nn.Conv2d(
+            8, old_weight.shape[0],
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+        )
+
+        with torch.no_grad():
+            new_conv.weight[:, :4] = old_weight          # 前 4 通道：原始预训练
+            new_conv.weight[:, 4:] = 0.0                  # 后 4 通道：零初始化
+            new_conv.bias.copy_(old_conv.bias)
+
+        self.unet.conv_in = new_conv
 
     # ═══════════════════════════════════════════════════════
     #  LoRA & Freeze
@@ -156,7 +193,6 @@ class SD2RefGenerator(LightningModule):
         )
         try:
             from diffusers.utils.peft_utils import set_weights_and_activate_adapters
-
             set_weights_and_activate_adapters(self.unet, ["default"], [1.0])
         except (ImportError, AttributeError):
             pass
@@ -215,8 +251,6 @@ class SD2RefGenerator(LightningModule):
 
     # ═══════════════════════════════════════════════════════
     #  adapter 三尺度特征 -> T2I-Adapter 风格 4 个 down 注入项
-    #  通道 [320, 640, 1280, 1280] / 分辨率 [H, H/2, H/4, H/8]
-    #  正好对应 SD2 UNet 的 4 个 down block 输出
     # ═══════════════════════════════════════════════════════
     def _build_down_intrablock(
         self,
@@ -232,17 +266,16 @@ class SD2RefGenerator(LightningModule):
         """
         f320, f640, f1280 = ref_feats
 
-        # 按 UNet 的 ceil 减半规则推导 4 个 down stage 的目标尺寸
         def _half(h, w):
             return (h + 1) // 2, (w + 1) // 2
 
-        h0, w0 = latent_h, latent_w  # 60
-        h1, w1 = _half(h0, w0)  # 30
-        h2, w2 = _half(h1, w1)  # 15
-        h3, w3 = _half(h2, w2)  # 8
+        h0, w0 = latent_h, latent_w
+        h1, w1 = _half(h0, w0)
+        h2, w2 = _half(h1, w1)
+        h3, w3 = _half(h2, w2)
 
         target_sizes = [(h0, w0), (h1, w1), (h2, w2), (h3, w3)]
-        feats = [f320, f640, f1280, f1280]  # 第 4 个复用 f1280 再降采样
+        feats = [f320, f640, f1280, f1280]
 
         residuals = []
         for feat, (th, tw) in zip(feats, target_sizes):
@@ -256,16 +289,16 @@ class SD2RefGenerator(LightningModule):
 
     # ═══════════════════════════════════════════════════════
     #  核心 UNet 前向：latent ε-prediction
+    #  接受 [B, 8, H, W] 输入（noisy_latent + sr_latent）
     # ═══════════════════════════════════════════════════════
-    def apply_model(self, x_t, t, lr, ref, ref_input=None):
-        bsz = x_t.shape[0]
+    def apply_model(self, x_input, t, lr, ref, ref_input=None):
+        """x_input: [B, 8, 60, 60] 或 [B, 4, 60, 60]（回退兼容）。"""
+        bsz = x_input.shape[0]
         if ref_input is None:
             ref_input = ref
 
-        # adapter 纹理特征 [f320, f640, f1280]
         ref_feats = self.adapter(lr, ref_input)
 
-        # DINOv2 语义 token
         sem_tokens = None
         if self.use_semantic:
             with torch.no_grad():
@@ -274,12 +307,11 @@ class SD2RefGenerator(LightningModule):
 
         context = self._build_context(bsz, sem_tokens)
 
-        _, _, latent_h, latent_w = x_t.shape
+        _, _, latent_h, latent_w = x_input.shape
         down_intrablock = self._build_down_intrablock(ref_feats, latent_h, latent_w)
 
-        # 注意：diffusers 内部会对该 list 做 pop，需每次传新 list
         noise_pred = self.unet(
-            x_t,
+            x_input,
             t,
             encoder_hidden_states=context,
             down_intrablock_additional_residuals=list(down_intrablock),
@@ -288,7 +320,6 @@ class SD2RefGenerator(LightningModule):
         return noise_pred
 
     def get_input(self, batch, bs=None, *args, **kwargs):
-        """返回: lr, ref, hr，均已 to device / float；normalize_input=True 时映射到 [-1,1]。"""
         lr = batch[self.lr_key]
         ref = batch[self.ref_key]
         hr = batch[self.hr_key]
@@ -308,14 +339,17 @@ class SD2RefGenerator(LightningModule):
         return lr, ref, hr
 
     # ═══════════════════════════════════════════════════════
-    #  按 batch 手动反推 pred_x0（epsilon 预测）
-    #  避免把 (B,) 的 t 传入只接受标量的 DDPMScheduler.step
+    #  反推 pred_x0（epsilon 预测）
     # ═══════════════════════════════════════════════════════
     def _predict_x0_from_eps(self, x_t, t, noise_pred):
+        """x_t 是 4 通道 noisy latent（不含拼接的 sr_latent）。"""
         alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(x_t.device)
         a_bar = alphas_cumprod[t].float().view(-1, 1, 1, 1)
         return (x_t - (1.0 - a_bar).sqrt() * noise_pred) / a_bar.sqrt()
 
+    # ═══════════════════════════════════════════════════════
+    #  训练前向
+    # ═══════════════════════════════════════════════════════
     def forward(self, lr, ref, hr):
         bsz = lr.shape[0]
 
@@ -328,7 +362,10 @@ class SD2RefGenerator(LightningModule):
         )
         x_t = self.noise_scheduler.add_noise(hr_latent, noise, t)
 
-        # CFG drop
+        # ── NEW: SR prior latent 作为条件（每一步 UNet 都看到目标方向）──
+        sr_latent_cond = self._get_sr_latent_cond(lr, ref)
+
+        # CFG drop（只影响 adapter 的 ref 输入，不影响 sr_latent_cond）
         ref_input = ref
         if self.cfg_drop_prob > 0:
             mask = torch.rand(bsz, device=self.device) < self.cfg_drop_prob
@@ -336,7 +373,10 @@ class SD2RefGenerator(LightningModule):
                 ref_input = ref_input.clone()
                 ref_input[mask] = 0.0
 
-        noise_pred = self.apply_model(x_t, t, lr, ref, ref_input=ref_input)
+        # ── NEW: 拼接 sr_latent 到 UNet 输入 ──
+        x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+        noise_pred = self.apply_model(x_t_input, t, lr, ref, ref_input=ref_input)
+
         loss = F.mse_loss(noise_pred, noise)
         pred_x0_latent = self._predict_x0_from_eps(x_t, t, noise_pred)
 
@@ -354,10 +394,32 @@ class SD2RefGenerator(LightningModule):
         return out["loss"], {"train/loss_diff": out["loss"].detach()}
 
     # ═══════════════════════════════════════════════════════
+    #  NEW: sr_latent 条件生成
+    # ═══════════════════════════════════════════════════════
+    def _get_sr_latent_cond(self, lr, ref) -> Optional[torch.Tensor]:
+        """计算 SR prior 的 VAE latent，作为 UNet 的额外条件。
+        返回 [B, 4, 60, 60] 或 None。
+        """
+        actual_sr = self.sr_model if self.sr_model is not None else None
+        if actual_sr is None or not self.use_sr_latent_cond:
+            return None
+        with torch.no_grad():
+            sr_prior = actual_sr(lr, ref)
+            return self.encode_latent(sr_prior)
+
+    def _concat_sr_latent(
+        self, x_t: torch.Tensor, sr_latent_cond: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """把 4 通道 x_t 和可选的 sr_latent_cond 拼成 8 通道输入。"""
+        if sr_latent_cond is not None:
+            return torch.cat([x_t, sr_latent_cond], dim=1)
+        else:
+            return torch.cat([x_t, torch.zeros_like(x_t)], dim=1)
+
+    # ═══════════════════════════════════════════════════════
     #  采样 / 推理
     # ═══════════════════════════════════════════════════════
     def _infer_latent_size(self, ref, hr=None):
-        """latent 尺寸与训练时 HR latent 对齐（目标分辨率 // 8），而非 LR // 8。"""
         target = hr if hr is not None else ref
         return target.shape[-2] // 8, target.shape[-1] // 8
 
@@ -369,33 +431,79 @@ class SD2RefGenerator(LightningModule):
         steps=50,
         sr_model=None,
         hr=None,
-        t_start=None,  # Better Start: 加噪目标时间步（None=不用，纯噪声）
-        guidance_scale=0.0,  # MSE Guidance: 引导强度（0=不用）
-        t_stop=200,  # MSE Guidance: 只在前几步（t > t_stop）引导
+        t_start=None,
+        guidance_scale=0.0,
+        t_stop=200,
     ):
         bsz = lr.shape[0]
         device = self.device
 
-        # ═══════════════════════════════════════
-        # Step 1: 初始化 x_t
-        # ═══════════════════════════════════════
-        sr_target = None  # MSE Guidance 的 target latent
+        # ── 选择 SR model：参数优先，fallback 到存储的 ──
+        actual_sr = sr_model if sr_model is not None else self.sr_model
 
-        if sr_model is not None and t_start is not None:
-            # ── Better Start: SR prior → 加噪到 t_start ──
-            sr_prior = sr_model(lr, ref)
-            sr_latent = self.encode_latent(sr_prior)  # 干净 latent
-            sr_target = sr_latent.detach().clone()  # 保存为 guidance target
+        # ═══════════════════════════════════════
+        # Step 1: sr_latent 条件（全去噪循环复用）
+        # ═══════════════════════════════════════
+        sr_latent_cond = None
+        if actual_sr is not None:
+            sr_prior_for_cond = actual_sr(lr, ref)
+            sr_latent_cond = self.encode_latent(sr_prior_for_cond)
+
+        # ═══════════════════════════════════════
+        # Step 2: 初始化 x_t
+        # ═══════════════════════════════════════
+        sr_target = None
+
+        if actual_sr is not None and t_start is not None:
+            # ───────────────────────────────────
+            # Better Start + 空间自适应加噪
+            # ───────────────────────────────────
+            sr_prior = sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
+            sr_latent = sr_latent_cond if sr_latent_cond is not None else self.encode_latent(sr_prior)
+            sr_target = sr_latent.detach().clone()
+
+            sr_pixel_01 = (sr_prior + 1.0) / 2.0
+
+            def _local_variance(img, kernel_size=11):
+                B, C, H, W = img.shape
+                pad = kernel_size // 2
+                patches = F.unfold(img, kernel_size, padding=pad)
+                patches = patches.view(B, C, kernel_size * kernel_size, H * W)
+                var = patches.var(dim=2)
+                var = var.mean(dim=1, keepdim=True)
+                return var.view(B, 1, H, W)
+
+            tex_map = _local_variance(sr_pixel_01, kernel_size=11)
+
+            tex_map_latent = F.interpolate(
+                tex_map,
+                size=sr_latent.shape[2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+
+            tex_norm = tex_map_latent.clone()
+            for b in range(bsz):
+                tmin = tex_norm[b].min()
+                tmax = tex_norm[b].max()
+                if tmax > tmin:
+                    tex_norm[b] = (tex_norm[b] - tmin) / (tmax - tmin + 1e-8)
+
+            t_flat = max(200, t_start - 500)
+            t_detail = min(999, t_start + 200)
 
             noise = torch.randn_like(sr_latent)
-            t_tensor = torch.full((bsz,), t_start, device=device, dtype=torch.long)
-            x_t = self.noise_scheduler.add_noise(sr_latent, noise, t_tensor)
+            t_flat_t   = torch.full((bsz,), t_flat,   device=device, dtype=torch.long)
+            t_detail_t = torch.full((bsz,), t_detail, device=device, dtype=torch.long)
 
-        elif sr_model is not None:
-            # ── 仅 MSE Guidance（无 Better Start）: 纯噪声起点 ──
-            sr_prior = sr_model(lr, ref)
+            x_t_flat   = self.noise_scheduler.add_noise(sr_latent, noise, t_flat_t)
+            x_t_detail = self.noise_scheduler.add_noise(sr_latent, noise, t_detail_t)
+
+            x_t = tex_norm * x_t_detail + (1.0 - tex_norm) * x_t_flat
+
+        elif actual_sr is not None:
+            sr_prior = sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
             sr_target = self.encode_latent(sr_prior).detach()
-
             latent_h, latent_w = self._infer_latent_size(ref, hr)
             x_t = torch.randn(
                 bsz,
@@ -407,7 +515,6 @@ class SD2RefGenerator(LightningModule):
             )
 
         else:
-            # ── 原始纯噪声路径 ──
             latent_h, latent_w = self._infer_latent_size(ref, hr)
             x_t = torch.randn(
                 bsz,
@@ -419,11 +526,10 @@ class SD2RefGenerator(LightningModule):
             )
 
         # ═══════════════════════════════════════
-        # Step 2: 去噪循环
+        # Step 3: 去噪循环（每步拼接 sr_latent_cond）
         # ═══════════════════════════════════════
         self.noise_scheduler.set_timesteps(steps, device=device)
 
-        # 如果有 Better Start，只取 t <= t_start 的时间步
         timesteps = self.noise_scheduler.timesteps
         if t_start is not None:
             timesteps = [t for t in timesteps if t <= t_start]
@@ -431,11 +537,14 @@ class SD2RefGenerator(LightningModule):
         for t in timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
 
-            # ── MSE Guidance: 用 SR target 修正去噪方向 ──
+            # ── 拼接 sr_latent_cond ──
+            x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+
             if sr_target is not None and guidance_scale > 0 and t > t_stop:
                 with torch.enable_grad():
                     x_t.requires_grad_(True)
-                    noise_pred = self.apply_model(x_t, t_tensor, lr, ref)
+                    x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+                    noise_pred = self.apply_model(x_t_input, t_tensor, lr, ref)
                     pred_x0 = self._predict_x0_from_eps(x_t, t_tensor, noise_pred)
 
                     loss_guidance = F.mse_loss(pred_x0, sr_target)
@@ -443,7 +552,7 @@ class SD2RefGenerator(LightningModule):
                     x_t = x_t.detach() - guidance_scale * grad
                 noise_pred = noise_pred.detach()
             else:
-                noise_pred = self.apply_model(x_t, t_tensor, lr, ref)
+                noise_pred = self.apply_model(x_t_input, t_tensor, lr, ref)
 
             x_t = self.noise_scheduler.step(noise_pred, t, x_t).prev_sample
 
@@ -451,12 +560,12 @@ class SD2RefGenerator(LightningModule):
 
     @torch.no_grad()
     def visual_steps(self, lr, ref, steps=50, sr_model=None, hr=None):
-        """返回采样过程中每一步的中间图像 [0, 1]，用于排查蓝色偏等质量问题。"""
         bsz = lr.shape[0]
         device = self.device
+        actual_sr = sr_model if sr_model is not None else self.sr_model
 
-        if sr_model is not None:
-            sr_prior = sr_model(lr, ref)
+        if actual_sr is not None:
+            sr_prior = actual_sr(lr, ref)
             x_t = self.encode_latent(sr_prior)
         else:
             latent_h, latent_w = self._infer_latent_size(ref, hr)
@@ -472,20 +581,21 @@ class SD2RefGenerator(LightningModule):
         self.noise_scheduler.set_timesteps(steps, device=device)
         pixel_each_step = []
 
+        sr_latent_cond = self._get_sr_latent_cond(lr, ref) if actual_sr is not None else None
+
         for t in self.noise_scheduler.timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
-            noise_pred = self.apply_model(x_t, t_tensor, lr, ref)
+            x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+            noise_pred = self.apply_model(x_t_input, t_tensor, lr, ref)
             x_t = self.noise_scheduler.step(noise_pred, t, x_t).prev_sample
-            # 解码当前步的 latent → pixel
             current_pixel = self.decode_latent_eval(x_t)
             current_pixel_01 = torch.clamp((current_pixel + 1.0) / 2.0, 0.0, 1.0)
             pixel_each_step.append(current_pixel_01)
 
-        return pixel_each_step  # list of (B,C,H,W) tensors, 从第一步到最后一步
+        return pixel_each_step
 
     @torch.no_grad()
     def validation_inference(self, batch, save_dir, steps=50, sr_model=None):
-        """验证推理，记录推理时间和显存，保存结果图。"""
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
@@ -499,8 +609,8 @@ class SD2RefGenerator(LightningModule):
         val_results = self.log_images(batch, steps=steps, sr_model=sr_model)
         ender.record()
         torch.cuda.synchronize()
-        elapsed_time = starter.elapsed_time(ender)  # ms
-        max_memory = torch.cuda.memory_allocated() / 1024**2  # MB
+        elapsed_time = starter.elapsed_time(ender)
+        max_memory = torch.cuda.memory_allocated() / 1024**2
 
         print(f"[Inference Time] {elapsed_time:.2f} ms")
         print(f"[Current Memory] {max_memory:.2f} MB")
@@ -555,7 +665,6 @@ class SD2RefGenerator(LightningModule):
         guidance_scale=0.0,
         t_stop=200,
     ):
-        """返回 pixel 空间 SR 图像 [0, 1]。"""
         samples = self.sample_log(
             lr,
             ref,
@@ -596,7 +705,7 @@ class SD2RefGenerator(LightningModule):
 
 
 # ══════════════════════════════════════════════════════════════
-#  测试 main：验证 forward / sample_log / control 注入是否跑通
+#  测试 main
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import argparse
@@ -615,10 +724,9 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 80)
-    print("  SD2RefGenerator — down_intrablock (T2I-Adapter 风格) 注入测试")
+    print("  SD2RefGenerator — 8ch conv_in (sr_latent 条件) 测试")
     print("=" * 80)
 
-    # 关闭 DINOv2 语义路径，避免额外依赖；策略用 rwkv
     model = SD2RefGenerator(
         strategy="rwkv",
         sd_model_path=args.sd_path,
@@ -627,8 +735,23 @@ if __name__ == "__main__":
         use_semantic=False,
         cfg_drop_prob=0.0,
         local_files_only=args.local_files_only,
+        sr_model=None,
     ).to(device)
     model.eval()
+
+    # 验证 conv_in 是 8 通道
+    assert model.unet.conv_in.in_channels == 8, (
+        f"Expected 8-channel conv_in, got {model.unet.conv_in.in_channels}"
+    )
+    print("✅ conv_in 8 通道验证通过")
+
+    # 验证前 4 通道 = 原始 SD2 权重（非全零）
+    assert model.unet.conv_in.weight[:, :4].abs().sum() > 0, "前 4 通道应为非零预训练权重"
+    print("✅ 前 4 通道预训练权重保留")
+
+    # 验证后 4 通道 = 零初始化
+    assert model.unet.conv_in.weight[:, 4:].abs().sum() == 0, "后 4 通道应全为零"
+    print("✅ 后 4 通道零初始化")
 
     B = 1
     hr = torch.rand(B, 3, args.hr_size, args.hr_size, device=device) * 2 - 1
@@ -636,22 +759,20 @@ if __name__ == "__main__":
     lr = torch.rand(B, 3, args.lr_size, args.lr_size, device=device) * 2 - 1
     print(f"Input : LR={list(lr.shape)}, Ref={list(ref.shape)}, HR={list(hr.shape)}")
 
-    # 1) 训练前向（含 loss / pred_x0）
+    # 1) 训练前向（sr_model=None，回退拼零）
     out = model.forward(lr, ref, hr)
-    print("\n--- forward ---")
+    print("\n--- forward (sr_model=None) ---")
     print(f"  loss           = {out['loss'].item():.4f}")
     print(f"  noise_pred     = {list(out['noise_pred'].shape)}")
-    print(f"  hr_latent      = {list(out['hr_latent'].shape)}")
-    print(f"  pred_x0_latent = {list(out['pred_x0_latent'].shape)}")
     assert out["noise_pred"].shape == out["hr_latent"].shape
     print("  ✅ forward passed!")
 
-    # 2) 采样（少量步数验证 latent 尺寸与注入尺寸一致）
+    # 2) 采样
     print("\n--- sample_log (steps=2) ---")
     with torch.no_grad():
         samples = model.sample_log(lr, ref, steps=2, hr=hr)
     print(f"  samples(pixel) = {list(samples.shape)}")
-    assert samples.shape[-1] == args.hr_size, "采样输出分辨率应等于 HR 尺寸"
+    assert samples.shape[-1] == args.hr_size
     print("  ✅ sample_log passed!")
 
     print(
@@ -659,5 +780,5 @@ if __name__ == "__main__":
         f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
     )
     print("=" * 80)
-    print("  ✅ 所有测试通过")
+    print("  ✅ 所有测试通过 — UNet 8 通道扩展成功")
     print("=" * 80)

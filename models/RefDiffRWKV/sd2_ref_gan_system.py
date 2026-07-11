@@ -229,7 +229,50 @@ class SD2RefGANSystem(LightningModule):
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             out = self.generator.forward(lr, ref, hr)
-            loss = out["loss"]
+            noise_pred = out["noise_pred"]
+            noise = out["noise"]
+
+            # ───────────────────────────────────
+            # 分区域 Loss 加权（零超参数）
+            # SR prior 误差小的区域 → 高权重，强约束"别乱画"
+            # SR prior 误差大的区域 → 低权重，放手让模型发挥
+            # ───────────────────────────────────
+            if self.sr_model is not None:
+                with torch.no_grad():
+                    sr_prior = self.sr_model(lr, ref)                # [B,3,480,480], [-1,1]
+                    sr_pixel = (sr_prior + 1.0) / 2.0                # [0,1]
+                    hr_pixel = (hr + 1.0) / 2.0                      # [0,1]
+
+                    # 逐像素 MAE（通道均值）
+                    sr_error = (sr_pixel - hr_pixel).abs().mean(
+                        dim=1, keepdim=True
+                    )                                                # [B,1,480,480]
+
+                    # 下采样到 latent 空间
+                    sr_error_latent = F.interpolate(
+                        sr_error,
+                        size=noise_pred.shape[2:],
+                        mode='bilinear',
+                        align_corners=False,
+                    )                                                # [B,1,60,60]
+
+                    # 每张图独立 min-max 归一化 + 反转
+                    B = sr_error_latent.shape[0]
+                    for b in range(B):
+                        e = sr_error_latent[b]
+                        e_min, e_max = e.min(), e.max()
+                        if e_max > e_min:
+                            sr_error_latent[b] = (e - e_min) / (e_max - e_min + 1e-8)
+
+                    loss_weight = 1.0 - sr_error_latent                # 误差小 → 权重高
+                    loss_weight = loss_weight.clamp(min=0.1)
+
+                # 加权 MSE
+                per_pixel_mse = (noise_pred - noise) ** 2             # [B,4,60,60]
+                per_pixel_mse = per_pixel_mse.mean(dim=1, keepdim=True)  # [B,1,60,60]
+                loss = (per_pixel_mse * loss_weight).mean()
+            else:
+                loss = out["loss"]
 
             # 预测 x0 并 decode 到 pixel（[-1, 1]），用于 GAN / LPIPS
             pred_x0_latent = out["pred_x0_latent"]
@@ -432,6 +475,12 @@ class SD2RefGANSystem(LightningModule):
                 shutil.rmtree(save_dir)
             os.makedirs(save_dir, exist_ok=True)
 
+            # ── 生成 SR prior ──
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                    sr_prior = self.sr_model(lr, ref)  # [B, 3, 480, 480]，值域 [-1, 1]
+            sr_prior_01 = (sr_prior + 1.0) / 2.0  # 映射到 [0, 1]
+
             images_to_concat = []
             for image_key in ["lq", "ref", "hq", "samples"]:
                 if image_key not in val_results:
@@ -441,15 +490,19 @@ class SD2RefGANSystem(LightningModule):
                 img = (img * 255).clip(0, 255).astype(np.uint8)
                 pil_img = Image.fromarray(img)
 
-                # lq 是 48×48，上采样到和其他图一致的大小
                 if image_key == "lq":
-                    target_size = val_results["samples"].shape[-2:]  # (480, 480)
+                    target_size = val_results["samples"].shape[-2:]
                     pil_img = pil_img.resize(
                         (target_size[1], target_size[0]),
                         Image.NEAREST,
                     )
 
                 images_to_concat.append(pil_img)
+
+            # ── 追加 SR prior ──
+            sr_img = sr_prior_01[0].detach().cpu().permute(1, 2, 0).numpy()
+            sr_img = (sr_img * 255).clip(0, 255).astype(np.uint8)
+            images_to_concat.append(Image.fromarray(sr_img))
 
             if images_to_concat:
                 total_w = sum(im.width for im in images_to_concat)

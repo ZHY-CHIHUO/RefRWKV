@@ -302,7 +302,7 @@ def build_model(cfg: dict):
     # SR prior（推理 Better Start 用，训练时固定）
     sr_model = build_sr_model(cfg)
 
-    # Generator
+    # Generator（含 sr_model 引用 + sr_latent 条件开关）
     generator = SD2RefGenerator(
         # Data keys
         lr_key=mc.get("lr_key", "lr"),
@@ -333,6 +333,9 @@ def build_model(cfg: dict):
         # Optimizer (for standalone usage)
         learning_rate=mc.get("learning_rate", 1e-4),
         weight_decay=mc.get("weight_decay", 1e-3),
+        # ── NEW: SR prior 条件注入 ──
+        sr_model=sr_model,
+        use_sr_latent_cond=mc.get("use_sr_latent_cond", False),
     )
 
     # Discriminator（可选，设为 None 则退化为纯 diffusion baseline）
@@ -481,7 +484,8 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  SD2RefGANSystem 训练")
     print(f"  数据根目录    : {cfg['data']['root']}")
     print(
-        f"  Batch size    : {cfg['data']['batch_size']} x accumulate {mc.get('accumulate_grad_batches', 8)}"
+        f"  Batch size    : {cfg['data']['batch_size']} x accumulate "
+        f"{mc.get('accumulate_grad_batches', 8)}"
     )
     print(f"  训练样本数    : {len(train_loader.dataset)}")
     print(f"  验证样本数    : {len(val_loader.dataset)}")
@@ -490,11 +494,14 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  RWKN embed_dim: {mc.get('rwkv_cfg', {}).get('embed_dim', 192)}")
     print(f"  使用 Discriminator : {mc.get('use_discriminator', True)}")
     print(
-        f"  GAN λ (sem/tex) : {mc.get('lambda_gan', 0.0)} / {mc.get('lambda_gan_texture', 0.0)}"
+        f"  GAN λ (sem/tex) : {mc.get('lambda_gan', 0.0)} / "
+        f"{mc.get('lambda_gan_texture', 0.0)}"
     )
     print(f"  LPIPS λ       : {mc.get('lambda_lpips', 0.0)}")
+    print(f"  SR latent cond  : {mc.get('use_sr_latent_cond', False)}")
     print(
-        f"  LR (G/D_sem/D_tex): {mc.get('learning_rate', 1e-4)} / {mc.get('lr_D', 5e-6)} / {mc.get('lr_D_texture', 1e-6)}"
+        f"  LR (G/D_sem/D_tex): {mc.get('learning_rate', 1e-4)} / "
+        f"{mc.get('lr_D', 5e-6)} / {mc.get('lr_D_texture', 1e-6)}"
     )
     print(f"  最大 epoch    : {max_epochs}")
     print(f"  CFG dropout   : {mc.get('cfg_drop_prob', 0.1)}")
@@ -502,14 +509,29 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  AMP           : {mc.get('use_amp', True)}")
     print(f"{'='*60}")
 
+    # ── Resume: 过滤旧版 4 通道 conv_in，兼容新版 8 通道 ──
     if resume_ckpt:
         ckpt = torch.load(resume_ckpt, map_location="cpu")
         if "state_dict" in ckpt:
-            system.load_state_dict(ckpt["state_dict"], strict=False)
+            state_dict = ckpt["state_dict"]
+            skipped_keys = [
+                k for k in state_dict
+                if "conv_in" in k and k.startswith("generator.unet.conv_in")
+            ]
+            if skipped_keys:
+                print(
+                    f"🔧 跳过旧版 conv_in 权重 ({len(skipped_keys)} keys)，"
+                    f"新 conv_in 使用 8 通道初始化"
+                )
+                state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if k not in skipped_keys
+                }
+            system.load_state_dict(state_dict, strict=False)
             print(f"✅ 加载模型权重 (跳过 optimizer — 结构已变更)")
             resume_ckpt = None
 
-    trainer.fit(system, train_loader, val_loader)
+    trainer.fit(system, train_loader, val_loader, ckpt_path=resume_ckpt)
 
     return (
         trainer.checkpoint_callback.best_model_path,
