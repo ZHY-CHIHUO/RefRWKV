@@ -333,7 +333,7 @@ def build_model(cfg: dict):
         # Optimizer (for standalone usage)
         learning_rate=mc.get("learning_rate", 1e-4),
         weight_decay=mc.get("weight_decay", 1e-3),
-        # ── NEW: SR prior 条件注入 ──
+        # SR prior 条件注入 ──
         sr_model=sr_model,
         use_sr_latent_cond=mc.get("use_sr_latent_cond", False),
     )

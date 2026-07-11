@@ -62,7 +62,7 @@ class SD2RefGenerator(LightningModule):
         hr_key: str = "hr",
         normalize_input: bool = False,    # True 时 get_input 内做 [0,1]->[-1,1]
         local_files_only: bool = True,
-        # ── NEW: SR prior 注入 ──
+        # SR prior 注入 ──
         sr_model: Optional[torch.nn.Module] = None,
         use_sr_latent_cond: bool = True,  # 是否在训练时把 sr_latent 拼接到 UNet 输入
     ):
@@ -79,7 +79,6 @@ class SD2RefGenerator(LightningModule):
         self.control_scale = control_scale
         self.normalize_input = normalize_input
 
-        # ── NEW ──
         self.sr_model = sr_model
         self.use_sr_latent_cond = use_sr_latent_cond
 
@@ -101,7 +100,6 @@ class SD2RefGenerator(LightningModule):
         )
         self.unet.enable_gradient_checkpointing()
 
-        # ── NEW ──
         # 先扩展 conv_in 再注入 LoRA：LoRA 只钩 attention，不影响 conv_in
         # 但 conv_in 的替换需要在 freeze 之前完成
         self._expand_conv_in_for_sr_latent()
@@ -152,7 +150,7 @@ class SD2RefGenerator(LightningModule):
         self.weight_decay = weight_decay
 
     # ═══════════════════════════════════════════════════════
-    #  NEW: UNet conv_in 4→8 通道扩展
+    #  UNet conv_in 4→8 通道扩展
     # ═══════════════════════════════════════════════════════
     def _expand_conv_in_for_sr_latent(self):
         """把 UNet conv_in 从 4 通道扩展到 8 通道。
@@ -362,7 +360,7 @@ class SD2RefGenerator(LightningModule):
         )
         x_t = self.noise_scheduler.add_noise(hr_latent, noise, t)
 
-        # ── NEW: SR prior latent 作为条件（每一步 UNet 都看到目标方向）──
+        # SR prior latent 作为条件（每一步 UNet 都看到目标方向）──
         sr_latent_cond = self._get_sr_latent_cond(lr, ref)
 
         # CFG drop（只影响 adapter 的 ref 输入，不影响 sr_latent_cond）
@@ -373,7 +371,7 @@ class SD2RefGenerator(LightningModule):
                 ref_input = ref_input.clone()
                 ref_input[mask] = 0.0
 
-        # ── NEW: 拼接 sr_latent 到 UNet 输入 ──
+        # 拼接 sr_latent 到 UNet 输入 ──
         x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
         noise_pred = self.apply_model(x_t_input, t, lr, ref, ref_input=ref_input)
 
@@ -394,7 +392,7 @@ class SD2RefGenerator(LightningModule):
         return out["loss"], {"train/loss_diff": out["loss"].detach()}
 
     # ═══════════════════════════════════════════════════════
-    #  NEW: sr_latent 条件生成
+    #  sr_latent 条件生成
     # ═══════════════════════════════════════════════════════
     def _get_sr_latent_cond(self, lr, ref) -> Optional[torch.Tensor]:
         """计算 SR prior 的 VAE latent，作为 UNet 的额外条件。
