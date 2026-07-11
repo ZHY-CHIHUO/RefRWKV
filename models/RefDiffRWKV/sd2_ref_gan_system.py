@@ -49,9 +49,9 @@ class SD2RefGANSystem(LightningModule):
         # Better Start：推理时用 SR prior 做 warm-start 初始化
         sr_model: Optional[torch.nn.Module] = None,
         # Better Start + MSE Guidance 推理参数 ──
-        t_start: Optional[int] = None,  # Better Start 加噪目标时间步（None=纯噪声起点）
-        guidance_scale: float = 0.0,  # MSE Guidance 引导强度（0=关闭）
-        t_stop: int = 200,  # MSE Guidance 仅在 t > t_stop 时启用
+        t_start: Optional[int] = None,
+        guidance_scale: float = 0.0,
+        t_stop: int = 200,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["generator", "discriminator", "sr_model"])
@@ -66,25 +66,26 @@ class SD2RefGANSystem(LightningModule):
         self.accumulate_grad_batches = accumulate_grad_batches
         self.sample_steps = sample_steps
 
-        # ── NEW ──
         self.t_start = t_start
         self.guidance_scale = guidance_scale
         self.t_stop = t_stop
+
+        # ── NaN 防护计数 ──
+        self._nan_g_count = 0
+        self._nan_d_count = 0
 
         # ═══════════════════════════════════════
         #  手动优化 + AMP + 梯度累积
         # ═══════════════════════════════════════
         self.automatic_optimization = False
         self.use_amp = use_amp
-        # 仅 G 段使用 AMP + scaler；D 段强制 fp32，不用 scaler
         self.scaler_g = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         self._g_accum_count = 0
         self._d_sem_accum_count = 0
         self._d_tex_accum_count = 0
-        self._gd_phase = 0  # 0: G, 1: D
+        self._gd_phase = 0
 
-        # 优化器索引（在 configure_optimizers 中按实际启用情况填充）
         self._opt_idx: Dict[str, int] = {}
 
         # ═══════════════════════════════════════
@@ -182,19 +183,16 @@ class SD2RefGANSystem(LightningModule):
         return super().load_state_dict(filtered, strict=False)
 
     def _override_lr_on_resume(self):
-        """从 checkpoint 恢复后，用 hparams 中的 LR 覆盖 optimizer。"""
         optimizers = self.optimizers()
         if not optimizers:
             return
 
-        # G optimizer（idx 0）
         target_g_lr = self.hparams.g_lr
         for pg in optimizers[self._opt_idx["g"]].param_groups:
             old = pg["lr"]
             pg["lr"] = target_g_lr
         print(f"🔧 G  LR: {old:.1e} → {target_g_lr:.1e}")
 
-        # D_sem optimizer（如果有）
         idx_sem = self._opt_idx.get("d_sem")
         if idx_sem is not None:
             for pg in optimizers[idx_sem].param_groups:
@@ -202,7 +200,6 @@ class SD2RefGANSystem(LightningModule):
                 pg["lr"] = self.hparams.d_lr_sem
             print(f"🔧 D_sem LR: {old:.1e} → {self.hparams.d_lr_sem:.1e}")
 
-        # D_tex optimizer（如果有）
         idx_tex = self._opt_idx.get("d_tex")
         if idx_tex is not None:
             for pg in optimizers[idx_tex].param_groups:
@@ -225,7 +222,6 @@ class SD2RefGANSystem(LightningModule):
     def _generator_step(self, batch, batch_idx):
         g_opt = self._get_g_opt()
         lr, ref, hr = self.generator.get_input(batch)
-        # 此时 lr, ref, hr 均在 [-1, 1]（你的数据集）
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             out = self.generator.forward(lr, ref, hr)
@@ -234,8 +230,6 @@ class SD2RefGANSystem(LightningModule):
 
             # ───────────────────────────────────
             # 分区域 Loss 加权（零超参数）
-            # SR prior 误差小的区域 → 高权重，强约束"别乱画"
-            # SR prior 误差大的区域 → 低权重，放手让模型发挥
             # ───────────────────────────────────
             if self.sr_model is not None:
                 with torch.no_grad():
@@ -243,12 +237,10 @@ class SD2RefGANSystem(LightningModule):
                     sr_pixel = (sr_prior + 1.0) / 2.0                # [0,1]
                     hr_pixel = (hr + 1.0) / 2.0                      # [0,1]
 
-                    # 逐像素 MAE（通道均值）
                     sr_error = (sr_pixel - hr_pixel).abs().mean(
                         dim=1, keepdim=True
                     )                                                # [B,1,480,480]
 
-                    # 下采样到 latent 空间
                     sr_error_latent = F.interpolate(
                         sr_error,
                         size=noise_pred.shape[2:],
@@ -256,7 +248,6 @@ class SD2RefGANSystem(LightningModule):
                         align_corners=False,
                     )                                                # [B,1,60,60]
 
-                    # 每张图独立 min-max 归一化 + 反转
                     B = sr_error_latent.shape[0]
                     for b in range(B):
                         e = sr_error_latent[b]
@@ -264,29 +255,39 @@ class SD2RefGANSystem(LightningModule):
                         if e_max > e_min:
                             sr_error_latent[b] = (e - e_min) / (e_max - e_min + 1e-8)
 
-                    loss_weight = 1.0 - sr_error_latent                # 误差小 → 权重高
+                    loss_weight = 1.0 - sr_error_latent
                     loss_weight = loss_weight.clamp(min=0.1)
 
-                # 加权 MSE
-                per_pixel_mse = (noise_pred - noise) ** 2             # [B,4,60,60]
-                per_pixel_mse = per_pixel_mse.mean(dim=1, keepdim=True)  # [B,1,60,60]
+                per_pixel_mse = (noise_pred - noise) ** 2
+                per_pixel_mse = per_pixel_mse.mean(dim=1, keepdim=True)
                 loss = (per_pixel_mse * loss_weight).mean()
+
+                # ── NaN 保护：回退到全局 MSE ──
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self._nan_g_count += 1
+                    print(f"⚠️ [G step] 分区域 loss 为 NaN/Inf (#{self._nan_g_count})，"
+                          f"回退到全局 MSE。batch={batch_idx}")
+                    loss = out["loss"]
             else:
                 loss = out["loss"]
 
             # 预测 x0 并 decode 到 pixel（[-1, 1]），用于 GAN / LPIPS
             pred_x0_latent = out["pred_x0_latent"]
+            pred_x0_latent = pred_x0_latent.clamp(-20.0, 20.0)  # ← 保护 VAE decoder 不溢出
             sr_pixel = self.generator.decode_latent(pred_x0_latent)
             # sr_pixel ∈ [-1, 1]，与 hr / ref 一致
 
             # LPIPS 辅助 loss（LPIPS 期望 [-1, 1]）
             if self.lambda_lpips > 0:
                 loss_lpips = self.net_lpips(sr_pixel, hr).mean() * self.lambda_lpips
-                loss = loss + loss_lpips
-                self.log("train/G_lpips", loss_lpips.detach(), on_step=True)
+                if not torch.isnan(loss_lpips) and not torch.isinf(loss_lpips):
+                    loss = loss + loss_lpips
+                    self.log("train/G_lpips", loss_lpips.detach(), on_step=True)
+                else:
+                    self._nan_g_count += 1
+                    print(f"⚠️ [G step] LPIPS loss 为 NaN/Inf (#{self._nan_g_count})，跳过")
 
             # GAN 辅助 loss：先冻结 D，只回传到 G
-            # sr_pixel ∈ [-1, 1]，直接送入，判别器内部会处理
             if self.discriminator is not None and (
                 self.lambda_gan_semantic > 0 or self.lambda_gan_texture > 0
             ):
@@ -300,8 +301,22 @@ class SD2RefGANSystem(LightningModule):
                         lambda_semantic=self.lambda_gan_semantic,
                         lambda_texture=self.lambda_gan_texture,
                     )
-                loss = loss + gan_loss
-                self.log("train/G_gan", gan_loss.detach(), on_step=True)
+                if not torch.isnan(gan_loss) and not torch.isinf(gan_loss):
+                    loss = loss + gan_loss
+                    self.log("train/G_gan", gan_loss.detach(), on_step=True)
+                else:
+                    self._nan_g_count += 1
+                    print(f"⚠️ [G step] GAN loss 为 NaN/Inf (#{self._nan_g_count})，"
+                          f"sr_pixel range=[{sr_pixel.min():.2f}, {sr_pixel.max():.2f}]")
+
+        # ── 最后防线：loss 本身 NaN/Inf 则跳过本次更新 ──
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"❌ [G step] G_total 为 NaN/Inf，跳过本次更新。batch={batch_idx}")
+            self._gd_phase = 1
+            if self.discriminator is not None:
+                self.discriminator.train()
+                self.discriminator.requires_grad_(True)
+            return None
 
         loss = loss / self.accumulate_grad_batches
         self.scaler_g.scale(loss).backward()
@@ -333,7 +348,7 @@ class SD2RefGANSystem(LightningModule):
         return loss.detach() * self.accumulate_grad_batches
 
     # ═══════════════════════════════════════════════════════
-    #  Discriminator Step  （不变——保持旧路径，不加 Better Start / Guidance）
+    #  Discriminator Step
     # ═══════════════════════════════════════════════════════
     def _discriminator_step(self, batch, batch_idx):
         # 如果 D 为空或 GAN loss 都没开，直接切回 G 阶段 ──
@@ -343,26 +358,45 @@ class SD2RefGANSystem(LightningModule):
             self._gd_phase = 0
             return None
 
-        # 关键：把 D 恢复为 train + requires_grad(True)，否则 backward 无梯度
         self.discriminator.train()
         self.discriminator.requires_grad_(True)
 
         d_sem_opt = self._get_d_sem_opt()
         d_tex_opt = self._get_d_tex_opt()
         lr, ref, hr = self.generator.get_input(batch)
-        # lr, ref, hr ∈ [-1, 1]
 
         # 生成 fake（无梯度，节省显存）
-        # 去掉 self.generator.eval() 防止触发底层 SystemError
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 fake = self.generator.generate_sr(
-                    lr, ref, steps=self.sample_steps, sr_model=self.sr_model, hr=hr
+                    lr, ref, steps=self.sample_steps,
+                    sr_model=self.sr_model, hr=hr,
+                    # ── 传入 Better Start 参数 ──
+                    t_start=self.t_start,
+                    guidance_scale=self.guidance_scale,
+                    t_stop=self.t_stop,
                 )
 
-        # generate_sr 始终返回 [0, 1] → 映射到 [-1, 1]，与 real/ref 对齐
         fake = fake.detach().float() * 2.0 - 1.0
         real = hr  # 已在 [-1, 1]
+
+        # ── NaN 检查：fake/real 含 NaN 则跳过 ──
+        if torch.isnan(fake).any() or torch.isinf(fake).any():
+            self._nan_d_count += 1
+            print(f"⚠️ [D step] fake 含 NaN/Inf (#{self._nan_d_count})，"
+                  f"batch={batch_idx}，跳过本次 D step")
+            self.discriminator.eval()
+            self.discriminator.requires_grad_(False)
+            self._gd_phase = 0
+            return None
+
+        if torch.isnan(real).any() or torch.isinf(real).any():
+            self._nan_d_count += 1
+            print(f"⚠️ [D step] real(hr) 含 NaN/Inf (#{self._nan_d_count})，跳过")
+            self.discriminator.eval()
+            self.discriminator.requires_grad_(False)
+            self._gd_phase = 0
+            return None
 
         # 语义 D（fp32，不用 scaler）
         if (
@@ -378,18 +412,21 @@ class SD2RefGANSystem(LightningModule):
                     lambda_semantic=1.0,
                     lambda_texture=0.0,
                 )
-            (loss_d_sem / self.accumulate_grad_batches).backward()
-            self._d_sem_accum_count += 1
+            if not torch.isnan(loss_d_sem) and not torch.isinf(loss_d_sem):
+                (loss_d_sem / self.accumulate_grad_batches).backward()
+                self._d_sem_accum_count += 1
+                self.log("train/D_sem", loss_d_sem.detach(), on_step=True, prog_bar=True)
 
-            if self._d_sem_accum_count >= self.accumulate_grad_batches:
-                self.clip_gradients(
-                    d_sem_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
-                )
-                d_sem_opt.step()
-                d_sem_opt.zero_grad()
-                self._d_sem_accum_count = 0
-
-            self.log("train/D_sem", loss_d_sem.detach(), on_step=True, prog_bar=True)
+                if self._d_sem_accum_count >= self.accumulate_grad_batches:
+                    self.clip_gradients(
+                        d_sem_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                    )
+                    d_sem_opt.step()
+                    d_sem_opt.zero_grad()
+                    self._d_sem_accum_count = 0
+            else:
+                self._nan_d_count += 1
+                print(f"⚠️ [D step] loss_d_sem 为 NaN/Inf (#{self._nan_d_count})，跳过 D_sem 更新")
 
         # 纹理 D（fp32，不用 scaler）
         if (
@@ -405,18 +442,21 @@ class SD2RefGANSystem(LightningModule):
                     lambda_semantic=0.0,
                     lambda_texture=1.0,
                 )
-            (loss_d_tex / self.accumulate_grad_batches).backward()
-            self._d_tex_accum_count += 1
+            if not torch.isnan(loss_d_tex) and not torch.isinf(loss_d_tex):
+                (loss_d_tex / self.accumulate_grad_batches).backward()
+                self._d_tex_accum_count += 1
+                self.log("train/D_tex", loss_d_tex.detach(), on_step=True, prog_bar=True)
 
-            if self._d_tex_accum_count >= self.accumulate_grad_batches:
-                self.clip_gradients(
-                    d_tex_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
-                )
-                d_tex_opt.step()
-                d_tex_opt.zero_grad()
-                self._d_tex_accum_count = 0
-
-            self.log("train/D_tex", loss_d_tex.detach(), on_step=True, prog_bar=True)
+                if self._d_tex_accum_count >= self.accumulate_grad_batches:
+                    self.clip_gradients(
+                        d_tex_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                    )
+                    d_tex_opt.step()
+                    d_tex_opt.zero_grad()
+                    self._d_tex_accum_count = 0
+            else:
+                self._nan_d_count += 1
+                print(f"⚠️ [D step] loss_d_tex 为 NaN/Inf (#{self._nan_d_count})，跳过 D_tex 更新")
 
         # D 阶段结束：把 D 设回 eval（G step 里会再控制），切回 G
         self.discriminator.eval()
@@ -439,7 +479,6 @@ class SD2RefGANSystem(LightningModule):
         )
 
         with torch.no_grad():
-            # 传入 Better Start + MSE Guidance 参数 ──
             val_results = self.generator.log_images(
                 batch,
                 steps=self.sample_steps,
@@ -451,7 +490,7 @@ class SD2RefGANSystem(LightningModule):
 
         # 计算指标 — 扩散采样结果
         if self.iqa is not None:
-            sr_batch = val_results["samples"]  # (B, C, H, W), [0,1]
+            sr_batch = val_results["samples"]
             hq_batch = val_results["hq"]
             agg = {}
             for i in range(len(sr_batch)):
@@ -475,17 +514,16 @@ class SD2RefGANSystem(LightningModule):
                 shutil.rmtree(save_dir)
             os.makedirs(save_dir, exist_ok=True)
 
-            # ── 生成 SR prior ──
             with torch.no_grad():
                 with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    sr_prior = self.sr_model(lr, ref)  # [B, 3, 480, 480]，值域 [-1, 1]
-            sr_prior_01 = (sr_prior + 1.0) / 2.0  # 映射到 [0, 1]
+                    sr_prior = self.sr_model(lr, ref)
+            sr_prior_01 = (sr_prior + 1.0) / 2.0
 
             images_to_concat = []
             for image_key in ["lq", "ref", "hq", "samples"]:
                 if image_key not in val_results:
                     continue
-                img = val_results[image_key][0]  # 取第一张, val_batch_size=1
+                img = val_results[image_key][0]
                 img = img.detach().cpu().permute(1, 2, 0).numpy()
                 img = (img * 255).clip(0, 255).astype(np.uint8)
                 pil_img = Image.fromarray(img)
@@ -499,7 +537,6 @@ class SD2RefGANSystem(LightningModule):
 
                 images_to_concat.append(pil_img)
 
-            # ── 追加 SR prior ──
             sr_img = sr_prior_01[0].detach().cpu().permute(1, 2, 0).numpy()
             sr_img = (sr_img * 255).clip(0, 255).astype(np.uint8)
             images_to_concat.append(Image.fromarray(sr_img))
