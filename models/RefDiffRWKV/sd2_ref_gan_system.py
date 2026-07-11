@@ -538,6 +538,7 @@ class SD2RefGANSystem(LightningModule):
                 images_to_concat.append(pil_img)
 
             sr_img = sr_prior_01[0].detach().cpu().permute(1, 2, 0).numpy()
+            sr_img = np.nan_to_num(sr_img, nan=0.0, posinf=1.0, neginf=0.0)
             sr_img = (sr_img * 255).clip(0, 255).astype(np.uint8)
             images_to_concat.append(Image.fromarray(sr_img))
 
