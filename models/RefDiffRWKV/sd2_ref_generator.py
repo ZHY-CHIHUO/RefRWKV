@@ -455,31 +455,28 @@ class SD2RefGenerator(LightningModule):
         if actual_sr is not None and t_start is not None:
             # ───────────────────────────────────
             # Better Start + 空间自适应加噪
+            # 纹理分区：SR-Ref 差异（SR 画得差 → 多加噪 → diffusion 重绘）
             # ───────────────────────────────────
             sr_prior = sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
             sr_latent = sr_latent_cond if sr_latent_cond is not None else self.encode_latent(sr_prior)
             sr_target = sr_latent.detach().clone()
 
-            sr_pixel_01 = (sr_prior + 1.0) / 2.0
+            sr_pixel_01 = (sr_prior + 1.0) / 2.0      # [B,3,480,480], [0,1]
+            ref_pixel_01 = (ref + 1.0) / 2.0            # [B,3,480,480], [0,1]
 
-            def _local_variance(img, kernel_size=11):
-                B, C, H, W = img.shape
-                pad = kernel_size // 2
-                patches = F.unfold(img, kernel_size, padding=pad)
-                patches = patches.view(B, C, kernel_size * kernel_size, H * W)
-                var = patches.var(dim=2)
-                var = var.mean(dim=1, keepdim=True)
-                return var.view(B, 1, H, W)
-
-            tex_map = _local_variance(sr_pixel_01, kernel_size=11)
+            # SR-Ref 逐像素差异 → 差异大 = SR 没画好 → 需要 diffusion
+            tex_map = (sr_pixel_01 - ref_pixel_01).abs().mean(
+                dim=1, keepdim=True
+            )                                            # [B,1,480,480]
 
             tex_map_latent = F.interpolate(
                 tex_map,
                 size=sr_latent.shape[2:],
                 mode='bilinear',
                 align_corners=False,
-            )
+            )                                            # [B,1,60,60]
 
+            # 每张图独立 min-max 归一化到 [0,1]
             tex_norm = tex_map_latent.clone()
             for b in range(bsz):
                 tmin = tex_norm[b].min()
@@ -487,6 +484,8 @@ class SD2RefGenerator(LightningModule):
                 if tmax > tmin:
                     tex_norm[b] = (tex_norm[b] - tmin) / (tmax - tmin + 1e-8)
 
+            # ── 平坦区 (差异小) → t_flat 少加噪，保留 SR prior 结构
+            # ── 复杂区 (差异大) → t_detail 多加噪，diffusion 重绘纹理
             t_flat = max(200, t_start - 500)
             t_detail = min(999, t_start + 200)
 
@@ -535,7 +534,6 @@ class SD2RefGenerator(LightningModule):
         for t in timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
 
-            # ── 拼接 sr_latent_cond ──
             x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
 
             if sr_target is not None and guidance_scale > 0 and t > t_stop:
