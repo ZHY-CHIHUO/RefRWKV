@@ -380,6 +380,7 @@ def build_model(cfg: dict):
         fr_metrics=mc.get("fr_metrics", ["psnr", "ssim", "lpips", "dists"]),
         # Better Start SR model
         sr_model=sr_model,
+        sr_fixed=mc.get("sr_fixed", True), 
         t_start=mc.get("t_start", None),
         guidance_scale=mc.get("guidance_scale", 0.0),
         t_stop=mc.get("t_stop", 200),
