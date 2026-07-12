@@ -45,7 +45,7 @@ class SD2RefGenerator(LightningModule):
         rwkv_cfg: Optional[dict] = None,
         use_semantic: bool = True,
         dinov2_model_name: str = "facebook/dinov2-base",
-        sem_base_dim: int = 768,          # DINOv2 token 维度（base=768, large=1024）
+        sem_base_dim: int = 768,  # DINOv2 token 维度（base=768, large=1024）
         num_train_timesteps: int = 1000,
         beta_start: float = 0.00085,
         beta_end: float = 0.012,
@@ -60,7 +60,7 @@ class SD2RefGenerator(LightningModule):
         lr_key: str = "lr",
         ref_key: str = "ref",
         hr_key: str = "hr",
-        normalize_input: bool = False,    # True 时 get_input 内做 [0,1]->[-1,1]
+        normalize_input: bool = False,  # True 时 get_input 内做 [0,1]->[-1,1]
         local_files_only: bool = True,
         # SR prior 注入 ──
         sr_model: Optional[torch.nn.Module] = None,
@@ -160,15 +160,16 @@ class SD2RefGenerator(LightningModule):
         old_weight = old_conv.weight.data  # [320, 4, 3, 3]
 
         new_conv = nn.Conv2d(
-            8, old_weight.shape[0],
+            8,
+            old_weight.shape[0],
             kernel_size=old_conv.kernel_size,
             stride=old_conv.stride,
             padding=old_conv.padding,
         )
 
         with torch.no_grad():
-            new_conv.weight[:, :4] = old_weight          # 前 4 通道：原始预训练
-            new_conv.weight[:, 4:] = 0.0                  # 后 4 通道：零初始化
+            new_conv.weight[:, :4] = old_weight  # 前 4 通道：原始预训练
+            new_conv.weight[:, 4:] = 0.0  # 后 4 通道：零初始化
             new_conv.bias.copy_(old_conv.bias)
 
         self.unet.conv_in = new_conv
@@ -191,6 +192,7 @@ class SD2RefGenerator(LightningModule):
         )
         try:
             from diffusers.utils.peft_utils import set_weights_and_activate_adapters
+
             set_weights_and_activate_adapters(self.unet, ["default"], [1.0])
         except (ImportError, AttributeError):
             pass
@@ -376,7 +378,12 @@ class SD2RefGenerator(LightningModule):
         noise_pred = self.apply_model(x_t_input, t, lr, ref, ref_input=ref_input)
 
         loss = F.mse_loss(noise_pred, noise)
+
         pred_x0_latent = self._predict_x0_from_eps(x_t, t, noise_pred)
+        pred_x0_latent = torch.nan_to_num(
+            pred_x0_latent, nan=0.0, posinf=20.0, neginf=-20.0
+        )
+        pred_x0_latent = pred_x0_latent.clamp(-20.0, 20.0)
 
         return {
             "loss": loss,
@@ -385,6 +392,7 @@ class SD2RefGenerator(LightningModule):
             "x_t": x_t,
             "hr_latent": hr_latent,
             "pred_x0_latent": pred_x0_latent,
+            "t": t,
         }
 
     def p_losses(self, lr, ref, hr):
@@ -455,28 +463,28 @@ class SD2RefGenerator(LightningModule):
         if actual_sr is not None and t_start is not None:
             # ───────────────────────────────────
             # Better Start + 空间自适应加噪
-            # 纹理分区：SR-Ref 差异（SR 画得差 → 多加噪 → diffusion 重绘）
             # ───────────────────────────────────
-            sr_prior = sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
-            sr_latent = sr_latent_cond if sr_latent_cond is not None else self.encode_latent(sr_prior)
+            sr_prior = (
+                sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
+            )
+            sr_latent = (
+                sr_latent_cond
+                if sr_latent_cond is not None
+                else self.encode_latent(sr_prior)
+            )
             sr_target = sr_latent.detach().clone()
 
-            sr_pixel_01 = (sr_prior + 1.0) / 2.0      # [B,3,480,480], [0,1]
-            ref_pixel_01 = (ref + 1.0) / 2.0            # [B,3,480,480], [0,1]
-
-            # SR-Ref 逐像素差异 → 差异大 = SR 没画好 → 需要 diffusion
-            tex_map = (sr_pixel_01 - ref_pixel_01).abs().mean(
-                dim=1, keepdim=True
-            )                                            # [B,1,480,480]
+            sr_pixel_01 = (sr_prior + 1.0) / 2.0
+            ref_pixel_01 = (ref + 1.0) / 2.0
+            tex_map = (sr_pixel_01 - ref_pixel_01).abs().mean(dim=1, keepdim=True)
 
             tex_map_latent = F.interpolate(
                 tex_map,
                 size=sr_latent.shape[2:],
-                mode='bilinear',
+                mode="bilinear",
                 align_corners=False,
-            )                                            # [B,1,60,60]
+            )
 
-            # 每张图独立 min-max 归一化到 [0,1]
             tex_norm = tex_map_latent.clone()
             for b in range(bsz):
                 tmin = tex_norm[b].min()
@@ -484,22 +492,22 @@ class SD2RefGenerator(LightningModule):
                 if tmax > tmin:
                     tex_norm[b] = (tex_norm[b] - tmin) / (tmax - tmin + 1e-8)
 
-            # ── 平坦区 (差异小) → t_flat 少加噪，保留 SR prior 结构
-            # ── 复杂区 (差异大) → t_detail 多加噪，diffusion 重绘纹理
             t_flat = max(200, t_start - 500)
             t_detail = min(999, t_start + 200)
 
             noise = torch.randn_like(sr_latent)
-            t_flat_t   = torch.full((bsz,), t_flat,   device=device, dtype=torch.long)
+            t_flat_t = torch.full((bsz,), t_flat, device=device, dtype=torch.long)
             t_detail_t = torch.full((bsz,), t_detail, device=device, dtype=torch.long)
 
-            x_t_flat   = self.noise_scheduler.add_noise(sr_latent, noise, t_flat_t)
+            x_t_flat = self.noise_scheduler.add_noise(sr_latent, noise, t_flat_t)
             x_t_detail = self.noise_scheduler.add_noise(sr_latent, noise, t_detail_t)
 
             x_t = tex_norm * x_t_detail + (1.0 - tex_norm) * x_t_flat
 
         elif actual_sr is not None:
-            sr_prior = sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
+            sr_prior = (
+                sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
+            )
             sr_target = self.encode_latent(sr_prior).detach()
             latent_h, latent_w = self._infer_latent_size(ref, hr)
             x_t = torch.randn(
@@ -534,6 +542,7 @@ class SD2RefGenerator(LightningModule):
         for t in timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
 
+            # ── 拼接 sr_latent_cond ──
             x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
 
             if sr_target is not None and guidance_scale > 0 and t > t_stop:
@@ -577,7 +586,9 @@ class SD2RefGenerator(LightningModule):
         self.noise_scheduler.set_timesteps(steps, device=device)
         pixel_each_step = []
 
-        sr_latent_cond = self._get_sr_latent_cond(lr, ref) if actual_sr is not None else None
+        sr_latent_cond = (
+            self._get_sr_latent_cond(lr, ref) if actual_sr is not None else None
+        )
 
         for t in self.noise_scheduler.timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
@@ -736,13 +747,15 @@ if __name__ == "__main__":
     model.eval()
 
     # 验证 conv_in 是 8 通道
-    assert model.unet.conv_in.in_channels == 8, (
-        f"Expected 8-channel conv_in, got {model.unet.conv_in.in_channels}"
-    )
+    assert (
+        model.unet.conv_in.in_channels == 8
+    ), f"Expected 8-channel conv_in, got {model.unet.conv_in.in_channels}"
     print("✅ conv_in 8 通道验证通过")
 
     # 验证前 4 通道 = 原始 SD2 权重（非全零）
-    assert model.unet.conv_in.weight[:, :4].abs().sum() > 0, "前 4 通道应为非零预训练权重"
+    assert (
+        model.unet.conv_in.weight[:, :4].abs().sum() > 0
+    ), "前 4 通道应为非零预训练权重"
     print("✅ 前 4 通道预训练权重保留")
 
     # 验证后 4 通道 = 零初始化
