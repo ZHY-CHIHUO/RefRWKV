@@ -365,6 +365,7 @@ def build_model(cfg: dict):
         lambda_gan_semantic=mc.get("lambda_gan", 0.0),
         lambda_gan_texture=mc.get("lambda_gan_texture", 0.0),
         lambda_lpips=mc.get("lambda_lpips", 0.0),
+        lambda_diff_sr=mc.get("lambda_diff_sr", 0.5),  # ← 新增
         # Training control
         accumulate_grad_batches=mc.get("accumulate_grad_batches", 8),
         use_amp=mc.get("use_amp", True),
@@ -380,7 +381,7 @@ def build_model(cfg: dict):
         fr_metrics=mc.get("fr_metrics", ["psnr", "ssim", "lpips", "dists"]),
         # Better Start SR model
         sr_model=sr_model,
-        sr_fixed=mc.get("sr_fixed", True), 
+        sr_fixed=mc.get("sr_fixed", True),
         t_start=mc.get("t_start", None),
         guidance_scale=mc.get("guidance_scale", 0.0),
         t_stop=mc.get("t_stop", 200),
@@ -492,13 +493,14 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  验证样本数    : {len(val_loader.dataset)}")
     print(f"  测试样本数    : {len(test_loader.dataset)}")
     print(f"  Strategy      : {mc.get('strategy', 'rwkv')}")
-    print(f"  RWKN embed_dim: {mc.get('rwkv_cfg', {}).get('embed_dim', 192)}")
+    print(f"  RWKV embed_dim: {mc.get('rwkv_cfg', {}).get('embed_dim', 192)}")
     print(f"  使用 Discriminator : {mc.get('use_discriminator', True)}")
     print(
         f"  GAN λ (sem/tex) : {mc.get('lambda_gan', 0.0)} / "
         f"{mc.get('lambda_gan_texture', 0.0)}"
     )
     print(f"  LPIPS λ       : {mc.get('lambda_lpips', 0.0)}")
+    print(f"  MSE(SR) λ     : {mc.get('lambda_diff_sr', 0.5)}")
     print(f"  SR latent cond  : {mc.get('use_sr_latent_cond', False)}")
     print(
         f"  LR (G/D_sem/D_tex): {mc.get('learning_rate', 1e-4)} / "
@@ -516,7 +518,8 @@ def train(cfg: dict, resume_ckpt: str = None):
         if "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
             skipped_keys = [
-                k for k in state_dict
+                k
+                for k in state_dict
                 if "conv_in" in k and k.startswith("generator.unet.conv_in")
             ]
             if skipped_keys:
@@ -525,8 +528,7 @@ def train(cfg: dict, resume_ckpt: str = None):
                     f"新 conv_in 使用 8 通道初始化"
                 )
                 state_dict = {
-                    k: v for k, v in state_dict.items()
-                    if k not in skipped_keys
+                    k: v for k, v in state_dict.items() if k not in skipped_keys
                 }
             system.load_state_dict(state_dict, strict=False)
             print(f"✅ 加载模型权重 (跳过 optimizer — 结构已变更)")

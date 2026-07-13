@@ -387,8 +387,11 @@ class RefDiffRWKV(nn.Module):
         patch_h = H // self.patch_size
         patch_w = W // self.patch_size
 
-        # LR 上采样到 Ref 尺寸
-        LR_up = self.lr_upsampler(LR)
+        # 如果 LR 已经是 Ref 的分辨率（比如 sr_pixel: 480x480），跳过上采样
+        if LR.shape[-2:] == Ref.shape[-2:]:
+            LR_up = LR
+        else:
+            LR_up = self.lr_upsampler(LR)
 
         # Patch embed 到 tokens
         sr_tokens = self.lr_patch_embed(LR_up)
