@@ -267,20 +267,24 @@ class SD2RefGANSystem(LightningModule):
 
         # 全零 context + 无 down_intrablock（不注入任何 adapter 特征）
         null_ctx = torch.zeros(
-            bsz, 77, self.generator.cross_attn_dim,
-            device=device, dtype=torch.float32,
+            bsz,
+            77,
+            self.generator.cross_attn_dim,
+            device=device,
+            dtype=torch.float32,
         )
 
         eps_pred = self.generator.unet(
-            x_input, t,
+            x_input,
+            t,
             encoder_hidden_states=null_ctx,
             # 不传 down_intrablock_additional_residuals
         ).sample
 
         pred_x0 = self.generator._predict_x0_from_eps(x_t, t, eps_pred)
-        pred_x0 = torch.nan_to_num(
-            pred_x0, nan=0.0, posinf=20.0, neginf=-20.0
-        ).clamp(-20.0, 20.0)
+        pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
+            -20.0, 20.0
+        )
 
         pred_pixel = self.generator.decode_latent(pred_x0)
         return pred_pixel
@@ -301,19 +305,15 @@ class SD2RefGANSystem(LightningModule):
         Returns:
             pred_pixel: [B, 3, H, W] in [-1, 1]
         """
-        x_t = self.generator.noise_scheduler.add_noise(
-            sr_latent_precomputed, noise, t
-        )
+        x_t = self.generator.noise_scheduler.add_noise(sr_latent_precomputed, noise, t)
 
-        x_input = self.generator._concat_sr_latent(
-            x_t, sr_latent_precomputed.detach()
-        )
+        x_input = self.generator._concat_sr_latent(x_t, sr_latent_precomputed.detach())
         noise_pred = self.generator.apply_model(x_input, t, lr, ref)
         pred_x0 = self.generator._predict_x0_from_eps(x_t, t, noise_pred)
 
-        pred_x0 = torch.nan_to_num(
-            pred_x0, nan=0.0, posinf=20.0, neginf=-20.0
-        ).clamp(-20.0, 20.0)
+        pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
+            -20.0, 20.0
+        )
 
         pred_pixel = self.generator.decode_latent(pred_x0)
         return pred_pixel
@@ -333,7 +333,11 @@ class SD2RefGANSystem(LightningModule):
             return None, None, None, None, None
 
         t = torch.randint(
-            0, 999, (bsz,), device=device, dtype=torch.long,
+            0,
+            999,
+            (bsz,),
+            device=device,
+            dtype=torch.long,
         )
         noise = torch.randn_like(sr_latent)
 
@@ -367,9 +371,7 @@ class SD2RefGANSystem(LightningModule):
             loss = out["loss"]  # MSE(noise_pred, noise)
 
         if torch.isnan(loss) or torch.isinf(loss):
-            print(
-                f"❌ [G step] Phase1 loss NaN/Inf，跳过。batch={batch_idx}"
-            )
+            print(f"❌ [G step] Phase1 loss NaN/Inf，跳过。batch={batch_idx}")
             self._gd_phase = 1
             if self.discriminator is not None:
                 self.discriminator.train()
@@ -400,7 +402,11 @@ class SD2RefGANSystem(LightningModule):
                 # ── 预计算 sr_latent + 共享 t 和 noise ──
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
                 t_sr = torch.randint(
-                    0, 999, (bsz,), device=device, dtype=torch.long,
+                    0,
+                    999,
+                    (bsz,),
+                    device=device,
+                    dtype=torch.long,
                 )
                 noise_sr = torch.randn_like(sr_latent)
 
@@ -419,27 +425,20 @@ class SD2RefGANSystem(LightningModule):
 
                 # MSE(SR pixel vs HR path pixel)
                 if self.lambda_diff_sr > 0:
-                    loss_diff_sr = F.mse_loss(
-                        pred_sr_pixel, pred_hr_pixel.detach()
-                    )
+                    loss_diff_sr = F.mse_loss(pred_sr_pixel, pred_hr_pixel.detach())
                     phase2_loss = phase2_loss + self.lambda_diff_sr * loss_diff_sr
-                    self.log(
-                        "train/G_diff_sr", loss_diff_sr.detach(), on_step=True
-                    )
+                    self.log("train/G_diff_sr", loss_diff_sr.detach(), on_step=True)
 
                 # LPIPS(SR pixel vs HR path pixel)
                 if self.lambda_lpips > 0:
-                    loss_lpips_sr = self.net_lpips(
-                        pred_sr_pixel, pred_hr_pixel.detach()
-                    ).mean() * self.lambda_lpips
-                    if (
-                        not torch.isnan(loss_lpips_sr)
-                        and not torch.isinf(loss_lpips_sr)
+                    loss_lpips_sr = (
+                        self.net_lpips(pred_sr_pixel, hr).mean() * self.lambda_lpips
+                    )
+                    if not torch.isnan(loss_lpips_sr) and not torch.isinf(
+                        loss_lpips_sr
                     ):
                         phase2_loss = phase2_loss + loss_lpips_sr
-                        self.log(
-                            "train/G_lpips", loss_lpips_sr.detach(), on_step=True
-                        )
+                        self.log("train/G_lpips", loss_lpips_sr.detach(), on_step=True)
                     else:
                         self._nan_g_count += 1
                         print(
@@ -496,9 +495,7 @@ class SD2RefGANSystem(LightningModule):
         if phase2_loss_val is not None:
             g_total = g_total + phase2_loss_val
         self.log("train/G_total", g_total, on_step=True, prog_bar=True)
-        self.log(
-            "train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True
-        )
+        self.log("train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True)
         return g_total
 
     # ═══════════════════════════════════════════════════════
@@ -532,19 +529,19 @@ class SD2RefGANSystem(LightningModule):
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
                 t = torch.randint(
-                    0, 999, (bsz,), device=device, dtype=torch.long,
+                    0,
+                    999,
+                    (bsz,),
+                    device=device,
+                    dtype=torch.long,
                 )
                 noise = torch.randn_like(sr_latent)
 
                 # 无 adapter（质量标杆）
-                pred_hr_pixel = self._no_adapter_pred_x0(
-                    hr, sr_latent, t, noise
-                )
+                pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
 
                 # 有 adapter（需要追赶）
-                pred_sr_pixel = self._adapter_pred_x0(
-                    lr, ref, sr_latent, t, noise
-                )
+                pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
 
         real = pred_hr_pixel.detach().float()
         fake = pred_sr_pixel.detach().float()
@@ -564,8 +561,7 @@ class SD2RefGANSystem(LightningModule):
         if torch.isnan(real).any() or torch.isinf(real).any():
             self._nan_d_count += 1
             print(
-                f"⚠️ [D step] real(no-adapter) NaN/Inf "
-                f"(#{self._nan_d_count})，跳过"
+                f"⚠️ [D step] real(no-adapter) NaN/Inf " f"(#{self._nan_d_count})，跳过"
             )
             self.discriminator.eval()
             self.discriminator.requires_grad_(False)
@@ -580,19 +576,25 @@ class SD2RefGANSystem(LightningModule):
         ):
             with torch.amp.autocast("cuda", enabled=False):
                 loss_d_sem = self.discriminator.compute_d_loss(
-                    real=real, fake=fake, ref=None,
-                    lambda_semantic=1.0, lambda_texture=0.0,
+                    real=real,
+                    fake=fake,
+                    ref=None,
+                    lambda_semantic=1.0,
+                    lambda_texture=0.0,
                 )
             if not torch.isnan(loss_d_sem) and not torch.isinf(loss_d_sem):
                 (loss_d_sem / self.accumulate_grad_batches).backward()
                 self._d_sem_accum_count += 1
                 self.log(
-                    "train/D_sem", loss_d_sem.detach(),
-                    on_step=True, prog_bar=True,
+                    "train/D_sem",
+                    loss_d_sem.detach(),
+                    on_step=True,
+                    prog_bar=True,
                 )
                 if self._d_sem_accum_count >= self.accumulate_grad_batches:
                     self.clip_gradients(
-                        d_sem_opt, gradient_clip_val=1.0,
+                        d_sem_opt,
+                        gradient_clip_val=1.0,
                         gradient_clip_algorithm="norm",
                     )
                     d_sem_opt.step()
@@ -613,19 +615,25 @@ class SD2RefGANSystem(LightningModule):
         ):
             with torch.amp.autocast("cuda", enabled=False):
                 loss_d_tex = self.discriminator.compute_d_loss(
-                    real=real, fake=fake, ref=ref,
-                    lambda_semantic=0.0, lambda_texture=1.0,
+                    real=real,
+                    fake=fake,
+                    ref=ref,
+                    lambda_semantic=0.0,
+                    lambda_texture=1.0,
                 )
             if not torch.isnan(loss_d_tex) and not torch.isinf(loss_d_tex):
                 (loss_d_tex / self.accumulate_grad_batches).backward()
                 self._d_tex_accum_count += 1
                 self.log(
-                    "train/D_tex", loss_d_tex.detach(),
-                    on_step=True, prog_bar=True,
+                    "train/D_tex",
+                    loss_d_tex.detach(),
+                    on_step=True,
+                    prog_bar=True,
                 )
                 if self._d_tex_accum_count >= self.accumulate_grad_batches:
                     self.clip_gradients(
-                        d_tex_opt, gradient_clip_val=1.0,
+                        d_tex_opt,
+                        gradient_clip_val=1.0,
                         gradient_clip_algorithm="norm",
                     )
                     d_tex_opt.step()
