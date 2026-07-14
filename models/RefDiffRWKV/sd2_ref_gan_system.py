@@ -179,28 +179,8 @@ class SD2RefGANSystem(LightningModule):
         self._d_tex_accum_count = checkpoint.get("d_tex_accum_count", 0)
 
     def load_state_dict(self, state_dict, strict=True):
-        """Load checkpoint weights.
-
-        When sr_fixed=True:  skip sr_model keys (weights come from build_sr_model).
-        When sr_fixed=False: load sr_model keys from checkpoint (retain fine-tuned weights).
-        """
-        if self.hparams.get("sr_fixed", True):
-            filtered = {
-                k: v for k, v in state_dict.items() if not k.startswith("sr_model.")
-            }
-            skipped = len(state_dict) - len(filtered)
-            if skipped:
-                print(
-                    f"🔒 跳过 {skipped} 个 sr_model 键，使用 build_sr_model 加载的权重"
-                )
-        else:
-            filtered = state_dict
-            sr_keys = [k for k in state_dict if k.startswith("sr_model.")]
-            if sr_keys:
-                print(
-                    f"🔧 sr_fixed=False，从 checkpoint 恢复 {len(sr_keys)} 个 sr_model 权重"
-                )
-        return super().load_state_dict(filtered, strict=False)
+        """Load checkpoint weights. sr_fixed 只控制冻结，不影响加载。"""
+        return super().load_state_dict(state_dict, strict=False)
 
     def _override_lr_on_resume(self):
         optimizers = self.optimizers()

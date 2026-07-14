@@ -518,21 +518,15 @@ def train(cfg: dict, resume_ckpt: str = None):
         if "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
             skipped_keys = [
-                k
-                for k in state_dict
+                k for k in state_dict
                 if "conv_in" in k and k.startswith("generator.unet.conv_in")
             ]
             if skipped_keys:
-                print(
-                    f"🔧 跳过旧版 conv_in 权重 ({len(skipped_keys)} keys)，"
-                    f"新 conv_in 使用 8 通道初始化"
-                )
-                state_dict = {
-                    k: v for k, v in state_dict.items() if k not in skipped_keys
-                }
+                print(f"🔧 跳过旧版 conv_in 权重 ({len(skipped_keys)} keys)")
+                state_dict = {k: v for k, v in state_dict.items() if k not in skipped_keys}
+                resume_ckpt = None
             system.load_state_dict(state_dict, strict=False)
-            print(f"✅ 加载模型权重 (跳过 optimizer — 结构已变更)")
-            resume_ckpt = None
+            print(f"✅ 加载模型权重")
 
     trainer.fit(system, train_loader, val_loader, ckpt_path=resume_ckpt)
 
