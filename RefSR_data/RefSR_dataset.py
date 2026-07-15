@@ -18,7 +18,6 @@ class RefPNGDataset(Dataset):
                 Ref/  (480x480)
             val/   ...
             test/  ...
-
     Args:
         data_dir: 数据根目录
         mode: 'train' / 'val' / 'test'
