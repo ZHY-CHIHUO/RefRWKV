@@ -16,6 +16,10 @@ _cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 # ═══════════════════════════════════════════════════════════════
 # CUDA WKV (unchanged — keep your working kernel)
 # ═══════════════════════════════════════════════════════════════
+# 自动获取当前 GPU 的计算能力
+cap = torch.cuda.get_device_capability()
+arch = f"compute_{cap[0]}{cap[1]}"
+
 wkv_cuda = load(
     name="bi_wkv",
     sources=[
@@ -29,7 +33,7 @@ wkv_cuda = load(
         "--use_fast_math",
         "-O3",
         "-Xptxas -O3",
-        "-gencode arch=compute_120,code=sm_120",
+        f"-gencode arch={arch},code={arch}",
     ],
 )
 
