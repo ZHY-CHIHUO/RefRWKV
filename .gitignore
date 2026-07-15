@@ -6,9 +6,12 @@ __pycache__/
 dist/
 build/
 
-# ===== 数据集 (文件太大,不上传) =====
+# ===== 数据集 =====
 *.lmdb/
-RefSR_data/
+RefSR_data/ALL_2/
+RefSR_data/ALL_2_zip/
+RefSR_data/CUFED
+RefSR_data/CUFED5/
 data/
 
 # ===== 模型权重 (太大,不上传) =====
