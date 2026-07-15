@@ -1,35 +1,43 @@
-# Python 编译缓存
+# ===== Python =====
 __pycache__/
-*.pyc
-*.pyo
-
-# 模型权重（绝对不提交）
-*.pth
-*.ckpt
-*.bin
-*.onnx
-checkpoints/
-logs/
-best_restore_rwkv_ref.pth
-
-# 数据集
-results/*
-data/*
-RefSR_data/*
-test_results/
-# 如果你 data/ 里有少量配置文件想提交，可以放开特定文件：
-!data/*.py
-!RefSR_data/*.py
-
-configs/*
-
-# CUDA 编译产物
-*.o
+*.py[cod]
 *.so
+*.egg-info/
+dist/
+build/
 
-# IDE
+# ===== 数据集 (文件太大,不上传) =====
+*.lmdb/
+RefSR_data/
+data/raw/
+
+# ===== 模型权重 (太大,不上传) =====
+checkpoints/
+
+# ===== 训练日志 =====
+logs/
+
+# ===== 配置 & 脚本 (按需隐藏) =====
+configs/
+scripts/
+
+# ===== 结果文件 (按需保留，如果不需要可取消注释) =====
+results/
+
+# ===== CUDA 编译产物 =====
+*.o
+*.out
+*.ptx
+*.cu.o
+
+# ===== 环境变量 =====
+.env
+.env.local
+
+# ===== IDE =====
 .vscode/
 .idea/
 
-# macOS
+# ===== 系统 =====
 .DS_Store
+Thumbs.db
