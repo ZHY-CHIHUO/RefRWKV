@@ -9,7 +9,7 @@ build/
 # ===== 数据集 (文件太大,不上传) =====
 *.lmdb/
 RefSR_data/
-data/raw/
+data/
 
 # ===== 模型权重 (太大,不上传) =====
 checkpoints/

@@ -452,7 +452,7 @@ class RefPairedEnviMemmapDataset(Dataset):
 def main():
     # ======================== 1. 数据集测试参数 ========================
     data_dirs = [
-        "/home/zhy/PROJECT/RWKV/data/raw/data0",
+        "/mnt/sda/home/zhangheyi/projects/RWKV/data/raw/data0",
     ]
     patch_size = 256
     scale = 8
