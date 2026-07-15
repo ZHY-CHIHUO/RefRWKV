@@ -403,15 +403,15 @@ class SD2RefGenerator(LightningModule):
     #  sr_latent 条件生成
     # ═══════════════════════════════════════════════════════
     def _get_sr_latent_cond(self, lr, ref) -> Optional[torch.Tensor]:
-        """计算 SR prior 的 VAE latent，作为 UNet 的额外条件。
-        返回 [B, 4, 60, 60] 或 None。
-        """
         actual_sr = self.sr_model if self.sr_model is not None else None
         if actual_sr is None or not self.use_sr_latent_cond:
             return None
         with torch.no_grad():
-            sr_prior = actual_sr(lr, ref)
-            return self.encode_latent(sr_prior)
+            with torch.cuda.amp.autocast(enabled=False):
+                sr_prior = actual_sr(lr.float(), ref.float())
+                sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0)
+                sr_prior = sr_prior.clamp(-1.0, 1.0)
+                return self.encode_latent(sr_prior.to(self.vae.dtype))
 
     def _concat_sr_latent(
         self, x_t: torch.Tensor, sr_latent_cond: Optional[torch.Tensor]
