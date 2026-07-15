@@ -371,7 +371,12 @@ class SD2RefGANSystem(LightningModule):
         if (
             self.sr_model is not None
             and self.discriminator is not None
-            and (self.lambda_gan_semantic > 0 or self.lambda_gan_texture > 0)
+            and (
+                self.lambda_gan_semantic > 0
+                or self.lambda_gan_texture > 0
+                or self.lambda_diff_sr > 0
+                or self.lambda_lpips > 0
+            )
         ):
             self.discriminator.eval()
             self.discriminator.requires_grad_(False)

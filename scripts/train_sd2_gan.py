@@ -44,6 +44,12 @@ from RefRWKV.RefSR_data.RefSR_dataset import RefLMDBDataset
 # SR prior 构建
 # ============================================================
 def build_sr_model(cfg: dict):
+    """构建 SR prior 模型。
+
+    ckpt_path 不为空时从独立 checkpoint 加载初始权重；
+    ckpt_path 为空时随机初始化（resume 时会被 GAN checkpoint 中的 generator.sr_model.* 覆盖）。
+    sr_fixed 只控制冻结，不影响加载来源。
+    """
     mc = cfg.get("model", {})
     if not mc.get("sr_enabled", False):
         return None
@@ -62,6 +68,7 @@ def build_sr_model(cfg: dict):
 
     ckpt_path = sr_cfg.get("ckpt_path")
     if ckpt_path is not None and os.path.exists(ckpt_path):
+        # 从独立 SR checkpoint 加载初始权重
         ckpt = torch.load(ckpt_path, map_location="cpu")
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             ckpt = ckpt["state_dict"]
@@ -80,15 +87,17 @@ def build_sr_model(cfg: dict):
             print(f"⚠️  SR prior 缺失键 ({len(missing)}): {missing[:3]}")
         if unexpected:
             print(f"⚠️  SR prior 多余键 ({len(unexpected)}): {unexpected[:3]}")
-        print(f"✅ Loaded SR prior weights from {ckpt_path}")
-    elif mc.get("sr_enabled", False):
-        print(
-            "⚠️ sr_enabled=True but sr.ckpt_path is null; using randomly initialized SR prior"
-        )
+        print(f"✅ 从 {ckpt_path} 加载 SR prior 初始权重")
+    else:
+        print("🔁 SR prior 随机初始化（resume 时由 GAN checkpoint 覆盖）")
 
     if mc.get("sr_fixed", True):
         model.eval()
         model.requires_grad_(False)
+        print(f"🔒 SR prior 已冻结 (sr_fixed=True)")
+    else:
+        model.train()
+        print(f"🔧 SR prior 可训练 (sr_fixed=False)")
 
     return model
 
@@ -511,22 +520,6 @@ def train(cfg: dict, resume_ckpt: str = None):
     print(f"  Semantic      : {mc.get('use_semantic', True)}")
     print(f"  AMP           : {mc.get('use_amp', True)}")
     print(f"{'='*60}")
-
-    # ── Resume: 过滤旧版 4 通道 conv_in，兼容新版 8 通道 ──
-    if resume_ckpt:
-        ckpt = torch.load(resume_ckpt, map_location="cpu")
-        if "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-            skipped_keys = [
-                k for k in state_dict
-                if "conv_in" in k and k.startswith("generator.unet.conv_in")
-            ]
-            if skipped_keys:
-                print(f"🔧 跳过旧版 conv_in 权重 ({len(skipped_keys)} keys)")
-                state_dict = {k: v for k, v in state_dict.items() if k not in skipped_keys}
-                resume_ckpt = None
-            system.load_state_dict(state_dict, strict=False)
-            print(f"✅ 加载模型权重")
 
     trainer.fit(system, train_loader, val_loader, ckpt_path=resume_ckpt)
 
