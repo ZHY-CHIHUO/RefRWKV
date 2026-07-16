@@ -721,11 +721,16 @@ class SD2RefGANSystem(LightningModule):
                     x_offset += im.width
                 combined.save(os.path.join(save_dir, f"b{batch_idx}.png"))
 
+        del val_results
+        torch.cuda.empty_cache()
         return loss_diff
 
     def on_validation_epoch_start(self):
         if self.discriminator is not None:
             self.discriminator.eval()
+
+    def on_validation_epoch_end(self):
+        torch.cuda.empty_cache()
 
     def on_train_start(self):
         if self.sr_model is not None:

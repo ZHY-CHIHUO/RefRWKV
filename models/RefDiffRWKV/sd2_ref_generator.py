@@ -407,7 +407,7 @@ class SD2RefGenerator(LightningModule):
         if actual_sr is None or not self.use_sr_latent_cond:
             return None
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 sr_prior = actual_sr(lr.float(), ref.float())
                 sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0)
                 sr_prior = sr_prior.clamp(-1.0, 1.0)
@@ -452,8 +452,15 @@ class SD2RefGenerator(LightningModule):
         # ═══════════════════════════════════════
         sr_latent_cond = None
         if actual_sr is not None:
-            sr_prior_for_cond = actual_sr(lr, ref)
-            sr_latent_cond = self.encode_latent(sr_prior_for_cond)
+            with torch.amp.autocast("cuda", enabled=False):
+                sr_prior_for_cond = actual_sr(lr.float(), ref.float())
+                sr_prior_for_cond = torch.nan_to_num(
+                    sr_prior_for_cond, nan=0.0, posinf=1.0, neginf=-1.0
+                )
+                sr_prior_for_cond = sr_prior_for_cond.clamp(-1.0, 1.0)
+                sr_latent_cond = self.encode_latent(
+                    sr_prior_for_cond.to(self.vae.dtype)
+                )
 
         # ═══════════════════════════════════════
         # Step 2: 初始化 x_t
@@ -464,9 +471,7 @@ class SD2RefGenerator(LightningModule):
             # ───────────────────────────────────
             # Better Start + 空间自适应加噪
             # ───────────────────────────────────
-            sr_prior = (
-                sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
-            )
+            sr_prior = sr_prior_for_cond
             sr_latent = (
                 sr_latent_cond
                 if sr_latent_cond is not None
@@ -505,9 +510,7 @@ class SD2RefGenerator(LightningModule):
             x_t = tex_norm * x_t_detail + (1.0 - tex_norm) * x_t_flat
 
         elif actual_sr is not None:
-            sr_prior = (
-                sr_prior_for_cond if sr_latent_cond is not None else actual_sr(lr, ref)
-            )
+            sr_prior = sr_prior_for_cond
             sr_target = self.encode_latent(sr_prior).detach()
             latent_h, latent_w = self._infer_latent_size(ref, hr)
             x_t = torch.randn(
@@ -570,8 +573,12 @@ class SD2RefGenerator(LightningModule):
         actual_sr = sr_model if sr_model is not None else self.sr_model
 
         if actual_sr is not None:
-            sr_prior = actual_sr(lr, ref)
-            x_t = self.encode_latent(sr_prior)
+            with torch.amp.autocast("cuda", enabled=False):
+                sr_prior = actual_sr(lr.float(), ref.float())
+                sr_prior = torch.nan_to_num(
+                    sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
+                ).clamp(-1.0, 1.0)
+                x_t = self.encode_latent(sr_prior.to(self.vae.dtype))
         else:
             latent_h, latent_w = self._infer_latent_size(ref, hr)
             x_t = torch.randn(
