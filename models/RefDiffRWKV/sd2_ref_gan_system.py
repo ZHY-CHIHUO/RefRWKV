@@ -685,8 +685,9 @@ class SD2RefGANSystem(LightningModule):
             os.makedirs(save_dir, exist_ok=True)
 
             with torch.no_grad():
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    sr_prior = self.sr_model(lr, ref)
+                with torch.amp.autocast("cuda", enabled=False):
+                    sr_prior = self.sr_model(lr.float(), ref.float())
+                    sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
             sr_prior_01 = (sr_prior + 1.0) / 2.0
 
             images_to_concat = []
