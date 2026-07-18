@@ -79,7 +79,13 @@ class RefPNGDataset(Dataset):
             raise FileNotFoundError(f"LR directory not found: {self.lr_dir}")
 
         # 可用文件名（不含扩展名）
-        all_names = sorted([p.stem for p in self.lr_dir.glob("*.png")])
+        all_names = sorted(
+            [
+                os.path.splitext(f)[0]
+                for f in os.listdir(self.lr_dir)
+                if f.endswith(".png")
+            ]
+        )
 
         mode_index = {"train": 0, "val": 1, "test": 2}[mode]
         num_to_sample = max_samples[mode_index]
