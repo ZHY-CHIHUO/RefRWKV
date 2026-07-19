@@ -96,7 +96,6 @@ class SD2RefGenerator(LightningModule):
         self.unet = UNet2DConditionModel.from_pretrained(
             sd_model_path, subfolder="unet", local_files_only=local_files_only
         )
-        self.unet.enable_gradient_checkpointing()
 
         # 先扩展 conv_in 再注入 LoRA
         self._expand_conv_in_for_sr_latent()

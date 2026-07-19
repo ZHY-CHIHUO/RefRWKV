@@ -67,7 +67,7 @@ def _visual_forward(model, image, return_feats=False, return_pooled_feats=False)
 
 
 class ImageOpenCLIPConvNext(nn.Module):
-    def __init__(self, precision="fp32", trainable_stages=0, local_files_only=True):
+    def __init__(self, precision="fp32", trainable_stages=0):
         super().__init__()
         model_name = "convnext_base_w"
         pretrained_name = "laion2b_s13b_b82k"
@@ -75,7 +75,6 @@ class ImageOpenCLIPConvNext(nn.Module):
             model_name,
             pretrained=pretrained_name,
             precision=precision,
-            local_files_only=local_files_only,
         )
         self.model = full_model.visual
         self.trainable_stages = trainable_stages
@@ -180,7 +179,6 @@ class ImageConvNextDiscriminator(nn.Module):
         self.model = ImageOpenCLIPConvNext(
             precision=precision,
             trainable_stages=trainable_stages,
-            local_files_only=local_files_only,
         )
         self.decoder = MultiLevelDConv(
             level=3, in_ch1=[256, 512], in_ch2=640, out_ch=256, down=2

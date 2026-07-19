@@ -284,27 +284,33 @@ class SD2RefGANSystem(LightningModule):
 
         if self.discriminator is not None:
             if self.discriminator.use_semantic_d:
-                d_sem_opt = torch.optim.AdamW(
-                    [
-                        p
-                        for p in self.discriminator.D_sem.parameters()
-                        if p.requires_grad
-                    ],
-                    lr=self.hparams.d_lr_sem,
-                    betas=self.hparams.betas,
-                    weight_decay=self.hparams.d_weight_decay,
-                )
-                self._opt_idx["d_sem"] = len(opts)
-                opts.append(d_sem_opt)
+                params_sem = [
+                    p for p in self.discriminator.D_sem.parameters() if p.requires_grad
+                ]
+                if params_sem:
+                    d_sem_opt = torch.optim.AdamW(
+                        params_sem,
+                        lr=self.hparams.d_lr_sem,
+                        betas=self.hparams.betas,
+                        weight_decay=self.hparams.d_weight_decay,
+                    )
+                    self._opt_idx["d_sem"] = len(opts)
+                    opts.append(d_sem_opt)
+                else:
+                    logger.warning("D_sem 无可训练参数，跳过 D_sem 优化器")
             if self.discriminator.use_texture_d:
-                d_tex_opt = torch.optim.AdamW(
-                    list(self.discriminator.D_tex.parameters()),
-                    lr=self.hparams.d_lr_tex,
-                    betas=self.hparams.betas,
-                    weight_decay=self.hparams.d_weight_decay,
-                )
-                self._opt_idx["d_tex"] = len(opts)
-                opts.append(d_tex_opt)
+                params_tex = list(self.discriminator.D_tex.parameters())
+                if params_tex:
+                    d_tex_opt = torch.optim.AdamW(
+                        params_tex,
+                        lr=self.hparams.d_lr_tex,
+                        betas=self.hparams.betas,
+                        weight_decay=self.hparams.d_weight_decay,
+                    )
+                    self._opt_idx["d_tex"] = len(opts)
+                    opts.append(d_tex_opt)
+                else:
+                    logger.warning("D_tex 无可训练参数，跳过 D_tex 优化器")
         return opts
 
     def on_save_checkpoint(self, checkpoint):
