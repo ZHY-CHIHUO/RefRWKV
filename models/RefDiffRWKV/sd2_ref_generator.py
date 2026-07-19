@@ -302,7 +302,7 @@ class SD2RefGenerator(LightningModule):
         ref_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz = x_input.shape[0]
-        ref_input = ref_input or ref
+        ref_input = ref if ref_input is None else ref_input
         ref_feats = self.adapter(lr, ref_input)
         sem_tokens = None
         if self.use_semantic:
