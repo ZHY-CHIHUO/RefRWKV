@@ -55,6 +55,9 @@ class SD2RefGANSystem(LightningModule):
         t_start: Optional[int] = None,
         guidance_scale: float = 0.0,
         t_stop: int = 200,
+        # [SEC] 梯度监控阈值
+        grad_clip_val: float = 1.0,
+        grad_warn_threshold: float = 100.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["generator", "discriminator", "sr_model"])
@@ -74,6 +77,9 @@ class SD2RefGANSystem(LightningModule):
         self.guidance_scale = guidance_scale
         self.t_stop = t_stop
 
+        self.grad_clip_val = grad_clip_val
+        self.grad_warn_threshold = grad_warn_threshold
+
         # ── NaN 防护计数 ──
         self._nan_g_count = 0
         self._nan_d_count = 0
@@ -83,7 +89,11 @@ class SD2RefGANSystem(LightningModule):
         # ═══════════════════════════════════════
         self.automatic_optimization = False
         self.use_amp = use_amp
-        self.scaler_g = torch.amp.GradScaler("cuda", enabled=use_amp)
+        # [SEC] 添加设备检查
+        if use_amp and torch.cuda.is_available():
+            self.scaler_g = torch.amp.GradScaler("cuda", enabled=True)
+        else:
+            self.scaler_g = None
 
         self._g_accum_count = 0
         self._d_sem_accum_count = 0
@@ -99,18 +109,21 @@ class SD2RefGANSystem(LightningModule):
         for p in self.net_lpips.parameters():
             p.requires_grad = False
 
+        # [SEC] IQA engine 容错处理
+        self.iqa = None
         try:
             from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
             self.iqa = IQAEngine(
-                device="cuda" if torch.cuda.is_available() else "cpu",
+                device=device_str,
                 nr_metrics=[],
                 fr_metrics=fr_metrics or ["psnr", "ssim", "lpips", "dists"],
                 use_y_channel=True,
                 verbose=False,
             )
-        except (ImportError, RuntimeError):
-            self.iqa = None
+        except (ImportError, RuntimeError) as e:
+            print(f"⚠️ IQA engine 不可用: {e}")
 
     # ═══════════════════════════════════════════════════════
     #  构建全零 down_intrablock 残差
@@ -146,6 +159,66 @@ class SD2RefGANSystem(LightningModule):
                 )
             )
         return residuals
+
+    # ═══════════════════════════════════════════════════════
+    #  [OPT] 提取公共 pred_x0 基础逻辑，减少重复代码
+    # ═══════════════════════════════════════════════════════
+    def _pred_x0_base(
+        self,
+        latent: torch.Tensor,
+        sr_latent_cond: Optional[torch.Tensor],
+        t: torch.Tensor,
+        noise: torch.Tensor,
+        context: torch.Tensor,
+        down_intrablock: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """公共的 pred_x0 计算逻辑
+
+        Args:
+            latent: 原始干净 latent
+            sr_latent_cond: SR 条件 latent（可选）
+            t: 时间步
+            noise: 噪声
+            context: 文本/语义 context
+            down_intrablock: adapter 注入残差（可选，None 表示不使用 adapter）
+
+        Returns:
+            pred_pixel: 预测的像素空间图像
+        """
+        # 加噪
+        x_t = self.generator.noise_scheduler.add_noise(latent, noise, t)
+
+        # 拼接 sr_latent_cond（如果有）
+        x_input = self.generator._concat_sr_latent(x_t, sr_latent_cond)
+
+        # UNet 前向
+        if down_intrablock is None:
+            # 不使用 adapter
+            zero_residuals = self._build_zero_intrablock(x_input)
+            eps_pred = self.generator.unet(
+                x_input,
+                t,
+                encoder_hidden_states=context,
+                down_intrablock_additional_residuals=zero_residuals,
+            ).sample
+        else:
+            # 使用 adapter
+            eps_pred = self.generator.unet(
+                x_input,
+                t,
+                encoder_hidden_states=context,
+                down_intrablock_additional_residuals=down_intrablock,
+            ).sample
+
+        # 反推 pred_x0
+        pred_x0 = self.generator._predict_x0_from_eps(x_t, t, eps_pred)
+        pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
+            -20.0, 20.0
+        )
+
+        # decode 到像素空间
+        pred_pixel = self.generator.decode_latent(pred_x0)
+        return pred_pixel
 
     # ═══════════════════════════════════════════════════════
     #  优化器 / 状态持久化
@@ -265,6 +338,27 @@ class SD2RefGANSystem(LightningModule):
             print(f"🔧 D_tex LR: {old:.1e} → {self.hparams.d_lr_tex:.1e}")
 
     # ═══════════════════════════════════════════════════════
+    #  [SEC] 梯度监控
+    # ═══════════════════════════════════════════════════════
+    def _monitor_grad_norms(self, optimizer, name: str):
+        """监控梯度范数，检测梯度爆炸"""
+        total_norm = 0.0
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2).item()
+                    total_norm += param_norm**2
+        total_norm = total_norm**0.5
+
+        if total_norm > self.grad_warn_threshold:
+            print(
+                f"⚠️ 梯度爆炸警告 [{name}]: "
+                f"grad_norm={total_norm:.2f} > threshold={self.grad_warn_threshold}"
+            )
+
+        return total_norm
+
+    # ═══════════════════════════════════════════════════════
     #  Helper: 共享的 sr_latent 预计算（全部路径 fp32）
     # ═══════════════════════════════════════════════════════
     @torch.no_grad()
@@ -284,12 +378,11 @@ class SD2RefGANSystem(LightningModule):
     # ═══════════════════════════════════════════════════════
     @torch.no_grad()
     def _no_adapter_pred_x0(self, hr, sr_latent_cond, t, noise):
+        # [FIX-2] 使用 _pred_x0_base 减少重复，并确保中间激活被释放
         bsz = hr.shape[0]
         device = hr.device
 
         hr_latent = self.generator.encode_latent(hr)
-        x_t = self.generator.noise_scheduler.add_noise(hr_latent, noise, t)
-        x_input = self.generator._concat_sr_latent(x_t, sr_latent_cond.detach())
 
         null_ctx = torch.zeros(
             bsz,
@@ -299,40 +392,58 @@ class SD2RefGANSystem(LightningModule):
             dtype=torch.float32,
         )
 
-        # 零残差覆盖 adapter 注入点，屏蔽 T2I-Adapter 信号
-        # generator.unet 的 LoRA 仍在，但 adapter 注入被零残差完全屏蔽
-        # 效果近似于"无 adapter 的 UNet 去噪"，零额外显存
-        zero_residuals = self._build_zero_intrablock(x_input)
-        eps_pred = self.generator.unet(
-            x_input,
-            t,
-            encoder_hidden_states=null_ctx,
-            down_intrablock_additional_residuals=zero_residuals,
-        ).sample
-
-        pred_x0 = self.generator._predict_x0_from_eps(x_t, t, eps_pred)
-        pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
-            -20.0, 20.0
+        # 使用公共基础逻辑，down_intrablock=None 表示不使用 adapter
+        pred_pixel = self._pred_x0_base(
+            latent=hr_latent,
+            sr_latent_cond=(
+                sr_latent_cond.detach() if sr_latent_cond is not None else None
+            ),
+            t=t,
+            noise=noise,
+            context=null_ctx,
+            down_intrablock=None,  # 不使用 adapter
         )
 
-        pred_pixel = self.generator.decode_latent(pred_x0)
+        # [FIX-2] 显式释放中间激活
+        torch.cuda.empty_cache()
+
         return pred_pixel
 
     # ═══════════════════════════════════════════════════════
     #  Helper: 有 adapter 路径（SR 去噪，可梯度）
     # ═══════════════════════════════════════════════════════
     def _adapter_pred_x0(self, lr, ref, sr_latent_precomputed, t, noise):
+        # [OPT] 使用 _pred_x0_base 减少重复
+        bsz = lr.shape[0]
+
+        # 获取 adapter 特征
+        ref_feats = self.generator.adapter(lr, ref)
+        sem_tokens = None
+        if self.generator.use_semantic:
+            with torch.no_grad():
+                sem_pyramid = self.generator.global_semantic(ref)
+            sem_tokens = self.generator.build_sem_tokens(sem_pyramid)
+
+        context = self.generator._build_context(bsz, sem_tokens)
+
+        # 计算 latent 尺寸以构建 down_intrablock
         x_t = self.generator.noise_scheduler.add_noise(sr_latent_precomputed, noise, t)
-
         x_input = self.generator._concat_sr_latent(x_t, sr_latent_precomputed.detach())
-        noise_pred = self.generator.apply_model(x_input, t, lr, ref)
-        pred_x0 = self.generator._predict_x0_from_eps(x_t, t, noise_pred)
-
-        pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
-            -20.0, 20.0
+        _, _, latent_h, latent_w = x_input.shape
+        down_intrablock = self.generator._build_down_intrablock(
+            ref_feats, latent_h, latent_w
         )
 
-        pred_pixel = self.generator.decode_latent(pred_x0)
+        # 使用公共基础逻辑
+        pred_pixel = self._pred_x0_base(
+            latent=sr_latent_precomputed,
+            sr_latent_cond=sr_latent_precomputed.detach(),
+            t=t,
+            noise=noise,
+            context=context,
+            down_intrablock=down_intrablock,  # 使用 adapter
+        )
+
         return pred_pixel
 
     # ═══════════════════════════════════════════════════════
@@ -363,13 +474,17 @@ class SD2RefGANSystem(LightningModule):
             g_opt.zero_grad(set_to_none=True)
             self._g_accum_count = 0
             self._gd_phase = 1
+            # [FIX-3] NaN 时重置 discriminator 状态
             if self.discriminator is not None:
-                self.discriminator.train()
-                self.discriminator.requires_grad_(True)
+                self.discriminator.eval()
+                self.discriminator.requires_grad_(False)
             return None
 
         loss_phase1 = loss / self.accumulate_grad_batches
-        self.scaler_g.scale(loss_phase1).backward()
+        if self.scaler_g is not None:
+            self.scaler_g.scale(loss_phase1).backward()
+        else:
+            loss_phase1.backward()
 
         # ═══════════════════════════════════════
         # Phase 2: SR 路径 — MSE(SR) + LPIPS(SR) + GAN
@@ -437,6 +552,7 @@ class SD2RefGANSystem(LightningModule):
                             f"(#{self._nan_g_count})，跳过"
                         )
 
+                # [FIX-10] 显式禁用 autocast
                 with torch.amp.autocast("cuda", enabled=False):
                     gan_loss = self.discriminator.compute_g_loss(
                         fake=pred_sr_pixel.float(),
@@ -459,20 +575,32 @@ class SD2RefGANSystem(LightningModule):
             if isinstance(phase2_loss, torch.Tensor) and phase2_loss.item() != 0:
                 phase2_loss_val = phase2_loss.detach()
                 phase2_loss_scaled = phase2_loss / self.accumulate_grad_batches
-                self.scaler_g.scale(phase2_loss_scaled).backward()
+                if self.scaler_g is not None:
+                    self.scaler_g.scale(phase2_loss_scaled).backward()
+                else:
+                    phase2_loss_scaled.backward()
 
         # ═══════════════════════════════════════
         # 累积 → step optimizer
         # ═══════════════════════════════════════
         self._g_accum_count += 1
         if self._g_accum_count >= self.accumulate_grad_batches:
-            self.scaler_g.unscale_(g_opt)
+            # [SEC] 梯度监控
+            self._monitor_grad_norms(g_opt, "G")
+
+            if self.scaler_g is not None:
+                self.scaler_g.unscale_(g_opt)
             self.clip_gradients(
-                g_opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                g_opt,
+                gradient_clip_val=self.grad_clip_val,
+                gradient_clip_algorithm="norm",
             )
-            self.scaler_g.step(g_opt)
-            self.scaler_g.update()
-            g_opt.zero_grad(set_to_none=True)  # [OPT-4]
+            if self.scaler_g is not None:
+                self.scaler_g.step(g_opt)
+                self.scaler_g.update()
+            else:
+                g_opt.step()
+            g_opt.zero_grad(set_to_none=True)
             self._g_accum_count = 0
             self._gd_phase = 1
 
@@ -511,6 +639,24 @@ class SD2RefGANSystem(LightningModule):
         bsz = lr.shape[0]
         device = lr.device
 
+        # [FIX-5] 添加 ref NaN 检查
+        if torch.isnan(ref).any() or torch.isinf(ref).any():
+            self._nan_d_count += 1
+            print(
+                f"⚠️ [D step] ref NaN/Inf (#{self._nan_d_count})，"
+                f"batch={batch_idx}，跳过"
+            )
+            if d_sem_opt is not None:
+                d_sem_opt.zero_grad(set_to_none=True)
+                self._d_sem_accum_count = 0
+            if d_tex_opt is not None:
+                d_tex_opt.zero_grad(set_to_none=True)
+                self._d_tex_accum_count = 0
+            self.discriminator.eval()
+            self.discriminator.requires_grad_(False)
+            self._gd_phase = 0
+            return None
+
         # ═══════════════════════════════════════
         #  单步 pred_x0：无 adapter vs 有 adapter
         # ═══════════════════════════════════════
@@ -539,11 +685,12 @@ class SD2RefGANSystem(LightningModule):
                 f"⚠️ [D step] fake NaN/Inf (#{self._nan_d_count})，"
                 f"batch={batch_idx}，跳过"
             )
+            # [FIX-8] NaN 时清零累积梯度
             if d_sem_opt is not None:
-                d_sem_opt.zero_grad(set_to_none=True)  # [OPT-4]
+                d_sem_opt.zero_grad(set_to_none=True)
                 self._d_sem_accum_count = 0
             if d_tex_opt is not None:
-                d_tex_opt.zero_grad(set_to_none=True)  # [OPT-4]
+                d_tex_opt.zero_grad(set_to_none=True)
                 self._d_tex_accum_count = 0
             self.discriminator.eval()
             self.discriminator.requires_grad_(False)
@@ -555,11 +702,12 @@ class SD2RefGANSystem(LightningModule):
             print(
                 f"⚠️ [D step] real(no-adapter) NaN/Inf " f"(#{self._nan_d_count})，跳过"
             )
+            # [FIX-8] NaN 时清零累积梯度
             if d_sem_opt is not None:
-                d_sem_opt.zero_grad(set_to_none=True)  # [OPT-4]
+                d_sem_opt.zero_grad(set_to_none=True)
                 self._d_sem_accum_count = 0
             if d_tex_opt is not None:
-                d_tex_opt.zero_grad(set_to_none=True)  # [OPT-4]
+                d_tex_opt.zero_grad(set_to_none=True)
                 self._d_tex_accum_count = 0
             self.discriminator.eval()
             self.discriminator.requires_grad_(False)
@@ -595,9 +743,12 @@ class SD2RefGANSystem(LightningModule):
                     prog_bar=True,
                 )
                 if self._d_sem_accum_count >= self.accumulate_grad_batches:
+                    # [SEC] 梯度监控
+                    self._monitor_grad_norms(d_sem_opt, "D_sem")
+
                     self.clip_gradients(
                         d_sem_opt,
-                        gradient_clip_val=1.0,
+                        gradient_clip_val=self.grad_clip_val,
                         gradient_clip_algorithm="norm",
                     )
                     d_sem_opt.step()
@@ -635,9 +786,12 @@ class SD2RefGANSystem(LightningModule):
                     prog_bar=True,
                 )
                 if self._d_tex_accum_count >= self.accumulate_grad_batches:
+                    # [SEC] 梯度监控
+                    self._monitor_grad_norms(d_tex_opt, "D_tex")
+
                     self.clip_gradients(
                         d_tex_opt,
-                        gradient_clip_val=1.0,
+                        gradient_clip_val=self.grad_clip_val,
                         gradient_clip_algorithm="norm",
                     )
                     d_tex_opt.step()
@@ -667,98 +821,108 @@ class SD2RefGANSystem(LightningModule):
     #  验证 / 推理
     # ═══════════════════════════════════════════════════════
     def validation_step(self, batch, batch_idx):
-        lr, ref, hr = self.generator.get_input(batch)
+        try:
+            lr, ref, hr = self.generator.get_input(batch)
 
-        loss_diff, _ = self.generator.p_losses(lr, ref, hr)
-        self.log(
-            "val/loss_diff",
-            loss_diff,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-        )
-        self.log(
-            "val_loss_diff",
-            loss_diff,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-        )
-
-        with torch.no_grad():
-            val_results = self.generator.log_images(
-                batch,
-                steps=self.sample_steps,
-                sr_model=self.sr_model,
-                t_start=self.t_start,
-                guidance_scale=self.guidance_scale,
-                t_stop=self.t_stop,
+            loss_diff, _ = self.generator.p_losses(lr, ref, hr)
+            self.log(
+                "val/loss_diff",
+                loss_diff,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+            )
+            self.log(
+                "val_loss_diff",
+                loss_diff,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
             )
 
-        if self.iqa is not None:
-            sr_batch = val_results["samples"]
-            hq_batch = val_results["hq"]
-            agg = {}
-            for i in range(len(sr_batch)):
-                sr_np = sr_batch[i].cpu().numpy()
-                hq_np = hq_batch[i].cpu().numpy()
-                m = self.iqa.evaluate_single(sr_np, hq_np)
-                for k, v in m.items():
-                    agg[k] = agg.get(k, 0.0) + v
-            n = len(sr_batch)
-            for k, v in agg.items():
-                self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
-                if k == "psnr":
-                    self.log("val_psnr", v / n, on_epoch=True)
-
-        # validation_tmp 保存（清理已移至 on_validation_epoch_start）
-        if batch_idx % 4 == 0:
-            save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
-            os.makedirs(save_dir, exist_ok=True)
-
             with torch.no_grad():
-                with torch.amp.autocast("cuda", enabled=False):
-                    sr_prior = self.sr_model(lr.float(), ref.float())
-                    sr_prior = torch.nan_to_num(
-                        sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
-                    ).clamp(-1.0, 1.0)
-            sr_prior_01 = (sr_prior + 1.0) / 2.0
+                val_results = self.generator.log_images(
+                    batch,
+                    steps=self.sample_steps,
+                    sr_model=self.sr_model,
+                    t_start=self.t_start,
+                    guidance_scale=self.guidance_scale,
+                    t_stop=self.t_stop,
+                )
 
-            images_to_concat = []
-            for image_key in ["lq", "ref", "hq", "samples"]:
-                if image_key not in val_results:
-                    continue
-                img = val_results[image_key][0]
-                img = img.detach().cpu().permute(1, 2, 0).numpy()
-                img = (img * 255).clip(0, 255).astype(np.uint8)
-                pil_img = Image.fromarray(img)
+            # [SEC] IQA 评估容错处理
+            if self.iqa is not None:
+                try:
+                    sr_batch = val_results["samples"]
+                    hq_batch = val_results["hq"]
+                    agg = {}
+                    for i in range(len(sr_batch)):
+                        sr_np = sr_batch[i].cpu().numpy()
+                        hq_np = hq_batch[i].cpu().numpy()
+                        m = self.iqa.evaluate_single(sr_np, hq_np)
+                        for k, v in m.items():
+                            agg[k] = agg.get(k, 0.0) + v
+                    n = len(sr_batch)
+                    for k, v in agg.items():
+                        self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
+                        if k == "psnr":
+                            self.log("val_psnr", v / n, on_epoch=True)
+                except Exception as e:
+                    print(f"⚠️ IQA 评估失败: {e}")
 
-                if image_key == "lq":
-                    target_size = val_results["samples"].shape[-2:]
-                    pil_img = pil_img.resize(
-                        (target_size[1], target_size[0]),
-                        Image.NEAREST,
-                    )
-                images_to_concat.append(pil_img)
+            # validation_tmp 保存（清理已移至 on_validation_epoch_start）
+            if batch_idx % 4 == 0:
+                save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
+                os.makedirs(save_dir, exist_ok=True)
 
-            sr_img = sr_prior_01[0].detach().cpu().permute(1, 2, 0).numpy()
-            sr_img = np.nan_to_num(sr_img, nan=0.0, posinf=1.0, neginf=0.0)
-            sr_img = (sr_img * 255).clip(0, 255).astype(np.uint8)
-            images_to_concat.append(Image.fromarray(sr_img))
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", enabled=False):
+                        sr_prior = self.sr_model(lr.float(), ref.float())
+                        sr_prior = torch.nan_to_num(
+                            sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
+                        ).clamp(-1.0, 1.0)
+                sr_prior_01 = (sr_prior + 1.0) / 2.0
 
-            if images_to_concat:
-                total_w = sum(im.width for im in images_to_concat)
-                max_h = max(im.height for im in images_to_concat)
-                combined = Image.new("RGB", (total_w, max_h))
-                x_offset = 0
-                for im in images_to_concat:
-                    combined.paste(im, (x_offset, 0))
-                    x_offset += im.width
-                combined.save(os.path.join(save_dir, f"b{batch_idx}.png"))
+                images_to_concat = []
+                for image_key in ["lq", "ref", "hq", "samples"]:
+                    if image_key not in val_results:
+                        continue
+                    img = val_results[image_key][0]
+                    img = img.detach().cpu().permute(1, 2, 0).numpy()
+                    img = (img * 255).clip(0, 255).astype(np.uint8)
+                    pil_img = Image.fromarray(img)
 
-        del val_results, lr, ref, hr
-        torch.cuda.empty_cache()
-        return loss_diff
+                    if image_key == "lq":
+                        target_size = val_results["samples"].shape[-2:]
+                        pil_img = pil_img.resize(
+                            (target_size[1], target_size[0]),
+                            Image.NEAREST,
+                        )
+                    images_to_concat.append(pil_img)
+
+                sr_img = sr_prior_01[0].detach().cpu().permute(1, 2, 0).numpy()
+                sr_img = np.nan_to_num(sr_img, nan=0.0, posinf=1.0, neginf=0.0)
+                sr_img = (sr_img * 255).clip(0, 255).astype(np.uint8)
+                images_to_concat.append(Image.fromarray(sr_img))
+
+                if images_to_concat:
+                    total_w = sum(im.width for im in images_to_concat)
+                    max_h = max(im.height for im in images_to_concat)
+                    combined = Image.new("RGB", (total_w, max_h))
+                    x_offset = 0
+                    for im in images_to_concat:
+                        combined.paste(im, (x_offset, 0))
+                        x_offset += im.width
+                    combined.save(os.path.join(save_dir, f"b{batch_idx}.png"))
+
+            del val_results, lr, ref, hr
+            torch.cuda.empty_cache()
+            return loss_diff
+        except Exception as e:
+            # [SEC] 验证步骤容错
+            print(f"⚠️ validation_step 异常: {e}")
+            torch.cuda.empty_cache()
+            return torch.tensor(0.0, device=self.device)
 
     # ═══════════════════════════════════════════════════════
     #  validation_tmp 清理逻辑移至此处
