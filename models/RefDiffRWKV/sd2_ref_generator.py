@@ -98,6 +98,9 @@ class SD2RefGenerator(LightningModule):
         self.sr_model = sr_model
         self.use_sr_latent_cond = use_sr_latent_cond
 
+        # [FIX] 动态设备类型，避免硬编码 "cuda"
+        self._device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
         # ═══════════════════════════════════════
         #  VAE（冻结）
         # ═══════════════════════════════════════
@@ -179,12 +182,10 @@ class SD2RefGenerator(LightningModule):
             stride=old_conv.stride,
             padding=old_conv.padding,
         )
-
         with torch.no_grad():
             new_conv.weight[:, :4] = old_weight
             nn.init.xavier_uniform_(new_conv.weight[:, 4:], gain=0.1)
             new_conv.bias.copy_(old_conv.bias)
-
         self.unet.conv_in = new_conv
 
     # ═══════════════════════════════════════════════════════
@@ -213,7 +214,6 @@ class SD2RefGenerator(LightningModule):
             pass
 
     def _freeze_unet_except_attn(self) -> None:
-        """冻结 UNet 除 attention 和 LoRA 外的参数，解冻 conv_in 后 4 通道。"""
         for n, p in self.unet.named_parameters():
             if "attn" not in n and "lora" not in n:
                 p.requires_grad = False
@@ -224,16 +224,13 @@ class SD2RefGenerator(LightningModule):
     # ═══════════════════════════════════════════════════════
     @torch.no_grad()
     def encode_latent(self, img: torch.Tensor) -> torch.Tensor:
-        """将像素图像编码为 latent（无梯度）。"""
         return self.vae.encode(img).latent_dist.sample() * self.vae_scale_factor
 
     def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
-        """将 latent 解码为像素图像（可梯度）。"""
         return self.vae.decode(z / self.vae_scale_factor).sample
 
     @torch.no_grad()
     def decode_latent_eval(self, z: torch.Tensor) -> torch.Tensor:
-        """推理模式 decode。"""
         return self.decode_latent(z)
 
     # ═══════════════════════════════════════════════════════
@@ -260,11 +257,13 @@ class SD2RefGenerator(LightningModule):
     def _build_context(
         self, bsz: int, sem_tokens: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        dtype = torch.float32
-        device = self.device
-        ctx_len = self.CROSS_ATTN_CTX_LEN
-        ctx_dim = self.cross_attn_dim
-        empty_ctx = torch.zeros(bsz, ctx_len, ctx_dim, device=device, dtype=dtype)
+        empty_ctx = torch.zeros(
+            bsz,
+            self.CROSS_ATTN_CTX_LEN,
+            self.cross_attn_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
         if sem_tokens is not None:
             return torch.cat([empty_ctx, sem_tokens], dim=1)
         return empty_ctx
@@ -305,24 +304,20 @@ class SD2RefGenerator(LightningModule):
         bsz = x_input.shape[0]
         ref_input = ref_input or ref
         ref_feats = self.adapter(lr, ref_input)
-
         sem_tokens = None
         if self.use_semantic:
             with torch.no_grad():
                 sem_pyramid = self.global_semantic(ref_input)
-            sem_tokens = self.build_sem_tokens(sem_pyramid)
+                sem_tokens = self.build_sem_tokens(sem_pyramid)
         context = self._build_context(bsz, sem_tokens)
-
         _, _, latent_h, latent_w = x_input.shape
         down_intrablock = self._build_down_intrablock(ref_feats, latent_h, latent_w)
-
-        noise_pred = self.unet(
+        return self.unet(
             x_input,
             t,
             encoder_hidden_states=context,
             down_intrablock_additional_residuals=list(down_intrablock),
         ).sample
-        return noise_pred
 
     def get_input(self, batch, bs: Optional[int] = None, *args, **kwargs):
         lr = batch[self.lr_key]
@@ -350,7 +345,7 @@ class SD2RefGenerator(LightningModule):
         return (x_t - (1.0 - a_bar).sqrt() * noise_pred) / (a_bar.sqrt() + 1e-8)
 
     # ═══════════════════════════════════════════════════════
-    #  SR latent 条件生成
+    #  SR latent 条件生成（修复：使用 self._device_type）
     # ═══════════════════════════════════════════════════════
     def _get_sr_latent_cond(
         self, lr: torch.Tensor, ref: torch.Tensor
@@ -359,7 +354,7 @@ class SD2RefGenerator(LightningModule):
         if actual_sr is None or not self.use_sr_latent_cond:
             return None
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=False):
+            with torch.amp.autocast(self._device_type, enabled=False):
                 sr_prior = actual_sr(lr.float(), ref.float())
                 sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0)
                 sr_prior = sr_prior.clamp(-1.0, 1.0)
@@ -374,8 +369,9 @@ class SD2RefGenerator(LightningModule):
         if sr_latent_cond is not None:
             return torch.cat([x_t, sr_latent_cond], dim=1)
         bsz, _, h, w = x_t.shape
-        zero_pad = torch.zeros(bsz, 4, h, w, device=x_t.device, dtype=x_t.dtype)
-        return torch.cat([x_t, zero_pad], dim=1)
+        return torch.cat(
+            [x_t, torch.zeros(bsz, 4, h, w, device=x_t.device, dtype=x_t.dtype)], dim=1
+        )
 
     # ═══════════════════════════════════════════════════════
     #  训练前向
@@ -396,7 +392,6 @@ class SD2RefGenerator(LightningModule):
             self.t_min, self.t_max + 1, (bsz,), device=self.device, dtype=torch.long
         )
         x_t = self.noise_scheduler.add_noise(hr_latent, noise, t)
-
         sr_latent_cond = self._get_sr_latent_cond(lr, ref)
 
         ref_input = ref
@@ -430,15 +425,13 @@ class SD2RefGenerator(LightningModule):
         return out["loss"], {"train/loss_diff": out["loss"].detach()}
 
     # ═══════════════════════════════════════════════════════
-    #  采样 / 推理（拆分为辅助方法）
+    #  采样 / 推理（修复：使用 self._device_type）
     # ═══════════════════════════════════════════════════════
     @torch.no_grad()
-    def _prepare_sr_cond(
-        self, lr: torch.Tensor, ref: torch.Tensor, actual_sr: Optional[torch.nn.Module]
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def _prepare_sr_cond(self, lr, ref, actual_sr):
         if actual_sr is None:
             return None, None
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(self._device_type, enabled=False):
             sr_prior = actual_sr(lr.float(), ref.float())
             sr_prior = torch.nan_to_num(
                 sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
@@ -459,7 +452,7 @@ class SD2RefGenerator(LightningModule):
         sr_prior,
         ref,
         t_start,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ):
         if (
             actual_sr is not None
             and t_start is not None
@@ -475,12 +468,10 @@ class SD2RefGenerator(LightningModule):
             )
             tex_norm = tex_map_latent.clone()
             for b in range(bsz):
-                tmin = tex_norm[b].min()
-                tmax = tex_norm[b].max()
+                tmin, tmax = tex_norm[b].min(), tex_norm[b].max()
                 if tmax > tmin:
                     tex_norm[b] = (tex_norm[b] - tmin) / (tmax - tmin + 1e-8)
-            t_flat = max(200, t_start - 500)
-            t_detail = min(999, t_start + 200)
+            t_flat, t_detail = max(200, t_start - 500), min(999, t_start + 200)
             noise = torch.randn_like(sr_latent)
             t_flat_t = torch.full((bsz,), t_flat, device=device, dtype=torch.long)
             t_detail_t = torch.full((bsz,), t_detail, device=device, dtype=torch.long)
@@ -491,16 +482,8 @@ class SD2RefGenerator(LightningModule):
 
     @torch.no_grad()
     def _denoise_step(
-        self,
-        x_t,
-        t_int,
-        lr,
-        ref,
-        sr_latent_cond,
-        sr_target,
-        guidance_scale,
-        t_stop,
-    ) -> torch.Tensor:
+        self, x_t, t_int, lr, ref, sr_latent_cond, sr_target, guidance_scale, t_stop
+    ):
         bsz = x_t.shape[0]
         t_tensor = torch.full((bsz,), t_int, device=x_t.device, dtype=torch.long)
         if sr_target is not None and guidance_scale > 0 and t_int > t_stop:
@@ -509,8 +492,7 @@ class SD2RefGenerator(LightningModule):
                 x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
                 noise_pred = self.apply_model(x_t_input, t_tensor, lr, ref)
                 pred_x0 = self._predict_x0_from_eps(x_t, t_tensor, noise_pred)
-                loss_guidance = F.mse_loss(pred_x0, sr_target)
-                grad = torch.autograd.grad(loss_guidance, x_t)[0]
+                grad = torch.autograd.grad(F.mse_loss(pred_x0, sr_target), x_t)[0]
                 x_t = x_t.detach() - guidance_scale * grad
             noise_pred = noise_pred.detach()
         else:
@@ -529,11 +511,10 @@ class SD2RefGenerator(LightningModule):
         t_start=None,
         guidance_scale=0.0,
         t_stop=200,
-    ) -> torch.Tensor:
+    ):
         if torch.isnan(lr).any() or torch.isnan(ref).any():
             raise ValueError("sample_log: Input contains NaN")
         bsz, device, actual_sr = lr.shape[0], self.device, sr_model or self.sr_model
-
         sr_latent_cond, sr_prior = self._prepare_sr_cond(lr, ref, actual_sr)
         latent_h, latent_w = _compute_latent_size(ref, hr)
         x_t, sr_target = self._initialize_latent(
@@ -548,12 +529,10 @@ class SD2RefGenerator(LightningModule):
             ref,
             t_start,
         )
-
         self.noise_scheduler.set_timesteps(steps, device=device)
         timesteps = self.noise_scheduler.timesteps
         if t_start is not None:
             timesteps = [t for t in timesteps if t <= t_start]
-
         for t in timesteps:
             x_t = self._denoise_step(
                 x_t, int(t), lr, ref, sr_latent_cond, sr_target, guidance_scale, t_stop
@@ -566,7 +545,7 @@ class SD2RefGenerator(LightningModule):
     ) -> List[torch.Tensor]:
         bsz, device, actual_sr = lr.shape[0], self.device, sr_model or self.sr_model
         if actual_sr is not None:
-            with torch.amp.autocast("cuda", enabled=False):
+            with torch.amp.autocast(self._device_type, enabled=False):
                 sr_prior = actual_sr(lr.float(), ref.float())
                 sr_prior = torch.nan_to_num(
                     sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
@@ -575,7 +554,6 @@ class SD2RefGenerator(LightningModule):
         else:
             latent_h, latent_w = _compute_latent_size(ref, hr)
             x_t = torch.randn(bsz, 4, latent_h, latent_w, device=device, dtype=lr.dtype)
-
         self.noise_scheduler.set_timesteps(steps, device=device)
         pixel_each_step = []
         sr_latent_cond = self._get_sr_latent_cond(lr, ref)
@@ -587,8 +565,11 @@ class SD2RefGenerator(LightningModule):
             x_t_clamped = x_t.clamp(
                 -self.vae_scale_factor * 5, self.vae_scale_factor * 5
             )
-            current_pixel = self.decode_latent_eval(x_t_clamped)
-            pixel_each_step.append(torch.clamp((current_pixel + 1.0) / 2.0, 0.0, 1.0))
+            pixel_each_step.append(
+                torch.clamp(
+                    (self.decode_latent_eval(x_t_clamped) + 1.0) / 2.0, 0.0, 1.0
+                )
+            )
         return pixel_each_step
 
     @torch.no_grad()
@@ -656,8 +637,10 @@ class SD2RefGenerator(LightningModule):
         val_results = self.log_images(batch, steps=steps, sr_model=sr_model)
         ender.record()
         torch.cuda.synchronize()
-        elapsed_time = starter.elapsed_time(ender)
-        max_memory = torch.cuda.memory_allocated() / 1024**2
+        elapsed_time, max_memory = (
+            starter.elapsed_time(ender),
+            torch.cuda.memory_allocated() / 1024**2,
+        )
         logger.info(
             "Inference Time: %.2f ms, Current Memory: %.2f MB", elapsed_time, max_memory
         )
@@ -665,9 +648,12 @@ class SD2RefGenerator(LightningModule):
         for image_key in val_results:
             image = val_results[image_key].detach().cpu()
             for i in range(len(image)):
-                curr_img = image[i].permute(1, 2, 0).numpy()
-                curr_img = (curr_img * 255).clip(0, 255).astype(np.uint8)
-                Image.fromarray(curr_img).save(
+                img = (
+                    (image[i].permute(1, 2, 0).numpy() * 255)
+                    .clip(0, 255)
+                    .astype(np.uint8)
+                )
+                Image.fromarray(img).save(
                     os.path.join(save_dir, f"{i}_{image_key}.png")
                 )
 
@@ -754,6 +740,15 @@ if __name__ == "__main__":
         list(out["noise_pred"].shape),
     )
     assert out["noise_pred"].shape == out["hr_latent"].shape
+
+    # [FIX] 验证梯度流
+    out["loss"].backward()
+    has_grad = all(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in model.unet.parameters()
+        if p.requires_grad
+    )
+    test_logger.info("梯度流验证: %s", "✅ 通过" if has_grad else "❌ 失败")
 
     samples = model.sample_log(lr, ref, steps=2, hr=hr)
     assert samples.shape[-1] == hr_sz
