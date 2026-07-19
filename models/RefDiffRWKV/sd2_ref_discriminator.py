@@ -197,7 +197,7 @@ class ImageConvNextDiscriminator(nn.Module):
             self.model.model.trunk.stem[1].requires_grad_(True)
 
     def train(self, mode=True):
-        super().train(mode)  # 调用父类
+        self.training = mode
         self.decoder.train(mode)
         if self.trainable_stages >= 1:
             self.model.model.trunk.stem.train(mode)
@@ -373,7 +373,7 @@ class SD2RefDiscriminator(LightningModule):
         self._d_tex_accum_count = 0
 
     def train(self, mode: bool = True):
-        super().train(mode)  # [FIX] 调用父类
+        self.training = mode
         if self.D_sem is not None:
             self.D_sem.train(mode)
         if self.D_tex is not None:
