@@ -3,6 +3,7 @@ sd2_ref_discriminator.py — 双判别器：语义 D + 纹理一致性 D
 与 SD2RefGenerator 分离，独立 LightningModule
 """
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,52 +14,37 @@ import open_clip
 from vision_aided_loss.cv_discriminator import BlurPool, spectral_norm
 from vision_aided_loss.cv_losses import multilevel_loss
 
+logger = logging.getLogger(__name__)
+
 # ══════════════════════════════════════════════════════════════
 #  Haar 小波高频分解
 # ══════════════════════════════════════════════════════════════
 
 
 def haar_highpass(x: torch.Tensor) -> torch.Tensor:
-    """Haar 小波高频分解。输入需为 3 通道 RGB，输出 9 通道 (LH/HL/HH x3)。
-    
-    Args:
-        x: [B, 3, H, W] 输入图像，值域 [-1, 1]
-    
-    Returns:
-        [B, 9, H//2, W//2] 高频分量
-    
-    Note:
-        对 std 添加 clamp(min=0.1) 防止遥感图像平坦区域（水面/云层）除法溢出
-    """
     B, C, H, W = x.shape
-
     if H % 2 != 0:
         x = x[:, :, : H - 1, :]
         H = H - 1
     if W % 2 != 0:
         x = x[:, :, :, : W - 1]
         W = W - 1
-
     x = x.reshape(B, C, H // 2, 2, W // 2, 2)
     x00 = x[:, :, :, 0, :, 0]
     x01 = x[:, :, :, 0, :, 1]
     x10 = x[:, :, :, 1, :, 0]
     x11 = x[:, :, :, 1, :, 1]
-
     LH = x01 - x00
     HL = x10 - x00
     HH = x11 - x00
-
     high = torch.cat([LH, HL, HH], dim=1)
-    # [FIX-9] 对 std 添加 clamp，防止平坦区域除法溢出
-    # 遥感图像中水面/云层等区域 std 可能接近 0
     std = high.std(dim=[2, 3], keepdim=True).clamp(min=0.1)
     high = (high - high.mean(dim=[2, 3], keepdim=True)) / std
-    return high.clamp(-10, 10)  # 全局 clamp 防止极端值
+    return high.clamp(-10, 10)
 
 
 # ══════════════════════════════════════════════════════════════
-#  Backbone: ConvNeXt-Base-W
+#  Backbone: ConvNeXt-Base-W（修复：增加 local_files_only 参数）
 # ══════════════════════════════════════════════════════════════
 
 
@@ -81,23 +67,19 @@ def _visual_forward(model, image, return_feats=False, return_pooled_feats=False)
 
 
 class ImageOpenCLIPConvNext(nn.Module):
-    def __init__(self, precision="fp32", trainable_stages=0):
+    def __init__(self, precision="fp32", trainable_stages=0, local_files_only=True):
         super().__init__()
-
         model_name = "convnext_base_w"
         pretrained_name = "laion2b_s13b_b82k"
-
         full_model, _, _ = open_clip.create_model_and_transforms(
             model_name,
             pretrained=pretrained_name,
             precision=precision,
+            local_files_only=local_files_only,
         )
-
         self.model = full_model.visual
         self.trainable_stages = trainable_stages
-
         self.model.eval().requires_grad_(False)
-
         if trainable_stages >= 1:
             self.model.trunk.stem.requires_grad_(True)
         if trainable_stages >= 2:
@@ -126,7 +108,6 @@ class MultiLevelDConv(nn.Module):
         super().__init__()
         self.decoder = nn.ModuleList()
         self.level = level
-        # [OPT-14] 存储 in_ch1 用于后续断言
         self.in_ch1 = in_ch1
 
         for i in range(level - 1):
@@ -154,7 +135,6 @@ class MultiLevelDConv(nn.Module):
                     nn.Tanh(),
                 )
             )
-
         self.decoder.append(
             nn.Sequential(spectral_norm(nn.Linear(in_ch2, out_ch)), activation)
         )
@@ -163,20 +143,16 @@ class MultiLevelDConv(nn.Module):
 
     def forward(self, x, c=None):
         final_pred = []
-        # [OPT-14] 添加通道数断言，防止上游特征维度变化时静默错误
         for i in range(self.level - 1):
             assert x[i].shape[1] == self.in_ch1[i], (
                 f"Channel mismatch at level {i}: "
                 f"expected {self.in_ch1[i]}, got {x[i].shape[1]}"
             )
             final_pred.append(self.decoder[i](x[i]).squeeze(1))
-
         h = self.decoder[-1](x[-1].float())
         out = self.out(h)
-
         if self.embed is not None and c is not None:
             out += torch.sum(self.embed(c) * h, dim=1, keepdim=True)
-
         out = torch.tanh(out)
         final_pred.append(out)
         return final_pred
@@ -188,20 +164,27 @@ class MultiLevelDConv(nn.Module):
 
 
 class ImageConvNextDiscriminator(nn.Module):
-    def __init__(self, alpha=0.8, precision="fp32", use_freq=True, trainable_stages=1):
+    def __init__(
+        self,
+        alpha=0.8,
+        precision="fp32",
+        use_freq=True,
+        trainable_stages=1,
+        local_files_only=True,
+    ):
         super().__init__()
         self.gan_alpha = alpha
         self.use_freq = use_freq
         self.trainable_stages = trainable_stages
 
         self.model = ImageOpenCLIPConvNext(
-            precision=precision, trainable_stages=trainable_stages
+            precision=precision,
+            trainable_stages=trainable_stages,
+            local_files_only=local_files_only,
         )
-
         self.decoder = MultiLevelDConv(
             level=3, in_ch1=[256, 512], in_ch2=640, out_ch=256, down=2
         )
-
         if use_freq:
             self._adapt_first_conv(9)
 
@@ -217,21 +200,16 @@ class ImageConvNextDiscriminator(nn.Module):
     def _adapt_first_conv(self, in_channels=9):
         old_conv = self.model.model.trunk.stem[0]
         old_weight = old_conv.weight.data.clone()
-
         new_conv = nn.Conv2d(
             in_channels, old_weight.shape[0], kernel_size=4, stride=4, padding=0
         )
-
         with torch.no_grad():
             new_conv.weight[:, :3] = old_weight[:, :3]
             for c in range(3, in_channels):
                 nn.init.orthogonal_(new_conv.weight[:, c : c + 1])
-
         new_conv.bias.data.copy_(old_conv.bias.data)
         new_conv.requires_grad_(self.trainable_stages >= 1)
-
         self.model.model.trunk.stem[0] = new_conv
-
         if self.trainable_stages >= 1:
             self.model.model.trunk.stem[1].requires_grad_(True)
 
@@ -255,13 +233,11 @@ class ImageConvNextDiscriminator(nn.Module):
         return self
 
     def forward(self, x, for_real=True, for_G=False, return_logits=False):
-        # [SEC] 输入验证
         assert x.shape[1] == 3, f"语义 D 期望 3 通道输入，收到 {x.shape[1]}"
         if torch.isnan(x).any() or torch.isinf(x).any():
             raise ValueError(f"语义 D 输入包含 NaN/Inf: min={x.min()}, max={x.max()}")
 
         if self.use_freq:
-            # [FIX-9] haar_highpass 内部已添加 clamp，此处无需重复
             x = haar_highpass(x)
         else:
             x = x * 0.5 + 0.5
@@ -271,26 +247,25 @@ class ImageConvNextDiscriminator(nn.Module):
             features = self.model.encode_image(x, return_pooled_feats=True)
             features = self.decoder(features)
         except RuntimeError as e:
-            # [SEC] 捕获 CUDA OOM 等运行时错误
             if "out of memory" in str(e).lower():
-                print("⚠️ 语义 D CUDA OOM，尝试清理缓存")
+                logger.warning("语义 D CUDA OOM，尝试清理缓存")
                 torch.cuda.empty_cache()
-                # 返回零 loss 避免训练中断
-                return torch.zeros((), device=x.device) if not return_logits else (
-                    torch.zeros((), device=x.device), []
+                return (
+                    torch.zeros((), device=x.device)
+                    if not return_logits
+                    else (torch.zeros((), device=x.device), [])
                 )
             raise
 
         loss_fn = multilevel_loss(alpha=self.gan_alpha)
         loss = loss_fn(features, for_real=for_real, for_G=for_G)
-
         if return_logits:
             return loss, features
         return loss
 
 
 # ══════════════════════════════════════════════════════════════
-#  TextureConsistencyDiscriminator（纹理一致性判别器）
+#  TextureConsistencyDiscriminator（修复：per_scale_logits detach）
 # ══════════════════════════════════════════════════════════════
 
 
@@ -340,13 +315,11 @@ class TextureConsistencyDiscriminator(nn.Module):
         return feats
 
     def forward(self, image, ref):
-        # [SEC] 输入验证
         if torch.isnan(image).any() or torch.isinf(image).any():
             raise ValueError(f"纹理 D image 输入包含 NaN/Inf")
         if torch.isnan(ref).any() or torch.isinf(ref).any():
             raise ValueError(f"纹理 D ref 输入包含 NaN/Inf")
 
-        # 逐尺度 abs 差要求 image / ref 空间尺寸一致，不一致则把 ref 对齐到 image
         if image.shape[-2:] != ref.shape[-2:]:
             ref = F.interpolate(
                 ref, size=image.shape[-2:], mode="bilinear", align_corners=False
@@ -362,13 +335,12 @@ class TextureConsistencyDiscriminator(nn.Module):
             per_scale_logits.append(logit)
 
         weights = torch.softmax(self.scale_weights, dim=0)
-        # [OPT-18] 使用动态维度扩展，提高可扩展性
         logits_stacked = torch.stack(per_scale_logits, dim=0)
-        # weights: [num_scales] -> [num_scales, 1, 1, ...] 匹配 logits_stacked.ndim
         weight_shape = [-1] + [1] * (logits_stacked.ndim - 1)
         weighted = (weights.view(*weight_shape) * logits_stacked).sum(dim=0)
 
-        return torch.clamp(weighted, -5.0, 5.0), per_scale_logits
+        # [FIX] per_scale_logits 中的张量 detach 后返回，避免泄漏计算图
+        return torch.clamp(weighted, -5.0, 5.0), [l.detach() for l in per_scale_logits]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -381,25 +353,20 @@ class SD2RefDiscriminator(LightningModule):
     双判别器封装：
       - 语义判别器 D_sem：ImageConvNextDiscriminator
       - 纹理判别器 D_tex：TextureConsistencyDiscriminator
-
-    与 SD2RefGenerator 解耦，可单独实例化、单独保存 checkpoint。
-    通过 compute_g_loss / compute_d_loss 向生成器提供 GAN loss 接口。
     """
 
     def __init__(
         self,
         use_semantic_d: bool = True,
         use_texture_d: bool = True,
-        # 语义 D 参数
         semantic_alpha: float = 0.8,
         semantic_use_freq: bool = True,
         semantic_trainable_stages: int = 1,
         semantic_precision: str = "fp32",
-        # 纹理 D 参数
+        semantic_local_files_only: bool = True,
         texture_base_ch: int = 48,
         texture_num_scales: int = 4,
         texture_use_spectral: bool = True,
-        # 优化器参数
         lr_semantic: float = 5e-6,
         lr_texture: float = 1e-6,
         weight_decay: float = 1e-3,
@@ -411,18 +378,17 @@ class SD2RefDiscriminator(LightningModule):
         self.use_semantic_d = use_semantic_d
         self.use_texture_d = use_texture_d
 
-        # 语义判别器
         if use_semantic_d:
             self.D_sem = ImageConvNextDiscriminator(
                 alpha=semantic_alpha,
                 precision=semantic_precision,
                 use_freq=semantic_use_freq,
                 trainable_stages=semantic_trainable_stages,
+                local_files_only=semantic_local_files_only,
             )
         else:
             self.D_sem = None
 
-        # 纹理判别器
         if use_texture_d:
             self.D_tex = TextureConsistencyDiscriminator(
                 in_ch=3,
@@ -433,13 +399,8 @@ class SD2RefDiscriminator(LightningModule):
         else:
             self.D_tex = None
 
-        # 累积梯度计数（如需手动优化可复用）
         self._d_sem_accum_count = 0
         self._d_tex_accum_count = 0
-
-    # ═══════════════════════════════════════════════════════
-    #  train / eval / requires_grad_ 重写
-    # ═══════════════════════════════════════════════════════
 
     def train(self, mode: bool = True):
         self.training = mode
@@ -460,11 +421,9 @@ class SD2RefDiscriminator(LightningModule):
         return self
 
     def _zero_loss(self, ref_tensor: torch.Tensor) -> torch.Tensor:
-        """返回与输入同 device/dtype 的 0 张量，避免返回 python float。"""
         return torch.zeros((), device=ref_tensor.device, dtype=ref_tensor.dtype)
 
     def _validate_inputs(self, *tensors):
-        """验证输入张量的有效性（NaN/Inf 检查）"""
         for i, t in enumerate(tensors):
             if t is None:
                 continue
@@ -475,7 +434,7 @@ class SD2RefDiscriminator(LightningModule):
                 )
 
     # ═══════════════════════════════════════════════════════
-    #  生成器侧接口：只计算 G 的 GAN loss，不更新 D
+    #  生成器侧接口
     # ═══════════════════════════════════════════════════════
 
     def compute_g_loss(
@@ -485,20 +444,15 @@ class SD2RefDiscriminator(LightningModule):
         lambda_semantic: float = 1.0,
         lambda_texture: float = 1.0,
     ) -> torch.Tensor:
-        """生成器的 GAN loss。调用前需确保 D 处于 eval / requires_grad(False)。"""
-        # [SEC] 输入验证
         self._validate_inputs(fake, ref)
-        
         loss = self._zero_loss(fake)
 
-        # [FIX-10] 显式禁用 autocast，避免混合精度不一致
         with torch.amp.autocast("cuda", enabled=False):
             if self.use_semantic_d and lambda_semantic > 0:
                 loss_sem = self.D_sem(fake.float(), for_real=False, for_G=True).mean()
                 loss = loss + lambda_semantic * loss_sem
 
             if self.use_texture_d and lambda_texture > 0 and ref is not None:
-                # [FIX-7] 统一 detach ref
                 ref = ref.detach().float()
                 fake_logit, _ = self.D_tex(fake.float(), ref)
                 loss = loss + lambda_texture * (-fake_logit.mean())
@@ -506,7 +460,7 @@ class SD2RefDiscriminator(LightningModule):
         return loss
 
     # ═══════════════════════════════════════════════════════
-    #  判别器侧接口：计算 D 的 GAN loss
+    #  判别器侧接口
     # ═══════════════════════════════════════════════════════
 
     def compute_d_loss(
@@ -517,22 +471,19 @@ class SD2RefDiscriminator(LightningModule):
         lambda_semantic: float = 1.0,
         lambda_texture: float = 1.0,
     ) -> torch.Tensor:
-        """判别器 loss：real 判真，fake 判假。"""
-        # [SEC] 输入验证 + [FIX-5] 添加 ref NaN 检查
         self._validate_inputs(real, fake, ref)
-        
-        # [FIX-7] 统一 detach real/fake/ref，避免重复 detach 和梯度泄漏
         real = real.detach()
         fake = fake.detach()
         if ref is not None:
             ref = ref.detach()
-        
+
         loss = self._zero_loss(real)
 
-        # [FIX-10] 显式禁用 autocast
         with torch.amp.autocast("cuda", enabled=False):
             if self.use_semantic_d and lambda_semantic > 0:
-                loss_sem_real = self.D_sem(real.float(), for_real=True, for_G=False).mean()
+                loss_sem_real = self.D_sem(
+                    real.float(), for_real=True, for_G=False
+                ).mean()
                 loss_sem_fake = self.D_sem(
                     fake.float(), for_real=False, for_G=False
                 ).mean()
@@ -541,7 +492,9 @@ class SD2RefDiscriminator(LightningModule):
             if self.use_texture_d and lambda_texture > 0 and ref is not None:
                 real_logit, _ = self.D_tex(real.float(), ref.float())
                 fake_logit, _ = self.D_tex(fake.float(), ref.float())
-                loss_tex = F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()
+                loss_tex = (
+                    F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()
+                )
                 loss = loss + lambda_texture * loss_tex
 
         return loss
@@ -557,11 +510,6 @@ class SD2RefDiscriminator(LightningModule):
         ref: Optional[torch.Tensor] = None,
         mode: str = "both",
     ) -> Tuple[torch.Tensor, dict]:
-        """
-        前向返回 D loss 与详细日志。
-        mode: "both" | "semantic" | "texture"
-        返回的 loss_D 可反传（log_dict 内为 detach 值）。
-        """
         log_dict = {}
         loss_D = self._zero_loss(real)
 
@@ -583,16 +531,10 @@ class SD2RefDiscriminator(LightningModule):
         return loss_D, log_dict
 
     def training_step(self, batch, batch_idx):
-        """
-        独立训练 D 时的回退接口（实际 GAN 训练走 sd2_ref_gan_system 的手动优化）。
-        期望 batch 含 "hr" / "sr"(已 detach) / "ref"(可选)。
-        新版 Lightning 已移除 optimizer_idx，这里统一计算总 D loss。
-        """
         try:
             real = batch["hr"]
             fake = batch["sr"].detach()
             ref = batch.get("ref", None)
-
             loss, log_dict = self.forward(real, fake, ref=ref, mode="both")
             self.log_dict(
                 {f"train/{k}": v for k, v in log_dict.items()},
@@ -601,15 +543,12 @@ class SD2RefDiscriminator(LightningModule):
             )
             return loss
         except (ValueError, RuntimeError) as e:
-            # [SEC] 容错处理：捕获 NaN/Inf 或 OOM 错误
-            print(f"⚠️ D training_step 异常: {e}")
+            logger.warning("D training_step 异常: %s", e)
             torch.cuda.empty_cache()
             return self._zero_loss(batch["hr"])
 
     def configure_optimizers(self):
-        """返回两个独立优化器，分别对应 semantic D 和 texture D。"""
         opts = []
-
         if self.use_semantic_d:
             params_sem = [p for p in self.D_sem.parameters() if p.requires_grad]
             opts.append(
@@ -620,7 +559,6 @@ class SD2RefDiscriminator(LightningModule):
                     weight_decay=self.hparams.weight_decay,
                 )
             )
-
         if self.use_texture_d:
             params_tex = list(self.D_tex.parameters())
             opts.append(
@@ -631,12 +569,7 @@ class SD2RefDiscriminator(LightningModule):
                     weight_decay=self.hparams.weight_decay,
                 )
             )
-
         return opts
-
-    # ═══════════════════════════════════════════════════════
-    #  checkpoint 状态持久化
-    # ═══════════════════════════════════════════════════════
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["d_sem_accum_count"] = self._d_sem_accum_count
@@ -649,35 +582,26 @@ class SD2RefDiscriminator(LightningModule):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # ====== 构造模型 ======
     model = SD2RefDiscriminator(
         use_semantic_d=True,
         use_texture_d=True,
     ).to(device)
-
     model.eval()
 
-    # ====== 假数据 ======
     B, C, H, W = 2, 3, 480, 480
-
     real = torch.randn(B, C, H, W, device=device)
     fake = torch.randn(B, C, H, W, device=device)
     ref = torch.randn(B, C, H, W, device=device)
 
-    # ====== D loss ======
     d_loss = model.compute_d_loss(real, fake, ref=ref)
     print("D loss:", d_loss.item())
 
-    # ====== G loss ======
     g_loss = model.compute_g_loss(fake, ref=ref)
     print("G loss:", g_loss.item())
 
-    # ====== forward（联合） ======
     loss, logs = model(real, fake, ref=ref, mode="both")
     print("forward loss:", loss.item())
     print("logs:", {k: v.item() for k, v in logs.items()})
 
-    # ====== 反向检查 ======
     loss.backward()
     print("backward ok")
