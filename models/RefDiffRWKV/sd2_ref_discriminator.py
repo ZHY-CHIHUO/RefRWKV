@@ -22,37 +22,26 @@ logger = logging.getLogger(__name__)
 
 
 def haar_highpass(x: torch.Tensor) -> torch.Tensor:
-    """Haar 小波高频分解，输出 9 通道高频分量（LH/HL/HH × 3 通道）。"""
     B, C, H, W = x.shape
     assert C == 3, f"haar_highpass 需要 3 通道输入，收到 {C} 通道"
-
     if H % 2 != 0:
         x = x[:, :, : H - 1, :]
         H = H - 1
     if W % 2 != 0:
         x = x[:, :, :, : W - 1]
         W = W - 1
-
     x = x.reshape(B, C, H // 2, 2, W // 2, 2)
     x00 = x[:, :, :, 0, :, 0]
     x01 = x[:, :, :, 0, :, 1]
     x10 = x[:, :, :, 1, :, 0]
     x11 = x[:, :, :, 1, :, 1]
-
-    LH = x01 - x00
-    HL = x10 - x00
-    HH = x11 - x00
-
-    high = torch.cat([LH, HL, HH], dim=1)
+    high = torch.cat([x01 - x00, x10 - x00, x11 - x00], dim=1)
     std = high.std(dim=[2, 3], keepdim=True).clamp(min=0.1)
-    high = (high - high.mean(dim=[2, 3], keepdim=True)) / std
-    return high.clamp(-10, 10)
+    return ((high - high.mean(dim=[2, 3], keepdim=True)) / std).clamp(-10, 10)
 
 
 # ══════════════════════════════════════════════════════════════
 #  Backbone: ConvNeXt-Base-W
-#  open_clip.create_model_and_transforms 不支持 local_files_only 参数，
-#  因此该参数保留在 __init__ 签名中供未来扩展，但不传递给 open_clip。
 # ══════════════════════════════════════════════════════════════
 
 
@@ -75,14 +64,11 @@ def _visual_forward(model, image, return_feats=False, return_pooled_feats=False)
 
 
 class ImageOpenCLIPConvNext(nn.Module):
-    def __init__(self, precision="fp32", trainable_stages=0, local_files_only=True):
+    def __init__(self, precision="fp32", trainable_stages=0):
         super().__init__()
-        model_name = "convnext_base_w"
-        pretrained_name = "laion2b_s13b_b82k"
-        # 注意：open_clip 不支持 local_files_only 参数，仅保留供未来扩展
         full_model, _, _ = open_clip.create_model_and_transforms(
-            model_name,
-            pretrained=pretrained_name,
+            "convnext_base_w",
+            pretrained="laion2b_s13b_b82k",
             precision=precision,
         )
         self.model = full_model.visual
@@ -110,8 +96,7 @@ class MultiLevelDConv(nn.Module):
         in_ch2=640,
         out_ch=256,
         num_classes=0,
-        # [FIX] inplace=False 避免与 checkpoint / 调试兼容性问题
-        activation=nn.LeakyReLU(0.2, inplace=False),
+        activation=nn.LeakyReLU(0.2, inplace=False),  # inplace=False 避免兼容性问题
         down=1,
     ):
         super().__init__()
@@ -120,30 +105,29 @@ class MultiLevelDConv(nn.Module):
         self.in_ch1 = in_ch1
 
         for i in range(level - 1):
-            self.decoder.append(
-                nn.Sequential(
-                    (
-                        BlurPool(in_ch1[i], pad_type="zero", stride=1, pad_off=1)
-                        if down > 1
-                        else nn.Identity()
-                    ),
-                    spectral_norm(
-                        nn.Conv2d(
-                            in_ch1[i],
-                            out_ch,
-                            kernel_size=3,
-                            stride=2 if down > 1 else 1,
-                            padding=1 if down == 1 else 0,
-                        )
-                    ),
-                    activation,
-                    spectral_norm(nn.Conv2d(out_ch, out_ch, 3, padding=1)),
-                    activation,
-                    BlurPool(out_ch, pad_type="zero", stride=1),
-                    spectral_norm(nn.Conv2d(out_ch, 1, kernel_size=1, stride=2)),
-                    nn.Tanh(),
-                )
-            )
+            layers = [
+                (
+                    BlurPool(in_ch1[i], pad_type="zero", stride=1, pad_off=1)
+                    if down > 1
+                    else nn.Identity()
+                ),
+                spectral_norm(
+                    nn.Conv2d(
+                        in_ch1[i],
+                        out_ch,
+                        3,
+                        stride=2 if down > 1 else 1,
+                        padding=1 if down == 1 else 0,
+                    )
+                ),
+                activation,
+                spectral_norm(nn.Conv2d(out_ch, out_ch, 3, padding=1)),
+                activation,
+                BlurPool(out_ch, pad_type="zero", stride=1),
+                spectral_norm(nn.Conv2d(out_ch, 1, kernel_size=1, stride=2)),
+                nn.Tanh(),
+            ]
+            self.decoder.append(nn.Sequential(*layers))
         self.decoder.append(
             nn.Sequential(spectral_norm(nn.Linear(in_ch2, out_ch)), activation)
         )
@@ -153,17 +137,15 @@ class MultiLevelDConv(nn.Module):
     def forward(self, x, c=None):
         final_pred = []
         for i in range(self.level - 1):
-            assert x[i].shape[1] == self.in_ch1[i], (
-                f"Channel mismatch at level {i}: "
-                f"expected {self.in_ch1[i]}, got {x[i].shape[1]}"
-            )
+            assert (
+                x[i].shape[1] == self.in_ch1[i]
+            ), f"Channel mismatch at level {i}: expected {self.in_ch1[i]}, got {x[i].shape[1]}"
             final_pred.append(self.decoder[i](x[i]).squeeze(1))
         h = self.decoder[-1](x[-1].float())
         out = self.out(h)
         if self.embed is not None and c is not None:
             out += torch.sum(self.embed(c) * h, dim=1, keepdim=True)
-        out = torch.tanh(out)
-        final_pred.append(out)
+        final_pred.append(torch.tanh(out))
         return final_pred
 
 
@@ -173,25 +155,19 @@ class MultiLevelDConv(nn.Module):
 
 
 class ImageConvNextDiscriminator(nn.Module):
-    def __init__(
-        self,
-        alpha=0.8,
-        precision="fp32",
-        use_freq=True,
-        trainable_stages=1,
-    ):
+    def __init__(self, alpha=0.8, precision="fp32", use_freq=True, trainable_stages=1):
         super().__init__()
         self.gan_alpha = alpha
         self.use_freq = use_freq
         self.trainable_stages = trainable_stages
 
         self.model = ImageOpenCLIPConvNext(
-            precision=precision,
-            trainable_stages=trainable_stages,
+            precision=precision, trainable_stages=trainable_stages
         )
         self.decoder = MultiLevelDConv(
             level=3, in_ch1=[256, 512], in_ch2=640, out_ch=256, down=2
         )
+
         if use_freq:
             self._adapt_first_conv(9)
 
@@ -221,8 +197,7 @@ class ImageConvNextDiscriminator(nn.Module):
             self.model.model.trunk.stem[1].requires_grad_(True)
 
     def train(self, mode=True):
-        # [FIX] 调用父类 train()，确保 register_buffer 等被正确管理
-        super().train(mode)
+        super().train(mode)  # 调用父类
         self.decoder.train(mode)
         if self.trainable_stages >= 1:
             self.model.model.trunk.stem.train(mode)
@@ -259,16 +234,13 @@ class ImageConvNextDiscriminator(nn.Module):
             if "out of memory" in str(e).lower():
                 logger.warning("语义 D CUDA OOM，尝试清理缓存")
                 torch.cuda.empty_cache()
-                # [FIX] 返回与输入相同 dtype 的零张量，避免混合精度下类型不匹配
-                zero_tensor = torch.zeros((), device=x.device, dtype=x.dtype)
-                return zero_tensor if not return_logits else (zero_tensor, [])
+                zero = torch.zeros((), device=x.device, dtype=x.dtype)
+                return zero if not return_logits else (zero, [])
             raise
 
         loss_fn = multilevel_loss(alpha=self.gan_alpha)
         loss = loss_fn(features, for_real=for_real, for_G=for_G)
-        if return_logits:
-            return loss, features
-        return loss
+        return (loss, features) if return_logits else loss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -283,16 +255,16 @@ class TextureConsistencyDiscriminator(nn.Module):
         self._sn = spectral_norm if use_spectral else lambda x: x
 
         enc_chs = [in_ch] + [base_ch * (2**i) for i in range(num_scales)]
-
         self.encoder = nn.ModuleList()
         for i in range(num_scales):
+            ch_in, ch_out = enc_chs[i], enc_chs[i + 1]
             self.encoder.append(
                 nn.Sequential(
-                    self._sn(nn.Conv2d(enc_chs[i], enc_chs[i + 1], 4, 2, 1)),
-                    nn.GroupNorm(min(8, enc_chs[i + 1] // 4), enc_chs[i + 1]),
+                    self._sn(nn.Conv2d(ch_in, ch_out, 4, 2, 1)),
+                    nn.GroupNorm(min(8, ch_out // 4), ch_out),
                     nn.LeakyReLU(0.2, inplace=False),
-                    self._sn(nn.Conv2d(enc_chs[i + 1], enc_chs[i + 1], 3, 1, 1)),
-                    nn.GroupNorm(min(8, enc_chs[i + 1] // 4), enc_chs[i + 1]),
+                    self._sn(nn.Conv2d(ch_out, ch_out, 3, 1, 1)),
+                    nn.GroupNorm(min(8, ch_out // 4), ch_out),
                     nn.LeakyReLU(0.2, inplace=False),
                 )
             )
@@ -311,7 +283,6 @@ class TextureConsistencyDiscriminator(nn.Module):
                     self._sn(nn.Linear(ch // 4, 1)),
                 )
             )
-
         self.scale_weights = nn.Parameter(torch.ones(num_scales) / num_scales)
 
     def _extract_features(self, x):
@@ -323,9 +294,9 @@ class TextureConsistencyDiscriminator(nn.Module):
 
     def forward(self, image, ref):
         if torch.isnan(image).any() or torch.isinf(image).any():
-            raise ValueError(f"纹理 D image 输入包含 NaN/Inf")
+            raise ValueError("纹理 D image 输入包含 NaN/Inf")
         if torch.isnan(ref).any() or torch.isinf(ref).any():
-            raise ValueError(f"纹理 D ref 输入包含 NaN/Inf")
+            raise ValueError("纹理 D ref 输入包含 NaN/Inf")
 
         if image.shape[-2:] != ref.shape[-2:]:
             ref = F.interpolate(
@@ -337,16 +308,13 @@ class TextureConsistencyDiscriminator(nn.Module):
 
         per_scale_logits = []
         for i, head in enumerate(self.scale_heads):
-            diff = torch.abs(feats_image[i] - feats_ref[i])
-            logit = head(diff)
-            per_scale_logits.append(logit)
+            per_scale_logits.append(head(torch.abs(feats_image[i] - feats_ref[i])))
 
         weights = torch.softmax(self.scale_weights, dim=0)
         logits_stacked = torch.stack(per_scale_logits, dim=0)
         weight_shape = [-1] + [1] * (logits_stacked.ndim - 1)
         weighted = (weights.view(*weight_shape) * logits_stacked).sum(dim=0)
 
-        # [FIX] per_scale_logits detach 后返回，避免泄漏计算图
         return torch.clamp(weighted, -5.0, 5.0), [l.detach() for l in per_scale_logits]
 
 
@@ -356,11 +324,7 @@ class TextureConsistencyDiscriminator(nn.Module):
 
 
 class SD2RefDiscriminator(LightningModule):
-    """
-    双判别器封装：
-      - 语义判别器 D_sem：ImageConvNextDiscriminator
-      - 纹理判别器 D_tex：TextureConsistencyDiscriminator
-    """
+    """双判别器封装：语义 D + 纹理 D"""
 
     def __init__(
         self,
@@ -380,37 +344,36 @@ class SD2RefDiscriminator(LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-
         self.use_semantic_d = use_semantic_d
         self.use_texture_d = use_texture_d
 
-        if use_semantic_d:
-            self.D_sem = ImageConvNextDiscriminator(
+        self.D_sem = (
+            ImageConvNextDiscriminator(
                 alpha=semantic_alpha,
                 precision=semantic_precision,
                 use_freq=semantic_use_freq,
                 trainable_stages=semantic_trainable_stages,
             )
-        else:
-            self.D_sem = None
+            if use_semantic_d
+            else None
+        )
 
-        if use_texture_d:
-            self.D_tex = TextureConsistencyDiscriminator(
+        self.D_tex = (
+            TextureConsistencyDiscriminator(
                 in_ch=3,
                 base_ch=texture_base_ch,
                 num_scales=texture_num_scales,
                 use_spectral=texture_use_spectral,
             )
-        else:
-            self.D_tex = None
+            if use_texture_d
+            else None
+        )
 
         self._d_sem_accum_count = 0
         self._d_tex_accum_count = 0
 
     def train(self, mode: bool = True):
-        # [FIX] 调用父类 train()，确保 Lightning 回调机制正常
-        super().train(mode)
-        self.training = mode
+        super().train(mode)  # [FIX] 调用父类
         if self.D_sem is not None:
             self.D_sem.train(mode)
         if self.D_tex is not None:
@@ -436,113 +399,69 @@ class SD2RefDiscriminator(LightningModule):
                 continue
             if torch.isnan(t).any() or torch.isinf(t).any():
                 raise ValueError(
-                    f"Input tensor {i} contains NaN/Inf: "
-                    f"min={t.min().item()}, max={t.max().item()}"
+                    f"Input tensor {i} contains NaN/Inf: min={t.min().item()}, max={t.max().item()}"
                 )
 
-    # ═══════════════════════════════════════════════════════
-    #  生成器侧接口
-    # ═══════════════════════════════════════════════════════
-
-    def compute_g_loss(
-        self,
-        fake: torch.Tensor,
-        ref: Optional[torch.Tensor] = None,
-        lambda_semantic: float = 1.0,
-        lambda_texture: float = 1.0,
-    ) -> torch.Tensor:
+    def compute_g_loss(self, fake, ref=None, lambda_semantic=1.0, lambda_texture=1.0):
         self._validate_inputs(fake, ref)
         loss = self._zero_loss(fake)
-
         with torch.amp.autocast("cuda", enabled=False):
             if self.use_semantic_d and lambda_semantic > 0:
-                loss_sem = self.D_sem(fake.float(), for_real=False, for_G=True).mean()
-                loss = loss + lambda_semantic * loss_sem
-
+                loss = (
+                    loss
+                    + lambda_semantic
+                    * self.D_sem(fake.float(), for_real=False, for_G=True).mean()
+                )
             if self.use_texture_d and lambda_texture > 0 and ref is not None:
-                ref = ref.detach().float()
-                fake_logit, _ = self.D_tex(fake.float(), ref)
+                ref_d = ref.detach().float()
+                fake_logit, _ = self.D_tex(fake.float(), ref_d)
                 loss = loss + lambda_texture * (-fake_logit.mean())
-
         return loss
-
-    # ═══════════════════════════════════════════════════════
-    #  判别器侧接口
-    # ═══════════════════════════════════════════════════════
 
     def compute_d_loss(
-        self,
-        real: torch.Tensor,
-        fake: torch.Tensor,
-        ref: Optional[torch.Tensor] = None,
-        lambda_semantic: float = 1.0,
-        lambda_texture: float = 1.0,
-    ) -> torch.Tensor:
+        self, real, fake, ref=None, lambda_semantic=1.0, lambda_texture=1.0
+    ):
         self._validate_inputs(real, fake, ref)
-        real = real.detach()
-        fake = fake.detach()
-        if ref is not None:
-            ref = ref.detach()
-
+        real, fake = real.detach(), fake.detach()
+        ref = ref.detach() if ref is not None else None
         loss = self._zero_loss(real)
-
         with torch.amp.autocast("cuda", enabled=False):
             if self.use_semantic_d and lambda_semantic > 0:
-                loss_sem_real = self.D_sem(
-                    real.float(), for_real=True, for_G=False
-                ).mean()
-                loss_sem_fake = self.D_sem(
-                    fake.float(), for_real=False, for_G=False
-                ).mean()
-                loss = loss + lambda_semantic * (loss_sem_real + loss_sem_fake)
-
+                r, f = real.float(), fake.float()
+                loss = loss + lambda_semantic * (
+                    self.D_sem(r, for_real=True).mean()
+                    + self.D_sem(f, for_real=False).mean()
+                )
             if self.use_texture_d and lambda_texture > 0 and ref is not None:
-                # [FIX] 缓存 ref.float() 避免重复转换
-                ref_float = ref.float()
-                real_logit, _ = self.D_tex(real.float(), ref_float)
-                fake_logit, _ = self.D_tex(fake.float(), ref_float)
-                loss_tex = (
+                ref_f = ref.float()  # 缓存避免重复转换
+                real_logit, _ = self.D_tex(real.float(), ref_f)
+                fake_logit, _ = self.D_tex(fake.float(), ref_f)
+                loss = loss + lambda_texture * (
                     F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()
                 )
-                loss = loss + lambda_texture * loss_tex
-
         return loss
 
-    # ═══════════════════════════════════════════════════════
-    #  Lightning 训练接口
-    # ═══════════════════════════════════════════════════════
-
-    def forward(
-        self,
-        real: torch.Tensor,
-        fake: torch.Tensor,
-        ref: Optional[torch.Tensor] = None,
-        mode: str = "both",
-    ) -> Tuple[torch.Tensor, dict]:
+    def forward(self, real, fake, ref=None, mode="both"):
         log_dict = {}
         loss_D = self._zero_loss(real)
-
-        if mode in ["both", "semantic"] and self.use_semantic_d:
-            loss_sem = self.compute_d_loss(
+        if mode in ("both", "semantic") and self.use_semantic_d:
+            l = self.compute_d_loss(
                 real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
             )
-            loss_D = loss_D + loss_sem
-            log_dict["loss_D_sem"] = loss_sem.detach()
-
-        if mode in ["both", "texture"] and self.use_texture_d and ref is not None:
-            loss_tex = self.compute_d_loss(
+            loss_D = loss_D + l
+            log_dict["loss_D_sem"] = l.detach()
+        if mode in ("both", "texture") and self.use_texture_d and ref is not None:
+            l = self.compute_d_loss(
                 real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
             )
-            loss_D = loss_D + loss_tex
-            log_dict["loss_D_tex"] = loss_tex.detach()
-
+            loss_D = loss_D + l
+            log_dict["loss_D_tex"] = l.detach()
         log_dict["loss_D_total"] = loss_D.detach()
         return loss_D, log_dict
 
     def training_step(self, batch, batch_idx):
         try:
-            real = batch["hr"]
-            fake = batch["sr"].detach()
+            real, fake = batch["hr"], batch["sr"].detach()
             ref = batch.get("ref", None)
             loss, log_dict = self.forward(real, fake, ref=ref, mode="both")
             self.log_dict(
@@ -557,14 +476,13 @@ class SD2RefDiscriminator(LightningModule):
             return self._zero_loss(batch["hr"])
 
     def configure_optimizers(self):
-        """配置优化器。注意：如果所有参数被冻结，对应优化器会被跳过。"""
         opts = []
         if self.use_semantic_d:
-            params_sem = [p for p in self.D_sem.parameters() if p.requires_grad]
-            if params_sem:  # [FIX] 防止空参数列表导致崩溃
+            ps = [p for p in self.D_sem.parameters() if p.requires_grad]
+            if ps:
                 opts.append(
                     torch.optim.AdamW(
-                        params_sem,
+                        ps,
                         lr=self.hparams.lr_semantic,
                         betas=self.hparams.betas,
                         weight_decay=self.hparams.weight_decay,
@@ -573,11 +491,11 @@ class SD2RefDiscriminator(LightningModule):
             else:
                 logger.warning("D_sem 无可训练参数，跳过 D_sem 优化器")
         if self.use_texture_d:
-            params_tex = list(self.D_tex.parameters())
-            if params_tex:  # [FIX] 防止空参数列表导致崩溃
+            ps = list(self.D_tex.parameters())
+            if ps:
                 opts.append(
                     torch.optim.AdamW(
-                        params_tex,
+                        ps,
                         lr=self.hparams.lr_texture,
                         betas=self.hparams.betas,
                         weight_decay=self.hparams.weight_decay,
@@ -598,26 +516,16 @@ class SD2RefDiscriminator(LightningModule):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SD2RefDiscriminator(
-        use_semantic_d=True,
-        use_texture_d=True,
-    ).to(device)
+    model = SD2RefDiscriminator(use_semantic_d=True, use_texture_d=True).to(device)
     model.eval()
-
-    B, C, H, W = 2, 3, 480, 480
-    real = torch.randn(B, C, H, W, device=device)
-    fake = torch.randn(B, C, H, W, device=device)
-    ref = torch.randn(B, C, H, W, device=device)
-
-    d_loss = model.compute_d_loss(real, fake, ref=ref)
-    print("D loss:", d_loss.item())
-
-    g_loss = model.compute_g_loss(fake, ref=ref)
-    print("G loss:", g_loss.item())
-
+    B, B3 = 2, 3
+    real = torch.randn(B, B3, 480, 480, device=device)
+    fake = torch.randn(B, B3, 480, 480, device=device)
+    ref = torch.randn(B, B3, 480, 480, device=device)
+    print("D loss:", model.compute_d_loss(real, fake, ref=ref).item())
+    print("G loss:", model.compute_g_loss(fake, ref=ref).item())
     loss, logs = model(real, fake, ref=ref, mode="both")
     print("forward loss:", loss.item())
     print("logs:", {k: v.item() for k, v in logs.items()})
-
     loss.backward()
     print("backward ok")

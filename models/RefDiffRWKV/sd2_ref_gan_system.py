@@ -13,7 +13,7 @@ sd2_ref_gan_system.py — G/D 分离 + 交替训练系统
 import os
 import logging
 import shutil
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
@@ -54,7 +54,6 @@ class SD2RefGANSystem(LightningModule):
         # 验证
         sample_steps: int = 50,
         fr_metrics: Optional[List[str]] = None,
-        save_val_every_n_batches: int = 4,  # [FIX] 新增：验证图片保存频率
         # Better Start
         sr_model: Optional[torch.nn.Module] = None,
         sr_fixed: bool = True,
@@ -81,7 +80,6 @@ class SD2RefGANSystem(LightningModule):
         self.accumulate_grad_batches = accumulate_grad_batches
         self.sample_steps = sample_steps
         self.g_d_ratio = g_d_ratio
-        self.save_val_every_n_batches = save_val_every_n_batches
         self.t_start = t_start
         self.guidance_scale = guidance_scale
         self.t_stop = t_stop
@@ -97,11 +95,13 @@ class SD2RefGANSystem(LightningModule):
         # 手动优化
         self.automatic_optimization = False
         self.use_amp = use_amp
-        self.scaler_g = (
-            torch.amp.GradScaler("cuda", enabled=True)
-            if use_amp and torch.cuda.is_available()
-            else None
-        )
+
+        # [FIX] 动态设备类型，避免硬编码 "cuda"
+        self._device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        if self.use_amp and self._device_type == "cuda":
+            self.scaler_g = torch.amp.GradScaler(self._device_type, enabled=True)
+        else:
+            self.scaler_g = None
 
         self._g_accum_count = 0
         self._d_sem_accum_count = 0
@@ -109,7 +109,7 @@ class SD2RefGANSystem(LightningModule):
         self._gd_phase = 0
         self._g_steps_since_d = 0
 
-        self._opt_idx: Dict[str, int] = {}
+        self._opt_idx: dict = {}
 
         # LPIPS
         self.net_lpips = lpips.LPIPS(net="vgg", verbose=False)
@@ -121,9 +121,8 @@ class SD2RefGANSystem(LightningModule):
         try:
             from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
-            device_str = "cuda" if torch.cuda.is_available() else "cpu"
             self.iqa = IQAEngine(
-                device=device_str,
+                device=self._device_type,
                 nr_metrics=[],
                 fr_metrics=fr_metrics or ["psnr", "ssim", "lpips", "dists"],
                 use_y_channel=True,
@@ -133,20 +132,25 @@ class SD2RefGANSystem(LightningModule):
             logger.warning("IQA engine 不可用: %s", e)
 
     # ═══════════════════════════════════════════════════════
-    #  train / eval （修复：调用 super().train()）
+    #  判别器状态辅助方法
     # ═══════════════════════════════════════════════════════
 
-    def train(self, mode: bool = True):
-        # [FIX] 调用父类 train()，确保 Lightning 回调机制正常
-        super().train(mode)
-        return self
+    def _freeze_discriminator(self):
+        if self.discriminator is not None:
+            self.discriminator.eval()
+            self.discriminator.requires_grad_(False)
+
+    def _unfreeze_discriminator(self):
+        if self.discriminator is not None:
+            self.discriminator.train()
+            self.discriminator.requires_grad_(True)
 
     # ═══════════════════════════════════════════════════════
     #  构建全零 down_intrablock 残差
     # ═══════════════════════════════════════════════════════
 
     def _build_zero_intrablock(self, x_input: torch.Tensor) -> List[torch.Tensor]:
-        _, _, latent_h, latent_w = x_input.shape
+        bsz, _, latent_h, latent_w = x_input.shape
 
         def _half(h, w):
             return (h + 1) // 2, (w + 1) // 2
@@ -162,14 +166,7 @@ class SD2RefGANSystem(LightningModule):
         residuals = []
         for (th, tw), ch in zip(target_sizes, channels):
             residuals.append(
-                torch.zeros(
-                    x_input.shape[0],
-                    ch,
-                    th,
-                    tw,
-                    device=x_input.device,
-                    dtype=x_input.dtype,
-                )
+                torch.zeros(bsz, ch, th, tw, device=x_input.device, dtype=x_input.dtype)
             )
         return residuals
 
@@ -209,8 +206,7 @@ class SD2RefGANSystem(LightningModule):
         pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
             -20.0, 20.0
         )
-        pred_pixel = self.generator.decode_latent(pred_x0)
-        return pred_pixel
+        return self.generator.decode_latent(pred_x0)
 
     # ═══════════════════════════════════════════════════════
     #  无 adapter 路径（HR 去噪标杆）
@@ -219,16 +215,15 @@ class SD2RefGANSystem(LightningModule):
     @torch.no_grad()
     def _no_adapter_pred_x0(self, hr, sr_latent_cond, t, noise):
         bsz = hr.shape[0]
-        device = hr.device
         hr_latent = self.generator.encode_latent(hr)
         null_ctx = torch.zeros(
             bsz,
             77,
             self.generator.cross_attn_dim,
-            device=device,
+            device=hr.device,
             dtype=torch.float32,
         )
-        pred_pixel = self._pred_x0_base(
+        return self._pred_x0_base(
             latent=hr_latent,
             sr_latent_cond=(
                 sr_latent_cond.detach() if sr_latent_cond is not None else None
@@ -238,17 +233,16 @@ class SD2RefGANSystem(LightningModule):
             context=null_ctx,
             down_intrablock=None,
         )
-        return pred_pixel
 
     # ═══════════════════════════════════════════════════════
     #  有 adapter 路径（SR 去噪，可梯度）
     # ═══════════════════════════════════════════════════════
 
     def _adapter_pred_x0(self, lr, ref, sr_latent_precomputed, t, noise):
-        bsz = lr.shape[0]
         latent_h, latent_w = sr_latent_precomputed.shape[2:]
-
+        bsz = lr.shape[0]
         ref_feats = self.generator.adapter(lr, ref)
+
         sem_tokens = None
         if self.generator.use_semantic:
             with torch.no_grad():
@@ -260,7 +254,7 @@ class SD2RefGANSystem(LightningModule):
             ref_feats, latent_h, latent_w
         )
 
-        pred_pixel = self._pred_x0_base(
+        return self._pred_x0_base(
             latent=sr_latent_precomputed,
             sr_latent_cond=sr_latent_precomputed.detach(),
             t=t,
@@ -268,7 +262,6 @@ class SD2RefGANSystem(LightningModule):
             context=context,
             down_intrablock=down_intrablock,
         )
-        return pred_pixel
 
     # ═══════════════════════════════════════════════════════
     #  优化器 / 状态持久化
@@ -341,22 +334,16 @@ class SD2RefGANSystem(LightningModule):
         self._g_steps_since_d = checkpoint.get("g_steps_since_d", 0)
 
     def load_state_dict(self, state_dict, strict=True):
-        # [FIX] 使用传入的 strict 参数而非硬编码 strict=False
         result = super().load_state_dict(state_dict, strict=strict)
-        missing = getattr(result, "missing_keys", []) or []
-        unexpected = getattr(result, "unexpected_keys", []) or []
+        missing, unexpected = result.missing_keys, result.unexpected_keys
         if missing:
             logger.warning("load_state_dict: %d missing keys", len(missing))
             for k in missing[:10]:
                 logger.warning("  - %s", k)
-            if len(missing) > 10:
-                logger.warning("  ... and %d more", len(missing) - 10)
         if unexpected:
             logger.warning("load_state_dict: %d unexpected keys", len(unexpected))
             for k in unexpected[:10]:
                 logger.warning("  - %s", k)
-            if len(unexpected) > 10:
-                logger.warning("  ... and %d more", len(unexpected) - 10)
         if not missing and not unexpected:
             logger.info("load_state_dict: all keys matched")
         return result
@@ -365,29 +352,31 @@ class SD2RefGANSystem(LightningModule):
         optimizers = self.optimizers()
         if not optimizers:
             return
-        g_idx = self._opt_idx.get("g")
-        if g_idx is None or g_idx >= len(optimizers):
-            logger.warning("G 优化器未找到，跳过 LR 覆盖")
-            return
-        target_g_lr = self.hparams.g_lr
-        for pg in optimizers[g_idx].param_groups:
-            old = pg["lr"]
-            pg["lr"] = target_g_lr
-        logger.info("G LR: %.1e → %.1e", old, target_g_lr)
+        # [FIX] 防止参数组为空时 old 未定义
+        old_g = None
+        for pg in optimizers[self._opt_idx["g"]].param_groups:
+            old_g = pg["lr"]
+            pg["lr"] = self.hparams.g_lr
+        if old_g is not None:
+            logger.info("G LR: %.1e → %.1e", old_g, self.hparams.g_lr)
 
         idx_sem = self._opt_idx.get("d_sem")
-        if idx_sem is not None and idx_sem < len(optimizers):
+        if idx_sem is not None:
+            old_sem = None
             for pg in optimizers[idx_sem].param_groups:
-                old = pg["lr"]
+                old_sem = pg["lr"]
                 pg["lr"] = self.hparams.d_lr_sem
-            logger.info("D_sem LR: %.1e → %.1e", old, self.hparams.d_lr_sem)
+            if old_sem is not None:
+                logger.info("D_sem LR: %.1e → %.1e", old_sem, self.hparams.d_lr_sem)
 
         idx_tex = self._opt_idx.get("d_tex")
-        if idx_tex is not None and idx_tex < len(optimizers):
+        if idx_tex is not None:
+            old_tex = None
             for pg in optimizers[idx_tex].param_groups:
-                old = pg["lr"]
+                old_tex = pg["lr"]
                 pg["lr"] = self.hparams.d_lr_tex
-            logger.info("D_tex LR: %.1e → %.1e", old, self.hparams.d_lr_tex)
+            if old_tex is not None:
+                logger.info("D_tex LR: %.1e → %.1e", old_tex, self.hparams.d_lr_tex)
 
     # ═══════════════════════════════════════════════════════
     #  梯度监控
@@ -398,8 +387,7 @@ class SD2RefGANSystem(LightningModule):
         for group in optimizer.param_groups:
             for p in group["params"]:
                 if p.grad is not None:
-                    param_norm = p.grad.data.norm(2).item()
-                    total_norm += param_norm**2
+                    total_norm += p.grad.data.norm(2).item() ** 2
         total_norm = total_norm**0.5
         if total_norm > self.grad_warn_threshold:
             logger.warning(
@@ -418,24 +406,18 @@ class SD2RefGANSystem(LightningModule):
     def _get_sr_latent_precomputed(self, lr, ref):
         if self.sr_model is None:
             return None
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(self._device_type, enabled=False):
             sr_pixel = self.sr_model(lr.float(), ref.float())
             sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0)
             sr_pixel = sr_pixel.clamp(-1.0, 1.0)
             return self.generator.encode_latent(sr_pixel.to(self.generator.vae.dtype))
 
     # ═══════════════════════════════════════════════════════
-    #  NaN 辅助方法
+    #  NaN 自动终止检测
     # ═══════════════════════════════════════════════════════
 
-    def _reset_nan_counters(self):
-        """重置所有 NaN 计数器。"""
-        self._consecutive_nan_g = 0
-        self._consecutive_nan_d = 0
-
     def _check_early_stop(self, is_g_step: bool):
-        cnt_name = "_consecutive_nan_g" if is_g_step else "_consecutive_nan_d"
-        cnt = getattr(self, cnt_name, 0)
+        cnt = self._consecutive_nan_g if is_g_step else self._consecutive_nan_d
         if cnt >= self.max_consecutive_nan:
             logger.error(
                 "连续 %d 步 NaN (%s)，自动停止训练",
@@ -457,89 +439,17 @@ class SD2RefGANSystem(LightningModule):
             return self._discriminator_step(batch, batch_idx)
 
     # ═══════════════════════════════════════════════════════
-    #  Generator Step — Phase 2 辅助 loss（修复：抽取为辅助方法）
+    #  Generator Step
     # ═══════════════════════════════════════════════════════
-
-    def _compute_g_phase2_loss(self, lr, ref, hr):
-        """计算 Phase 2 的 SR 辅助 loss（MSE(SR) + LPIPS + GAN）。
-
-        Returns:
-            (phase2_loss, phase2_loss_val): 带梯度的 loss 和 detach 后的标量值
-        """
-        self.discriminator.eval()
-        self.discriminator.requires_grad_(False)
-        bsz = lr.shape[0]
-        device = lr.device
-
-        with torch.amp.autocast("cuda", enabled=self.use_amp):
-            sr_latent = self._get_sr_latent_precomputed(lr, ref)
-            if sr_latent is None:
-                return None, None
-
-            t_sr = torch.randint(
-                self.generator.t_min,
-                self.generator.t_max + 1,
-                (bsz,),
-                device=device,
-                dtype=torch.long,
-            )
-            noise_sr = torch.randn_like(sr_latent)
-
-            with torch.no_grad():
-                pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t_sr, noise_sr)
-
-            pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t_sr, noise_sr)
-
-            phase2_loss = 0.0
-
-            if self.lambda_diff_sr > 0:
-                loss_diff_sr = F.mse_loss(pred_sr_pixel, pred_hr_pixel.detach())
-                phase2_loss = phase2_loss + self.lambda_diff_sr * loss_diff_sr
-                self.log("train/G_diff_sr", loss_diff_sr.detach(), on_step=True)
-
-            if self.lambda_lpips > 0:
-                loss_lpips_sr = (
-                    self.net_lpips(pred_sr_pixel, hr).mean() * self.lambda_lpips
-                )
-                if not torch.isnan(loss_lpips_sr) and not torch.isinf(loss_lpips_sr):
-                    phase2_loss = phase2_loss + loss_lpips_sr
-                    self.log("train/G_lpips", loss_lpips_sr.detach(), on_step=True)
-                else:
-                    self._nan_g_count += 1
-                    logger.warning(
-                        "[G step] LPIPS(SR) NaN/Inf (#%d)，跳过", self._nan_g_count
-                    )
-
-            with torch.amp.autocast("cuda", enabled=False):
-                gan_loss = self.discriminator.compute_g_loss(
-                    fake=pred_sr_pixel.float(),
-                    ref=ref.float(),
-                    lambda_semantic=self.lambda_gan_semantic,
-                    lambda_texture=self.lambda_gan_texture,
-                )
-
-            if not torch.isnan(gan_loss) and not torch.isinf(gan_loss):
-                phase2_loss = phase2_loss + gan_loss
-                self.log("train/G_gan", gan_loss.detach(), on_step=True)
-            else:
-                self._nan_g_count += 1
-                logger.warning(
-                    "[G step] GAN NaN/Inf (#%d)，pred_sr_pixel range=[%.2f, %.2f]",
-                    self._nan_g_count,
-                    pred_sr_pixel.min(),
-                    pred_sr_pixel.max(),
-                )
-
-        if isinstance(phase2_loss, torch.Tensor) and phase2_loss.item() != 0:
-            return phase2_loss, phase2_loss.detach()
-        return None, None
 
     def _generator_step(self, batch, batch_idx):
         g_opt = self._get_g_opt()
+        # [FIX] 确保 G step 期间 D 冻结
+        self._freeze_discriminator()
         lr, ref, hr = self.generator.get_input(batch)
 
         # Phase 1: 扩散去噪
-        with torch.amp.autocast("cuda", enabled=self.use_amp):
+        with torch.amp.autocast(self._device_type, enabled=self.use_amp):
             out = self.generator.forward(lr, ref, hr)
             loss = out["loss"]
 
@@ -551,9 +461,6 @@ class SD2RefGANSystem(LightningModule):
             g_opt.zero_grad(set_to_none=True)
             self._g_accum_count = 0
             self._gd_phase = 1
-            if self.discriminator is not None:
-                self.discriminator.eval()
-                self.discriminator.requires_grad_(False)
             return None
         self._consecutive_nan_g = 0
 
@@ -575,9 +482,70 @@ class SD2RefGANSystem(LightningModule):
                 or self.lambda_lpips > 0
             )
         ):
-            # [FIX] 抽取为辅助方法，提高可读性
-            phase2_loss, phase2_loss_val = self._compute_g_phase2_loss(lr, ref, hr)
-            if phase2_loss is not None:
+            bsz = lr.shape[0]
+            with torch.amp.autocast(self._device_type, enabled=self.use_amp):
+                sr_latent = self._get_sr_latent_precomputed(lr, ref)
+                t_sr = torch.randint(
+                    self.generator.t_min,
+                    self.generator.t_max + 1,
+                    (bsz,),
+                    device=lr.device,
+                    dtype=torch.long,
+                )
+                noise_sr = torch.randn_like(sr_latent)
+
+                with torch.no_grad():
+                    pred_hr_pixel = self._no_adapter_pred_x0(
+                        hr, sr_latent, t_sr, noise_sr
+                    )
+                pred_sr_pixel = self._adapter_pred_x0(
+                    lr, ref, sr_latent, t_sr, noise_sr
+                )
+
+                phase2_loss = 0.0
+
+                if self.lambda_diff_sr > 0:
+                    loss_diff_sr = F.mse_loss(pred_sr_pixel, pred_hr_pixel.detach())
+                    phase2_loss = phase2_loss + self.lambda_diff_sr * loss_diff_sr
+                    self.log("train/G_diff_sr", loss_diff_sr.detach(), on_step=True)
+
+                if self.lambda_lpips > 0:
+                    loss_lpips_sr = (
+                        self.net_lpips(pred_sr_pixel, hr).mean() * self.lambda_lpips
+                    )
+                    if not torch.isnan(loss_lpips_sr) and not torch.isinf(
+                        loss_lpips_sr
+                    ):
+                        phase2_loss = phase2_loss + loss_lpips_sr
+                        self.log("train/G_lpips", loss_lpips_sr.detach(), on_step=True)
+                    else:
+                        self._nan_g_count += 1
+                        logger.warning(
+                            "[G step] LPIPS(SR) NaN/Inf (#%d)，跳过", self._nan_g_count
+                        )
+
+                with torch.amp.autocast(self._device_type, enabled=False):
+                    gan_loss = self.discriminator.compute_g_loss(
+                        fake=pred_sr_pixel.float(),
+                        ref=ref.float(),
+                        lambda_semantic=self.lambda_gan_semantic,
+                        lambda_texture=self.lambda_gan_texture,
+                    )
+
+                if not torch.isnan(gan_loss) and not torch.isinf(gan_loss):
+                    phase2_loss = phase2_loss + gan_loss
+                    self.log("train/G_gan", gan_loss.detach(), on_step=True)
+                else:
+                    self._nan_g_count += 1
+                    logger.warning(
+                        "[G step] GAN NaN/Inf (#%d)，pred_sr_pixel range=[%.2f, %.2f]",
+                        self._nan_g_count,
+                        pred_sr_pixel.min(),
+                        pred_sr_pixel.max(),
+                    )
+
+            if isinstance(phase2_loss, torch.Tensor) and phase2_loss.item() != 0:
+                phase2_loss_val = phase2_loss.detach()
                 phase2_loss_scaled = phase2_loss / self.accumulate_grad_batches
                 if self.scaler_g is not None:
                     self.scaler_g.scale(phase2_loss_scaled).backward()
@@ -603,14 +571,11 @@ class SD2RefGANSystem(LightningModule):
             g_opt.zero_grad(set_to_none=True)
             self._g_accum_count = 0
 
-            # g_d_ratio 控制
             self._g_steps_since_d += 1
             if self._g_steps_since_d >= self.g_d_ratio:
                 self._gd_phase = 1
                 self._g_steps_since_d = 0
-                if self.discriminator is not None:
-                    self.discriminator.train()
-                    self.discriminator.requires_grad_(True)
+                self._unfreeze_discriminator()
 
         g_total = loss.detach()
         if phase2_loss_val is not None:
@@ -620,27 +585,8 @@ class SD2RefGANSystem(LightningModule):
         return g_total
 
     # ═══════════════════════════════════════════════════════
-    #  Discriminator Step（修复：抽取 NaN 处理逻辑）
+    #  Discriminator Step
     # ═══════════════════════════════════════════════════════
-
-    def _handle_nan_d_step(self, d_sem_opt, d_tex_opt, batch_idx, reason: str):
-        """处理 D step 中的 NaN/Inf 情况，统一清理逻辑。"""
-        self._nan_d_count += 1
-        self._consecutive_nan_d += 1
-        self._check_early_stop(is_g_step=False)
-        logger.warning(
-            "[D step] %s (#%d), batch=%d", reason, self._nan_d_count, batch_idx
-        )
-        if d_sem_opt is not None:
-            d_sem_opt.zero_grad(set_to_none=True)
-            self._d_sem_accum_count = 0
-        if d_tex_opt is not None:
-            d_tex_opt.zero_grad(set_to_none=True)
-            self._d_tex_accum_count = 0
-        self.discriminator.eval()
-        self.discriminator.requires_grad_(False)
-        self._gd_phase = 0
-        self._reset_nan_counters()
 
     def _discriminator_step(self, batch, batch_idx):
         if self.discriminator is None or (
@@ -652,44 +598,76 @@ class SD2RefGANSystem(LightningModule):
             self._gd_phase = 0
             return None
 
-        self.discriminator.train()
-        self.discriminator.requires_grad_(True)
+        self._unfreeze_discriminator()
 
         d_sem_opt = self._get_d_sem_opt()
         d_tex_opt = self._get_d_tex_opt()
         lr, ref, hr = self.generator.get_input(batch)
         bsz = lr.shape[0]
-        device = lr.device
 
         # ref NaN 检查
         if torch.isnan(ref).any() or torch.isinf(ref).any():
-            self._handle_nan_d_step(d_sem_opt, d_tex_opt, batch_idx, "ref NaN/Inf")
+            self._nan_d_count += 1
+            self._consecutive_nan_d += 1
+            self._check_early_stop(is_g_step=False)
+            logger.warning(
+                "[D step] ref NaN/Inf (#%d), batch=%d", self._nan_d_count, batch_idx
+            )
+            if d_sem_opt is not None:
+                d_sem_opt.zero_grad(set_to_none=True)
+                self._d_sem_accum_count = 0
+            if d_tex_opt is not None:
+                d_tex_opt.zero_grad(set_to_none=True)
+                self._d_tex_accum_count = 0
+            self._freeze_discriminator()
+            self._gd_phase = 0
             return None
         self._consecutive_nan_d = 0
 
         # 单步 pred_x0
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=self.use_amp):
+            with torch.amp.autocast(self._device_type, enabled=self.use_amp):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
-                t = torch.randint(0, 999, (bsz,), device=device, dtype=torch.long)
+                t = torch.randint(0, 999, (bsz,), device=lr.device, dtype=torch.long)
                 noise = torch.randn_like(sr_latent)
                 pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
                 pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
 
-        real = pred_hr_pixel.detach().float()
-        fake = pred_sr_pixel.detach().float()
+        real, fake = pred_hr_pixel.detach().float(), pred_sr_pixel.detach().float()
 
         # fake NaN 检查
         if torch.isnan(fake).any() or torch.isinf(fake).any():
-            self._handle_nan_d_step(d_sem_opt, d_tex_opt, batch_idx, "fake NaN/Inf")
+            self._nan_d_count += 1
+            self._consecutive_nan_d += 1
+            self._check_early_stop(is_g_step=False)
+            logger.warning(
+                "[D step] fake NaN/Inf (#%d), batch=%d", self._nan_d_count, batch_idx
+            )
+            if d_sem_opt is not None:
+                d_sem_opt.zero_grad(set_to_none=True)
+                self._d_sem_accum_count = 0
+            if d_tex_opt is not None:
+                d_tex_opt.zero_grad(set_to_none=True)
+                self._d_tex_accum_count = 0
+            self._freeze_discriminator()
+            self._gd_phase = 0
             return None
         self._consecutive_nan_d = 0
 
         # real NaN 检查
         if torch.isnan(real).any() or torch.isinf(real).any():
-            self._handle_nan_d_step(
-                d_sem_opt, d_tex_opt, batch_idx, "real(no-adapter) NaN/Inf"
-            )
+            self._nan_d_count += 1
+            self._consecutive_nan_d += 1
+            self._check_early_stop(is_g_step=False)
+            logger.warning("[D step] real(no-adapter) NaN/Inf (#%d)", self._nan_d_count)
+            if d_sem_opt is not None:
+                d_sem_opt.zero_grad(set_to_none=True)
+                self._d_sem_accum_count = 0
+            if d_tex_opt is not None:
+                d_tex_opt.zero_grad(set_to_none=True)
+                self._d_tex_accum_count = 0
+            self._freeze_discriminator()
+            self._gd_phase = 0
             return None
         self._consecutive_nan_d = 0
 
@@ -702,13 +680,9 @@ class SD2RefGANSystem(LightningModule):
             and self.discriminator.use_semantic_d
             and d_sem_opt is not None
         ):
-            with torch.amp.autocast("cuda", enabled=False):
+            with torch.amp.autocast(self._device_type, enabled=False):
                 loss_d_sem = self.discriminator.compute_d_loss(
-                    real=real,
-                    fake=fake,
-                    ref=None,
-                    lambda_semantic=1.0,
-                    lambda_texture=0.0,
+                    real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
                 )
             if not torch.isnan(loss_d_sem) and not torch.isinf(loss_d_sem):
                 (loss_d_sem / self.accumulate_grad_batches).backward()
@@ -739,13 +713,9 @@ class SD2RefGANSystem(LightningModule):
             and self.discriminator.use_texture_d
             and d_tex_opt is not None
         ):
-            with torch.amp.autocast("cuda", enabled=False):
+            with torch.amp.autocast(self._device_type, enabled=False):
                 loss_d_tex = self.discriminator.compute_d_loss(
-                    real=real,
-                    fake=fake,
-                    ref=ref,
-                    lambda_semantic=0.0,
-                    lambda_texture=1.0,
+                    real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
                 )
             if not torch.isnan(loss_d_tex) and not torch.isinf(loss_d_tex):
                 (loss_d_tex / self.accumulate_grad_batches).backward()
@@ -786,8 +756,7 @@ class SD2RefGANSystem(LightningModule):
             not self.discriminator.use_texture_d or self._d_tex_accum_count == 0
         )
         if d_sem_done and d_tex_done:
-            self.discriminator.eval()
-            self.discriminator.requires_grad_(False)
+            self._freeze_discriminator()
             self._gd_phase = 0
             self._g_steps_since_d = 0
 
@@ -820,13 +789,12 @@ class SD2RefGANSystem(LightningModule):
 
             if self.iqa is not None:
                 try:
-                    sr_batch = val_results["samples"]
-                    hq_batch = val_results["hq"]
+                    sr_batch, hq_batch = val_results["samples"], val_results["hq"]
                     agg = {}
                     for i in range(len(sr_batch)):
-                        sr_np = sr_batch[i].cpu().numpy()
-                        hq_np = hq_batch[i].cpu().numpy()
-                        m = self.iqa.evaluate_single(sr_np, hq_np)
+                        m = self.iqa.evaluate_single(
+                            sr_batch[i].cpu().numpy(), hq_batch[i].cpu().numpy()
+                        )
                         for k, v in m.items():
                             agg[k] = agg.get(k, 0.0) + v
                     n = len(sr_batch)
@@ -837,45 +805,39 @@ class SD2RefGANSystem(LightningModule):
                 except Exception as e:
                     logger.warning("IQA 评估失败: %s", e)
 
-            # [FIX] 使用可配置的保存频率
-            if (
-                self.save_val_every_n_batches > 0
-                and batch_idx % self.save_val_every_n_batches == 0
-            ):
+            # [FIX] logger 空检查
+            if batch_idx % 4 == 0 and self.logger is not None:
                 self._save_validation_images(val_results, lr, ref, hr)
 
             del val_results, lr, ref, hr
             return loss_diff
         except Exception as e:
             logger.warning("validation_step 异常: %s", e)
-            torch.cuda.empty_cache()
             return torch.tensor(0.0, device=self.device)
 
     def _save_validation_images(self, val_results, lr, ref, hr):
-        """保存验证图片到 validation_tmp 目录。"""
-        if self.logger is None:
-            return
         save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
         os.makedirs(save_dir, exist_ok=True)
 
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=False):
-                if self.sr_model is not None:
-                    sr_prior = self.sr_model(lr.float(), ref.float())
+            with torch.amp.autocast(self._device_type, enabled=False):
+                sr_prior = (
+                    self.sr_model(lr.float(), ref.float())
+                    if self.sr_model is not None
+                    else None
+                )
+                if sr_prior is not None:
                     sr_prior = torch.nan_to_num(
                         sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
                     ).clamp(-1.0, 1.0)
-                else:
-                    sr_prior = None
 
         images_to_concat = []
-        for image_key in ["lq", "ref", "hq", "samples"]:
+        for image_key in ("lq", "ref", "hq", "samples"):
             if image_key not in val_results:
                 continue
             img = val_results[image_key][0]
             img = img.detach().cpu().permute(1, 2, 0).numpy()
-            img = (img * 255).clip(0, 255).astype(np.uint8)
-            pil_img = Image.fromarray(img)
+            pil_img = Image.fromarray((img * 255).clip(0, 255).astype(np.uint8))
             if image_key == "lq":
                 target_size = val_results["samples"].shape[-2:]
                 pil_img = pil_img.resize(
@@ -884,10 +846,12 @@ class SD2RefGANSystem(LightningModule):
             images_to_concat.append(pil_img)
 
         if sr_prior is not None:
-            sr_prior_01 = (sr_prior + 1.0) / 2.0
-            sr_img = sr_prior_01[0].detach().cpu().permute(1, 2, 0).numpy()
-            sr_img = np.nan_to_num(sr_img, nan=0.0, posinf=1.0, neginf=0.0)
-            sr_img = (sr_img * 255).clip(0, 255).astype(np.uint8)
+            sr_img = ((sr_prior + 1.0) / 2.0)[0].detach().cpu().permute(1, 2, 0).numpy()
+            sr_img = (
+                (np.nan_to_num(sr_img, nan=0.0, posinf=1.0, neginf=0.0) * 255)
+                .clip(0, 255)
+                .astype(np.uint8)
+            )
             images_to_concat.append(Image.fromarray(sr_img))
 
         if images_to_concat:
@@ -898,25 +862,19 @@ class SD2RefGANSystem(LightningModule):
             for im in images_to_concat:
                 combined.paste(im, (x_offset, 0))
                 x_offset += im.width
-            combined.save(os.path.join(save_dir, f"b{self.global_step}.png"))
+            combined.save(os.path.join(save_dir, f"step_{self.global_step}.png"))
 
     def on_validation_epoch_start(self):
-        if self.discriminator is not None:
-            self.discriminator.eval()
-
-        # [FIX] import shutil 已移至文件顶部，此处直接使用
-        save_dir = (
-            os.path.join(self.logger.save_dir, "validation_tmp")
-            if self.logger
-            else None
-        )
-        if save_dir and os.path.exists(save_dir):
-            shutil.rmtree(save_dir)
-            logger.info("已清理 validation_tmp 目录")
+        self._freeze_discriminator()
+        if self.logger is not None:
+            save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
+            if os.path.exists(save_dir):
+                shutil.rmtree(save_dir)
+                logger.info("已清理 validation_tmp 目录")
 
     def on_validation_epoch_end(self):
-        # [FIX] 仅在 epoch 结束时清理缓存，而非每步
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def on_train_start(self):
         if self.sr_model is not None:
