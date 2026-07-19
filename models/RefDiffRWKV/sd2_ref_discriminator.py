@@ -398,16 +398,14 @@ class SD2RefDiscriminator(LightningModule):
 
     # ═══════════════════════════════════════════════════════
     #  train / eval / requires_grad_ 重写
-    #  关键：转发到 D_sem 的自定义实现，避免默认 nn.Module 行为
-    #  把冻结的 laion2b CLIP backbone 整体解冻。
     # ═══════════════════════════════════════════════════════
 
     def train(self, mode: bool = True):
         self.training = mode
         if self.D_sem is not None:
-            self.D_sem.train(mode)  # 自定义：只切 decoder + 可训练 stage
+            self.D_sem.train(mode)
         if self.D_tex is not None:
-            self.D_tex.train(mode)  # 默认行为即可
+            self.D_tex.train(mode)
         return self
 
     def eval(self):
@@ -415,7 +413,7 @@ class SD2RefDiscriminator(LightningModule):
 
     def requires_grad_(self, requires_grad: bool = True):
         if self.D_sem is not None:
-            self.D_sem.requires_grad_(requires_grad)  # 自定义：保护 CLIP trunk
+            self.D_sem.requires_grad_(requires_grad)
         if self.D_tex is not None:
             self.D_tex.requires_grad_(requires_grad)
         return self
@@ -443,6 +441,7 @@ class SD2RefDiscriminator(LightningModule):
             loss = loss + lambda_semantic * loss_sem
 
         if self.use_texture_d and lambda_texture > 0 and ref is not None:
+            ref = ref.detach()
             fake_logit, _ = self.D_tex(fake, ref)
             loss = loss + lambda_texture * (-fake_logit.mean())
 
@@ -471,6 +470,7 @@ class SD2RefDiscriminator(LightningModule):
             loss = loss + lambda_semantic * (loss_sem_real + loss_sem_fake)
 
         if self.use_texture_d and lambda_texture > 0 and ref is not None:
+            ref = ref.detach()
             real_logit, _ = self.D_tex(real, ref)
             fake_logit, _ = self.D_tex(fake.detach(), ref)
             loss_tex = F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()

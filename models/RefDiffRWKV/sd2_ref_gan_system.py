@@ -7,8 +7,7 @@ sd2_ref_gan_system.py — G/D 分离 + 交替训练系统
   3. G step 中扩散 loss 为主，GAN / LPIPS 为辅助；
   4. D step 中用单步 pred_x0 生成 fake/real（无adapter vs 有adapter），更新判别器；
   5. 所有进入判别器的图像统一保持在 [-1, 1] 值域。
-  6. 复用 RefGAN 的 UNet：HR 路径不注入 adapter/lr/ref，SR 路径注入。
-     D 比较同一个 UNet "有/无 adapter 增强" 的去噪质量差异。
+  6. 无 adapter 路径复用 generator UNet + 零残差注入，零额外显存开销。
 """
 
 import os
@@ -100,19 +99,53 @@ class SD2RefGANSystem(LightningModule):
         for p in self.net_lpips.parameters():
             p.requires_grad = False
 
-        # IQA engine
         try:
             from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
             self.iqa = IQAEngine(
-                device="cuda",
+                device="cuda" if torch.cuda.is_available() else "cpu",
                 nr_metrics=[],
                 fr_metrics=fr_metrics or ["psnr", "ssim", "lpips", "dists"],
                 use_y_channel=True,
                 verbose=False,
             )
-        except ImportError:
+        except (ImportError, RuntimeError):
             self.iqa = None
+
+    # ═══════════════════════════════════════════════════════
+    #  构建全零 down_intrablock 残差
+    #  用于 _no_adapter_pred_x0 中禁用 adapter 注入信号
+    # ═══════════════════════════════════════════════════════
+    def _build_zero_intrablock(self, x_input: torch.Tensor) -> List[torch.Tensor]:
+        """构建 4 个全零残差，匹配 SD2 UNet 的 4 个 down block。
+        通道 [320, 640, 1280, 1280]，空间尺寸按 ceil 减半推导。
+        传入 generator.unet 后，adapter 的注入信号被完全屏蔽。"""
+        _, _, latent_h, latent_w = x_input.shape
+
+        def _half(h, w):
+            return (h + 1) // 2, (w + 1) // 2
+
+        h0, w0 = latent_h, latent_w
+        h1, w1 = _half(h0, w0)
+        h2, w2 = _half(h1, w1)
+        h3, w3 = _half(h2, w2)
+
+        target_sizes = [(h0, w0), (h1, w1), (h2, w2), (h3, w3)]
+        channels = [320, 640, 1280, 1280]
+
+        residuals = []
+        for (th, tw), ch in zip(target_sizes, channels):
+            residuals.append(
+                torch.zeros(
+                    x_input.shape[0],
+                    ch,
+                    th,
+                    tw,
+                    device=x_input.device,
+                    dtype=x_input.dtype,
+                )
+            )
+        return residuals
 
     # ═══════════════════════════════════════════════════════
     #  优化器 / 状态持久化
@@ -178,8 +211,33 @@ class SD2RefGANSystem(LightningModule):
         self._d_sem_accum_count = checkpoint.get("d_sem_accum_count", 0)
         self._d_tex_accum_count = checkpoint.get("d_tex_accum_count", 0)
 
+    # ═══════════════════════════════════════════════════════
+    #  load_state_dict 增加 missing/unexpected keys 日志
+    # ═══════════════════════════════════════════════════════
     def load_state_dict(self, state_dict, strict=True):
-        return super().load_state_dict(state_dict, strict=False)
+        result = super().load_state_dict(state_dict, strict=False)
+
+        missing = getattr(result, "missing_keys", []) or []
+        unexpected = getattr(result, "unexpected_keys", []) or []
+
+        if missing:
+            print(f"⚠️ load_state_dict: {len(missing)} missing keys")
+            for k in missing[:10]:
+                print(f"  - {k}")
+            if len(missing) > 10:
+                print(f"  ... and {len(missing) - 10} more")
+
+        if unexpected:
+            print(f"⚠️ load_state_dict: {len(unexpected)} unexpected keys")
+            for k in unexpected[:10]:
+                print(f"  - {k}")
+            if len(unexpected) > 10:
+                print(f"  ... and {len(unexpected) - 10} more")
+
+        if not missing and not unexpected:
+            print("✅ load_state_dict: all keys matched")
+
+        return result
 
     def _override_lr_on_resume(self):
         optimizers = self.optimizers()
@@ -222,6 +280,7 @@ class SD2RefGANSystem(LightningModule):
 
     # ═══════════════════════════════════════════════════════
     #  Helper: 无 adapter 路径（HR 去噪标杆）
+    #  复用 generator.unet + 零残差，屏蔽 adapter 注入
     # ═══════════════════════════════════════════════════════
     @torch.no_grad()
     def _no_adapter_pred_x0(self, hr, sr_latent_cond, t, noise):
@@ -240,10 +299,15 @@ class SD2RefGANSystem(LightningModule):
             dtype=torch.float32,
         )
 
+        # 零残差覆盖 adapter 注入点，屏蔽 T2I-Adapter 信号
+        # generator.unet 的 LoRA 仍在，但 adapter 注入被零残差完全屏蔽
+        # 效果近似于"无 adapter 的 UNet 去噪"，零额外显存
+        zero_residuals = self._build_zero_intrablock(x_input)
         eps_pred = self.generator.unet(
             x_input,
             t,
             encoder_hidden_states=null_ctx,
+            down_intrablock_additional_residuals=zero_residuals,
         ).sample
 
         pred_x0 = self.generator._predict_x0_from_eps(x_t, t, eps_pred)
@@ -287,16 +351,16 @@ class SD2RefGANSystem(LightningModule):
         g_opt = self._get_g_opt()
         lr, ref, hr = self.generator.get_input(batch)
 
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
         # Phase 1: MSE(noise_pred, noise) — 纯扩散去噪
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             out = self.generator.forward(lr, ref, hr)
             loss = out["loss"]
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"❌ [G step] Phase1 loss NaN/Inf，跳过。batch={batch_idx}")
-            g_opt.zero_grad()
+            g_opt.zero_grad(set_to_none=True)
             self._g_accum_count = 0
             self._gd_phase = 1
             if self.discriminator is not None:
@@ -307,9 +371,9 @@ class SD2RefGANSystem(LightningModule):
         loss_phase1 = loss / self.accumulate_grad_batches
         self.scaler_g.scale(loss_phase1).backward()
 
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
         # Phase 2: SR 路径 — MSE(SR) + LPIPS(SR) + GAN
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
         phase2_loss_val = None
         if (
             self.sr_model is not None
@@ -329,8 +393,8 @@ class SD2RefGANSystem(LightningModule):
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
                 t_sr = torch.randint(
-                    0,
-                    999,
+                    self.generator.t_min,
+                    self.generator.t_max + 1,
                     (bsz,),
                     device=device,
                     dtype=torch.long,
@@ -361,7 +425,11 @@ class SD2RefGANSystem(LightningModule):
                         loss_lpips_sr
                     ):
                         phase2_loss = phase2_loss + loss_lpips_sr
-                        self.log("train/G_lpips", loss_lpips_sr.detach(), on_step=True)
+                        self.log(
+                            "train/G_lpips",
+                            loss_lpips_sr.detach(),
+                            on_step=True,
+                        )
                     else:
                         self._nan_g_count += 1
                         print(
@@ -393,9 +461,9 @@ class SD2RefGANSystem(LightningModule):
                 phase2_loss_scaled = phase2_loss / self.accumulate_grad_batches
                 self.scaler_g.scale(phase2_loss_scaled).backward()
 
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
         # 累积 → step optimizer
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
         self._g_accum_count += 1
         if self._g_accum_count >= self.accumulate_grad_batches:
             self.scaler_g.unscale_(g_opt)
@@ -404,7 +472,7 @@ class SD2RefGANSystem(LightningModule):
             )
             self.scaler_g.step(g_opt)
             self.scaler_g.update()
-            g_opt.zero_grad()
+            g_opt.zero_grad(set_to_none=True)  # [OPT-4]
             self._g_accum_count = 0
             self._gd_phase = 1
 
@@ -443,9 +511,9 @@ class SD2RefGANSystem(LightningModule):
         bsz = lr.shape[0]
         device = lr.device
 
-        # ═══════════════════════════════════════════════════
-        #  单步 pred_x0：无 adapter vs 有 adapter（两路共享 sr_latent、t、noise）
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
+        #  单步 pred_x0：无 adapter vs 有 adapter
+        # ═══════════════════════════════════════
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
@@ -464,7 +532,7 @@ class SD2RefGANSystem(LightningModule):
         real = pred_hr_pixel.detach().float()
         fake = pred_sr_pixel.detach().float()
 
-        # ── NaN 检查（同时清零 D 累积梯度，防止污染下一轮）──
+        # ── NaN 检查 ──
         if torch.isnan(fake).any() or torch.isinf(fake).any():
             self._nan_d_count += 1
             print(
@@ -472,10 +540,10 @@ class SD2RefGANSystem(LightningModule):
                 f"batch={batch_idx}，跳过"
             )
             if d_sem_opt is not None:
-                d_sem_opt.zero_grad()
+                d_sem_opt.zero_grad(set_to_none=True)  # [OPT-4]
                 self._d_sem_accum_count = 0
             if d_tex_opt is not None:
-                d_tex_opt.zero_grad()
+                d_tex_opt.zero_grad(set_to_none=True)  # [OPT-4]
                 self._d_tex_accum_count = 0
             self.discriminator.eval()
             self.discriminator.requires_grad_(False)
@@ -488,15 +556,19 @@ class SD2RefGANSystem(LightningModule):
                 f"⚠️ [D step] real(no-adapter) NaN/Inf " f"(#{self._nan_d_count})，跳过"
             )
             if d_sem_opt is not None:
-                d_sem_opt.zero_grad()
+                d_sem_opt.zero_grad(set_to_none=True)  # [OPT-4]
                 self._d_sem_accum_count = 0
             if d_tex_opt is not None:
-                d_tex_opt.zero_grad()
+                d_tex_opt.zero_grad(set_to_none=True)  # [OPT-4]
                 self._d_tex_accum_count = 0
             self.discriminator.eval()
             self.discriminator.requires_grad_(False)
             self._gd_phase = 0
             return None
+
+        # 追踪本次 step 中各优化器是否参与了更新
+        sem_updated_this_step = False
+        tex_updated_this_step = False
 
         # ── 语义 D ──
         if (
@@ -515,6 +587,7 @@ class SD2RefGANSystem(LightningModule):
             if not torch.isnan(loss_d_sem) and not torch.isinf(loss_d_sem):
                 (loss_d_sem / self.accumulate_grad_batches).backward()
                 self._d_sem_accum_count += 1
+                sem_updated_this_step = True
                 self.log(
                     "train/D_sem",
                     loss_d_sem.detach(),
@@ -528,7 +601,7 @@ class SD2RefGANSystem(LightningModule):
                         gradient_clip_algorithm="norm",
                     )
                     d_sem_opt.step()
-                    d_sem_opt.zero_grad()
+                    d_sem_opt.zero_grad(set_to_none=True)
                     self._d_sem_accum_count = 0
             else:
                 self._nan_d_count += 1
@@ -554,6 +627,7 @@ class SD2RefGANSystem(LightningModule):
             if not torch.isnan(loss_d_tex) and not torch.isinf(loss_d_tex):
                 (loss_d_tex / self.accumulate_grad_batches).backward()
                 self._d_tex_accum_count += 1
+                tex_updated_this_step = True
                 self.log(
                     "train/D_tex",
                     loss_d_tex.detach(),
@@ -567,7 +641,7 @@ class SD2RefGANSystem(LightningModule):
                         gradient_clip_algorithm="norm",
                     )
                     d_tex_opt.step()
-                    d_tex_opt.zero_grad()
+                    d_tex_opt.zero_grad(set_to_none=True)
                     self._d_tex_accum_count = 0
             else:
                 self._nan_d_count += 1
@@ -575,6 +649,14 @@ class SD2RefGANSystem(LightningModule):
                     f"⚠️ [D step] loss_d_tex NaN/Inf "
                     f"(#{self._nan_d_count})，跳过 D_tex"
                 )
+
+        # 对未参与本次更新的优化器清零累积梯度
+        if d_sem_opt is not None and not sem_updated_this_step:
+            d_sem_opt.zero_grad(set_to_none=True)
+            self._d_sem_accum_count = 0
+        if d_tex_opt is not None and not tex_updated_this_step:
+            d_tex_opt.zero_grad(set_to_none=True)
+            self._d_tex_accum_count = 0
 
         self.discriminator.eval()
         self.discriminator.requires_grad_(False)
@@ -589,10 +671,18 @@ class SD2RefGANSystem(LightningModule):
 
         loss_diff, _ = self.generator.p_losses(lr, ref, hr)
         self.log(
-            "val/loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
+            "val/loss_diff",
+            loss_diff,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
         )
         self.log(
-            "val_loss_diff", loss_diff, on_step=False, on_epoch=True, prog_bar=True
+            "val_loss_diff",
+            loss_diff,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
         )
 
         with torch.no_grad():
@@ -619,14 +709,11 @@ class SD2RefGANSystem(LightningModule):
             for k, v in agg.items():
                 self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
                 if k == "psnr":
-                    self.log(f"val_psnr", v / n, on_epoch=True)
+                    self.log("val_psnr", v / n, on_epoch=True)
 
+        # validation_tmp 保存（清理已移至 on_validation_epoch_start）
         if batch_idx % 4 == 0:
-            import shutil
-
             save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
-            if batch_idx == 0 and os.path.exists(save_dir):
-                shutil.rmtree(save_dir)
             os.makedirs(save_dir, exist_ok=True)
 
             with torch.no_grad():
@@ -673,9 +760,19 @@ class SD2RefGANSystem(LightningModule):
         torch.cuda.empty_cache()
         return loss_diff
 
+    # ═══════════════════════════════════════════════════════
+    #  validation_tmp 清理逻辑移至此处
+    # ═══════════════════════════════════════════════════════
     def on_validation_epoch_start(self):
         if self.discriminator is not None:
             self.discriminator.eval()
+
+        import shutil
+
+        save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
+        if os.path.exists(save_dir):
+            shutil.rmtree(save_dir)
+            print(f"🧹 已清理 validation_tmp 目录")
 
     def on_validation_epoch_end(self):
         torch.cuda.empty_cache()
