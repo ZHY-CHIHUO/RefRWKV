@@ -485,9 +485,9 @@ class SD2RefGANSystem(LightningModule):
 
         self._g_accum_count += 1
         if self._g_accum_count >= self.accumulate_grad_batches:
-            self._monitor_grad_norms(g_opt, "G")
             if self.scaler_g is not None:
                 self.scaler_g.unscale_(g_opt)
+            self._monitor_grad_norms(g_opt, "G")
             self.clip_gradients(
                 g_opt,
                 gradient_clip_val=self.grad_clip_val,
