@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning import LightningModule
-from typing import Optional, List, Tuple
+from typing import Tuple
 
 import open_clip
 from vision_aided_loss.cv_discriminator import BlurPool, spectral_norm
@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 #  Haar 小波高频分解
 # ══════════════════════════════════════════════════════════════
 
+_HAAR_STD_EPS: float = 0.1
+_HAAR_CLAMP_MAX: float = 10.0
+
 
 def haar_highpass(x: torch.Tensor) -> torch.Tensor:
     B, C, H, W = x.shape
@@ -27,17 +30,21 @@ def haar_highpass(x: torch.Tensor) -> torch.Tensor:
     if H % 2 != 0:
         x = x[:, :, : H - 1, :]
         H = H - 1
+        logger.debug("haar_highpass: H=%d 为奇数，截断最后一行", H + 1)
     if W % 2 != 0:
         x = x[:, :, :, : W - 1]
         W = W - 1
+        logger.debug("haar_highpass: W=%d 为奇数，截断最后一列", W + 1)
     x = x.reshape(B, C, H // 2, 2, W // 2, 2)
     x00 = x[:, :, :, 0, :, 0]
     x01 = x[:, :, :, 0, :, 1]
     x10 = x[:, :, :, 1, :, 0]
     x11 = x[:, :, :, 1, :, 1]
     high = torch.cat([x01 - x00, x10 - x00, x11 - x00], dim=1)
-    std = high.std(dim=[2, 3], keepdim=True).clamp(min=0.1)
-    return ((high - high.mean(dim=[2, 3], keepdim=True)) / std).clamp(-10, 10)
+    std = high.std(dim=[2, 3], keepdim=True).clamp(min=_HAAR_STD_EPS)
+    return ((high - high.mean(dim=[2, 3], keepdim=True)) / std).clamp(
+        -_HAAR_CLAMP_MAX, _HAAR_CLAMP_MAX
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -46,6 +53,8 @@ def haar_highpass(x: torch.Tensor) -> torch.Tensor:
 
 
 def _visual_forward(model, image, return_feats=False, return_pooled_feats=False):
+    if return_feats and return_pooled_feats:
+        raise ValueError("return_feats 与 return_pooled_feats 不可同时为 True")
     x, intermediates = model.trunk.forward_intermediates(
         image,
         indices=None,
@@ -92,14 +101,16 @@ class MultiLevelDConv(nn.Module):
     def __init__(
         self,
         level=3,
-        in_ch1=(256, 512),
+        in_ch1: Tuple[int, ...] = (256, 512),
         in_ch2=640,
         out_ch=256,
         num_classes=0,
-        activation=nn.LeakyReLU(0.2, inplace=False),  # inplace=False 避免兼容性问题
+        activation=None,
         down=1,
     ):
         super().__init__()
+        if activation is None:
+            activation = nn.LeakyReLU(0.2, inplace=False)
         self.decoder = nn.ModuleList()
         self.level = level
         self.in_ch1 = in_ch1
@@ -155,11 +166,14 @@ class MultiLevelDConv(nn.Module):
 
 
 class ImageConvNextDiscriminator(nn.Module):
+    check_input_finite: bool = True
+
     def __init__(self, alpha=0.8, precision="fp32", use_freq=True, trainable_stages=1):
         super().__init__()
         self.gan_alpha = alpha
         self.use_freq = use_freq
         self.trainable_stages = trainable_stages
+        self._loss_fn = multilevel_loss(alpha=alpha)
 
         self.model = ImageOpenCLIPConvNext(
             precision=precision, trainable_stages=trainable_stages
@@ -197,8 +211,10 @@ class ImageConvNextDiscriminator(nn.Module):
             self.model.model.trunk.stem[1].requires_grad_(True)
 
     def train(self, mode=True):
-        self.training = mode
-        self.decoder.train(mode)
+        super().train(mode)
+        # backbone 整体保持 eval（冻结 BN/Dropout 统计量）
+        self.model.eval()
+        # 可训练阶段重新设为 train
         if self.trainable_stages >= 1:
             self.model.model.trunk.stem.train(mode)
         if self.trainable_stages >= 2:
@@ -218,7 +234,7 @@ class ImageConvNextDiscriminator(nn.Module):
 
     def forward(self, x, for_real=True, for_G=False, return_logits=False):
         assert x.shape[1] == 3, f"语义 D 期望 3 通道输入，收到 {x.shape[1]}"
-        if torch.isnan(x).any() or torch.isinf(x).any():
+        if self.check_input_finite and (torch.isnan(x).any() or torch.isinf(x).any()):
             raise ValueError(f"语义 D 输入包含 NaN/Inf: min={x.min()}, max={x.max()}")
 
         if self.use_freq:
@@ -227,20 +243,11 @@ class ImageConvNextDiscriminator(nn.Module):
             x = x * 0.5 + 0.5
             x = (x - self.image_mean[:, None, None]) / self.image_std[:, None, None]
 
-        try:
-            features = self.model.encode_image(x, return_pooled_feats=True)
-            features = self.decoder(features)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                logger.warning("语义 D CUDA OOM，尝试清理缓存")
-                torch.cuda.empty_cache()
-                zero = torch.zeros((), device=x.device, dtype=x.dtype)
-                return zero if not return_logits else (zero, [])
-            raise
+        feats = self.model.encode_image(x, return_pooled_feats=True)
+        logits = self.decoder(feats)
 
-        loss_fn = multilevel_loss(alpha=self.gan_alpha)
-        loss = loss_fn(features, for_real=for_real, for_G=for_G)
-        return (loss, features) if return_logits else loss
+        loss = self._loss_fn(logits, for_real=for_real, for_G=for_G)
+        return (loss, logits) if return_logits else loss
 
 
 # ══════════════════════════════════════════════════════════════
@@ -249,6 +256,8 @@ class ImageConvNextDiscriminator(nn.Module):
 
 
 class TextureConsistencyDiscriminator(nn.Module):
+    check_input_finite: bool = True
+
     def __init__(self, in_ch=3, base_ch=48, num_scales=4, use_spectral=True):
         super().__init__()
         self.num_scales = num_scales
@@ -293,9 +302,13 @@ class TextureConsistencyDiscriminator(nn.Module):
         return feats
 
     def forward(self, image, ref):
-        if torch.isnan(image).any() or torch.isinf(image).any():
+        if self.check_input_finite and (
+            torch.isnan(image).any() or torch.isinf(image).any()
+        ):
             raise ValueError("纹理 D image 输入包含 NaN/Inf")
-        if torch.isnan(ref).any() or torch.isinf(ref).any():
+        if self.check_input_finite and (
+            torch.isnan(ref).any() or torch.isinf(ref).any()
+        ):
             raise ValueError("纹理 D ref 输入包含 NaN/Inf")
 
         if image.shape[-2:] != ref.shape[-2:]:
@@ -369,17 +382,6 @@ class SD2RefDiscriminator(LightningModule):
             else None
         )
 
-        self._d_sem_accum_count = 0
-        self._d_tex_accum_count = 0
-
-    def train(self, mode: bool = True):
-        self.training = mode
-        if self.D_sem is not None:
-            self.D_sem.train(mode)
-        if self.D_tex is not None:
-            self.D_tex.train(mode)
-        return self
-
     def eval(self):
         return self.train(False)
 
@@ -405,7 +407,7 @@ class SD2RefDiscriminator(LightningModule):
     def compute_g_loss(self, fake, ref=None, lambda_semantic=1.0, lambda_texture=1.0):
         self._validate_inputs(fake, ref)
         loss = self._zero_loss(fake)
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(self.device.type, enabled=False):
             if self.use_semantic_d and lambda_semantic > 0:
                 loss = (
                     loss
@@ -425,7 +427,7 @@ class SD2RefDiscriminator(LightningModule):
         real, fake = real.detach(), fake.detach()
         ref = ref.detach() if ref is not None else None
         loss = self._zero_loss(real)
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(self.device.type, enabled=False):
             if self.use_semantic_d and lambda_semantic > 0:
                 r, f = real.float(), fake.float()
                 loss = loss + lambda_semantic * (
@@ -442,25 +444,41 @@ class SD2RefDiscriminator(LightningModule):
         return loss
 
     def forward(self, real, fake, ref=None, mode="both"):
+        self._validate_inputs(real, fake, ref)
+        real_d, fake_d = real.detach(), fake.detach()
+        ref_d = ref.detach() if ref is not None else None
+
         log_dict = {}
         loss_D = self._zero_loss(real)
-        if mode in ("both", "semantic") and self.use_semantic_d:
-            l = self.compute_d_loss(
-                real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
-            )
-            loss_D = loss_D + l
-            log_dict["loss_D_sem"] = l.detach()
-        if mode in ("both", "texture") and self.use_texture_d and ref is not None:
-            l = self.compute_d_loss(
-                real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
-            )
-            loss_D = loss_D + l
-            log_dict["loss_D_tex"] = l.detach()
+
+        with torch.amp.autocast(self.device.type, enabled=False):
+            r, f = real_d.float(), fake_d.float()
+            if mode in ("both", "semantic") and self.use_semantic_d:
+                l_sem = (
+                    self.D_sem(r, for_real=True).mean()
+                    + self.D_sem(f, for_real=False).mean()
+                )
+                loss_D = loss_D + l_sem
+                log_dict["loss_D_sem"] = l_sem.detach()
+            if mode in ("both", "texture") and self.use_texture_d and ref_d is not None:
+                ref_f = ref_d.float()
+                real_logit, _ = self.D_tex(r, ref_f)
+                fake_logit, _ = self.D_tex(f, ref_f)
+                l_tex = (
+                    F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()
+                )
+                loss_D = loss_D + l_tex
+                log_dict["loss_D_tex"] = l_tex.detach()
+
         log_dict["loss_D_total"] = loss_D.detach()
         return loss_D, log_dict
 
     def training_step(self, batch, batch_idx):
         try:
+            if "hr" not in batch or "sr" not in batch:
+                raise KeyError(
+                    f"batch 缺少必要键 'hr'/'sr'，当前键: {list(batch.keys())}"
+                )
             real, fake = batch["hr"], batch["sr"].detach()
             ref = batch.get("ref", None)
             loss, log_dict = self.forward(real, fake, ref=ref, mode="both")
@@ -470,48 +488,38 @@ class SD2RefDiscriminator(LightningModule):
                 prog_bar=True,
             )
             return loss
-        except (ValueError, RuntimeError) as e:
-            logger.warning("D training_step 异常: %s", e)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("D training_step CUDA OOM, batch=%d", batch_idx)
             torch.cuda.empty_cache()
+            return self._zero_loss(batch["hr"])
+        except KeyError as e:
+            logger.error("D training_step 数据键缺失: %s", e)
+            raise
+        except ValueError as e:
+            logger.warning("D training_step 数据异常: %s", e)
             return self._zero_loss(batch["hr"])
 
     def configure_optimizers(self):
-        opts = []
+        param_groups = []
         if self.use_semantic_d:
             ps = [p for p in self.D_sem.parameters() if p.requires_grad]
             if ps:
-                opts.append(
-                    torch.optim.AdamW(
-                        ps,
-                        lr=self.hparams.lr_semantic,
-                        betas=self.hparams.betas,
-                        weight_decay=self.hparams.weight_decay,
-                    )
-                )
+                param_groups.append({"params": ps, "lr": self.hparams.lr_semantic})
             else:
                 logger.warning("D_sem 无可训练参数，跳过 D_sem 优化器")
         if self.use_texture_d:
-            ps = list(self.D_tex.parameters())
+            ps = [p for p in self.D_tex.parameters() if p.requires_grad]
             if ps:
-                opts.append(
-                    torch.optim.AdamW(
-                        ps,
-                        lr=self.hparams.lr_texture,
-                        betas=self.hparams.betas,
-                        weight_decay=self.hparams.weight_decay,
-                    )
-                )
+                param_groups.append({"params": ps, "lr": self.hparams.lr_texture})
             else:
                 logger.warning("D_tex 无可训练参数，跳过 D_tex 优化器")
-        return opts
-
-    def on_save_checkpoint(self, checkpoint):
-        checkpoint["d_sem_accum_count"] = self._d_sem_accum_count
-        checkpoint["d_tex_accum_count"] = self._d_tex_accum_count
-
-    def on_load_checkpoint(self, checkpoint):
-        self._d_sem_accum_count = checkpoint.get("d_sem_accum_count", 0)
-        self._d_tex_accum_count = checkpoint.get("d_tex_accum_count", 0)
+        if not param_groups:
+            raise ValueError("无任何可训练参数，无法创建优化器")
+        return torch.optim.AdamW(
+            param_groups,
+            betas=self.hparams.betas,
+            weight_decay=self.hparams.weight_decay,
+        )
 
 
 if __name__ == "__main__":
