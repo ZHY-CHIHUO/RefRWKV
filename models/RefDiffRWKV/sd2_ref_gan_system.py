@@ -158,7 +158,7 @@ class SD2RefGANSystem(LightningModule):
         self, latent, sr_latent_cond, t, noise, context, down_intrablock=None
     ):
         x_t = self.generator.noise_scheduler.add_noise(latent, noise, t)
-        x_input = self.generator._concat_sr_latent(x_t, sr_latent_cond)
+        x_input = self.generator.concat_sr_latent(x_t, sr_latent_cond)
         eps_pred = self.generator.unet(
             x_input,
             t,
@@ -184,7 +184,7 @@ class SD2RefGANSystem(LightningModule):
         hr_latent = self.generator.encode_latent(hr)
         null_ctx = torch.zeros(
             bsz,
-            77,
+            self.generator.CROSS_ATTN_CTX_LEN,
             self.generator.cross_attn_dim,
             device=hr.device,
             dtype=torch.float32,
@@ -241,8 +241,12 @@ class SD2RefGANSystem(LightningModule):
 
     def configure_optimizers(self):
         opts = []
+        g_params = [p for p in self.generator.parameters() if p.requires_grad]
+        if not g_params:
+            logger.warning("Generator 无可训练参数，使用占位参数")
+            g_params = [torch.zeros(1, requires_grad=True)]
         g_opt = torch.optim.AdamW(
-            self.generator.parameters(),
+            g_params,
             lr=self.hparams.g_lr,
             weight_decay=self.hparams.g_weight_decay,
         )

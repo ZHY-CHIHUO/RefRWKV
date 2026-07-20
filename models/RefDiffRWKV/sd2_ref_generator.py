@@ -170,7 +170,7 @@ class SD2RefGenerator(LightningModule):
     # ═══════════════════════════════════════════════════════
     def _expand_conv_in_for_sr_latent(self) -> None:
         """将 UNet conv_in 从 4 通道扩展到 8 通道。
-        前 4 通道保留 SD2 预训练权重，后 4 通道 xavier 初始化。
+        前 4 通道保留 SD2 预训练权重，后 4 通道以缩小方差的正态分布初始化。
         """
         old_conv = self.unet.conv_in
         old_weight = old_conv.weight.data
@@ -184,7 +184,19 @@ class SD2RefGenerator(LightningModule):
         )
         with torch.no_grad():
             new_conv.weight[:, :4] = old_weight
-            nn.init.xavier_uniform_(new_conv.weight[:, 4:], gain=0.1)
+            # [FIX] xavier_uniform_ 对切片不生效，手动计算 std 后 normal_ 赋值
+            fan_in = (
+                old_weight.shape[1]
+                * old_conv.kernel_size[0]
+                * old_conv.kernel_size[1]
+            )
+            fan_out = (
+                old_weight.shape[0]
+                * old_conv.kernel_size[0]
+                * old_conv.kernel_size[1]
+            )
+            std = 0.1 * (2.0 / (fan_in + fan_out)) ** 0.5
+            new_conv.weight[:, 4:].normal_(0, std)
             new_conv.bias.copy_(old_conv.bias)
         self.unet.conv_in = new_conv
 
@@ -217,7 +229,14 @@ class SD2RefGenerator(LightningModule):
         for n, p in self.unet.named_parameters():
             if "attn" not in n and "lora" not in n:
                 p.requires_grad = False
-        self.unet.conv_in.weight[:, 4:].requires_grad_(True)
+        # [FIX] 切片无法设置 requires_grad；整体开启后用 hook 屏蔽前 4 通道梯度
+        self.unet.conv_in.weight.requires_grad = True
+
+        def _mask_pretrained_grad(grad: torch.Tensor) -> torch.Tensor:
+            grad[:, :4] = 0
+            return grad
+
+        self.unet.conv_in.weight.register_hook(_mask_pretrained_grad)
 
     # ═══════════════════════════════════════════════════════
     #  VAE helpers
@@ -254,7 +273,7 @@ class SD2RefGenerator(LightningModule):
         ]
         return torch.cat(projected, dim=1)
 
-    def _build_context(
+    def build_context(
         self, bsz: int, sem_tokens: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         empty_ctx = torch.zeros(
@@ -268,10 +287,13 @@ class SD2RefGenerator(LightningModule):
             return torch.cat([empty_ctx, sem_tokens], dim=1)
         return empty_ctx
 
+    # 向后兼容别名
+    _build_context = build_context
+
     # ═══════════════════════════════════════════════════════
     #  Adapter 三尺度特征 → T2I-Adapter 风格 down 注入
     # ═══════════════════════════════════════════════════════
-    def _build_down_intrablock(
+    def build_down_intrablock(
         self, ref_feats: List[torch.Tensor], latent_h: int, latent_w: int
     ) -> List[torch.Tensor]:
         f320, f640, f1280 = ref_feats
@@ -289,6 +311,9 @@ class SD2RefGenerator(LightningModule):
                 )
             residuals.append(feat * self.control_scale)
         return residuals
+
+    # 向后兼容别名
+    _build_down_intrablock = build_down_intrablock
 
     # ═══════════════════════════════════════════════════════
     #  核心 UNet 前向
@@ -309,9 +334,9 @@ class SD2RefGenerator(LightningModule):
             with torch.no_grad():
                 sem_pyramid = self.global_semantic(ref_input)
                 sem_tokens = self.build_sem_tokens(sem_pyramid)
-        context = self._build_context(bsz, sem_tokens)
+        context = self.build_context(bsz, sem_tokens)
         _, _, latent_h, latent_w = x_input.shape
-        down_intrablock = self._build_down_intrablock(ref_feats, latent_h, latent_w)
+        down_intrablock = self.build_down_intrablock(ref_feats, latent_h, latent_w)
         return self.unet(
             x_input,
             t,
@@ -337,33 +362,35 @@ class SD2RefGenerator(LightningModule):
     # ═══════════════════════════════════════════════════════
     #  反推 pred_x0
     # ═══════════════════════════════════════════════════════
-    def _predict_x0_from_eps(
+    def predict_x0_from_eps(
         self, x_t: torch.Tensor, t: torch.Tensor, noise_pred: torch.Tensor
     ) -> torch.Tensor:
         alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(x_t.device)
         a_bar = alphas_cumprod[t].float().view(-1, 1, 1, 1)
         return (x_t - (1.0 - a_bar).sqrt() * noise_pred) / (a_bar.sqrt() + 1e-8)
 
+    # 向后兼容别名
+    _predict_x0_from_eps = predict_x0_from_eps
+
     # ═══════════════════════════════════════════════════════
-    #  SR latent 条件生成（修复：使用 self._device_type）
+    #  SR latent 条件生成
     # ═══════════════════════════════════════════════════════
     def _get_sr_latent_cond(
         self, lr: torch.Tensor, ref: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        actual_sr = self.sr_model if self.sr_model is not None else None
-        if actual_sr is None or not self.use_sr_latent_cond:
+        if self.sr_model is None or not self.use_sr_latent_cond:
             return None
         with torch.no_grad():
             with torch.amp.autocast(self._device_type, enabled=False):
-                sr_prior = actual_sr(lr.float(), ref.float())
+                sr_prior = self.sr_model(lr.float(), ref.float())
                 sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0)
                 sr_prior = sr_prior.clamp(-1.0, 1.0)
                 return self.encode_latent(sr_prior.to(self.vae.dtype))
 
     # ═══════════════════════════════════════════════════════
-    #  拼接 sr_latent（修复：None 分支拼接 4 通道零）
+    #  拼接 sr_latent
     # ═══════════════════════════════════════════════════════
-    def _concat_sr_latent(
+    def concat_sr_latent(
         self, x_t: torch.Tensor, sr_latent_cond: Optional[torch.Tensor]
     ) -> torch.Tensor:
         if sr_latent_cond is not None:
@@ -372,6 +399,9 @@ class SD2RefGenerator(LightningModule):
         return torch.cat(
             [x_t, torch.zeros(bsz, 4, h, w, device=x_t.device, dtype=x_t.dtype)], dim=1
         )
+
+    # 向后兼容别名
+    _concat_sr_latent = concat_sr_latent
 
     # ═══════════════════════════════════════════════════════
     #  训练前向
@@ -401,11 +431,11 @@ class SD2RefGenerator(LightningModule):
                 ref_input = ref_input.clone()
                 ref_input[mask] = 0.0
 
-        x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+        x_t_input = self.concat_sr_latent(x_t, sr_latent_cond)
         noise_pred = self.apply_model(x_t_input, t, lr, ref, ref_input=ref_input)
         loss = F.mse_loss(noise_pred, noise)
 
-        pred_x0_latent = self._predict_x0_from_eps(x_t, t, noise_pred)
+        pred_x0_latent = self.predict_x0_from_eps(x_t, t, noise_pred)
         pred_x0_latent = torch.nan_to_num(
             pred_x0_latent, nan=0.0, posinf=20.0, neginf=-20.0
         ).clamp(-20.0, 20.0)
@@ -425,7 +455,7 @@ class SD2RefGenerator(LightningModule):
         return out["loss"], {"train/loss_diff": out["loss"].detach()}
 
     # ═══════════════════════════════════════════════════════
-    #  采样 / 推理（修复：使用 self._device_type）
+    #  采样 / 推理
     # ═══════════════════════════════════════════════════════
     @torch.no_grad()
     def _prepare_sr_cond(self, lr, ref, actual_sr):
@@ -466,11 +496,13 @@ class SD2RefGenerator(LightningModule):
             tex_map_latent = F.interpolate(
                 tex_map, size=sr_latent.shape[2:], mode="bilinear", align_corners=False
             )
-            tex_norm = tex_map_latent.clone()
-            for b in range(bsz):
-                tmin, tmax = tex_norm[b].min(), tex_norm[b].max()
-                if tmax > tmin:
-                    tex_norm[b] = (tex_norm[b] - tmin) / (tmax - tmin + 1e-8)
+            # [FIX] 向量化 per-sample min-max 归一化，替代逐样本 for 循环
+            flat = tex_map_latent.flatten(1)  # (B, H*W)
+            tmin = flat.amin(dim=1, keepdim=True)
+            tmax = flat.amax(dim=1, keepdim=True)
+            tex_norm = ((flat - tmin) / (tmax - tmin).clamp(min=1e-8)).view_as(
+                tex_map_latent
+            )
             t_flat, t_detail = max(200, t_start - 500), min(999, t_start + 200)
             noise = torch.randn_like(sr_latent)
             t_flat_t = torch.full((bsz,), t_flat, device=device, dtype=torch.long)
@@ -489,14 +521,14 @@ class SD2RefGenerator(LightningModule):
         if sr_target is not None and guidance_scale > 0 and t_int > t_stop:
             with torch.enable_grad():
                 x_t.requires_grad_(True)
-                x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+                x_t_input = self.concat_sr_latent(x_t, sr_latent_cond)
                 noise_pred = self.apply_model(x_t_input, t_tensor, lr, ref)
-                pred_x0 = self._predict_x0_from_eps(x_t, t_tensor, noise_pred)
+                pred_x0 = self.predict_x0_from_eps(x_t, t_tensor, noise_pred)
                 grad = torch.autograd.grad(F.mse_loss(pred_x0, sr_target), x_t)[0]
                 x_t = x_t.detach() - guidance_scale * grad
             noise_pred = noise_pred.detach()
         else:
-            x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+            x_t_input = self.concat_sr_latent(x_t, sr_latent_cond)
             noise_pred = self.apply_model(x_t_input, t_tensor, lr, ref)
         return self.noise_scheduler.step(noise_pred, t_int, x_t).prev_sample
 
@@ -559,7 +591,7 @@ class SD2RefGenerator(LightningModule):
         sr_latent_cond = self._get_sr_latent_cond(lr, ref)
         for t in self.noise_scheduler.timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
-            x_t_input = self._concat_sr_latent(x_t, sr_latent_cond)
+            x_t_input = self.concat_sr_latent(x_t, sr_latent_cond)
             noise_pred = self.apply_model(x_t_input, t_tensor, lr, ref)
             x_t = self.noise_scheduler.step(noise_pred, t, x_t).prev_sample
             x_t_clamped = x_t.clamp(
@@ -627,23 +659,26 @@ class SD2RefGenerator(LightningModule):
 
     @torch.no_grad()
     def validation_inference(self, batch, save_dir, steps=50, sr_model=None):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
+        # [FIX] 添加 CUDA 可用性检查，避免 CPU 环境报错
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
         lr, ref, hr = self.get_input(batch)
-        starter = torch.cuda.Event(enable_timing=True)
-        ender = torch.cuda.Event(enable_timing=True)
-        starter.record()
+        use_cuda_timer = torch.cuda.is_available()
+        if use_cuda_timer:
+            starter = torch.cuda.Event(enable_timing=True)
+            ender = torch.cuda.Event(enable_timing=True)
+            starter.record()
         val_results = self.log_images(batch, steps=steps, sr_model=sr_model)
-        ender.record()
-        torch.cuda.synchronize()
-        elapsed_time, max_memory = (
-            starter.elapsed_time(ender),
-            torch.cuda.memory_allocated() / 1024**2,
-        )
-        logger.info(
-            "Inference Time: %.2f ms, Current Memory: %.2f MB", elapsed_time, max_memory
-        )
+        if use_cuda_timer:
+            ender.record()
+            torch.cuda.synchronize()
+            logger.info(
+                "Inference Time: %.2f ms, Memory: %.2f MB",
+                starter.elapsed_time(ender),
+                torch.cuda.memory_allocated() / 1024**2,
+            )
         os.makedirs(save_dir, exist_ok=True)
         for image_key in val_results:
             image = val_results[image_key].detach().cpu()
@@ -688,6 +723,12 @@ class SD2RefGenerator(LightningModule):
         params.extend(p for p in self.unet.parameters() if p.requires_grad)
         if self.use_semantic and self.sem_proj is not None:
             params.extend(self.sem_proj.parameters())
+        # [FIX] 空参数保护，避免 AdamW 收到空列表报错
+        if not params:
+            logger.warning("Generator 无可训练参数")
+            return torch.optim.AdamW(
+                [torch.zeros(1, requires_grad=True)], lr=1e-8
+            )
         return torch.optim.AdamW(
             params, lr=self.learning_rate, weight_decay=self.weight_decay
         )
@@ -726,7 +767,7 @@ if __name__ == "__main__":
     assert model.unet.conv_in.weight[:, :4].abs().sum() > 0
     test_logger.info("✅ 前 4 通道预训练权重保留")
     assert model.unet.conv_in.weight[:, 4:].abs().sum() > 0
-    test_logger.info("✅ 后 4 通道 xavier 初始化（非零）")
+    test_logger.info("✅ 后 4 通道初始化（非零）")
 
     B, hr_sz, lr_sz = 1, args.hr_size, args.lr_size
     hr = torch.rand(B, 3, hr_sz, hr_sz, device=device) * 2 - 1
@@ -749,6 +790,13 @@ if __name__ == "__main__":
         if p.requires_grad
     )
     test_logger.info("梯度流验证: %s", "✅ 通过" if has_grad else "❌ 失败")
+
+    # 验证 conv_in 后 4 通道有梯度、前 4 通道梯度被 hook 屏蔽
+    conv_in_grad = model.unet.conv_in.weight.grad
+    if conv_in_grad is not None:
+        assert conv_in_grad[:, :4].abs().sum() == 0, "前 4 通道梯度应被 hook 屏蔽"
+        assert conv_in_grad[:, 4:].abs().sum() > 0, "后 4 通道应有梯度"
+        test_logger.info("✅ conv_in 梯度屏蔽验证通过")
 
     samples = model.sample_log(lr, ref, steps=2, hr=hr)
     assert samples.shape[-1] == hr_sz
