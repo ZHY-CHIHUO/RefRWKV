@@ -85,7 +85,6 @@ class SD2RefGANSystem(LightningModule):
 
         self.automatic_optimization = False
         self.use_amp = use_amp
-        self._device_type = "cuda" if torch.cuda.is_available() else "cpu"
         self.scaler_g = (
             torch.amp.GradScaler("cuda", enabled=True)
             if (use_amp and torch.cuda.is_available())
@@ -110,7 +109,7 @@ class SD2RefGANSystem(LightningModule):
             from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
             self.iqa = IQAEngine(
-                device=self._device_type,
+                device=self.device.type,
                 nr_metrics=[],
                 fr_metrics=fr_metrics or ["psnr", "ssim", "lpips", "dists"],
                 use_y_channel=True,
@@ -244,7 +243,9 @@ class SD2RefGANSystem(LightningModule):
         g_params = [p for p in self.generator.parameters() if p.requires_grad]
         if not g_params:
             logger.warning("Generator 无可训练参数，使用占位参数")
-            g_params = [torch.zeros(1, requires_grad=True)]
+            if not hasattr(self, "_g_dummy_param"):
+                self._g_dummy_param = nn.Parameter(torch.zeros(1))
+            g_params = [self._g_dummy_param]
         g_opt = torch.optim.AdamW(
             g_params,
             lr=self.hparams.g_lr,
@@ -270,7 +271,9 @@ class SD2RefGANSystem(LightningModule):
                 else:
                     logger.warning("D_sem 无可训练参数，跳过")
             if self.discriminator.use_texture_d:
-                ps = list(self.discriminator.D_tex.parameters())
+                ps = [
+                    p for p in self.discriminator.D_tex.parameters() if p.requires_grad
+                ]
                 if ps:
                     d_opt = torch.optim.AdamW(
                         ps,
@@ -362,7 +365,7 @@ class SD2RefGANSystem(LightningModule):
     def _get_sr_latent_precomputed(self, lr, ref):
         if self.sr_model is None:
             return None
-        with torch.amp.autocast(self._device_type, enabled=False):
+        with torch.amp.autocast(self.device.type, enabled=False):
             sr_pixel = self.sr_model(lr.float(), ref.float())
             sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0)
             sr_pixel = sr_pixel.clamp(-1.0, 1.0)
@@ -393,7 +396,7 @@ class SD2RefGANSystem(LightningModule):
         self._freeze_discriminator()
         lr, ref, hr = self.generator.get_input(batch)
 
-        with torch.amp.autocast(self._device_type, enabled=self.use_amp):
+        with torch.amp.autocast(self.device.type, enabled=self.use_amp):
             out = self.generator.forward(lr, ref, hr)
             loss = out["loss"]
 
@@ -426,7 +429,7 @@ class SD2RefGANSystem(LightningModule):
             )
         ):
             bsz = lr.shape[0]
-            with torch.amp.autocast(self._device_type, enabled=self.use_amp):
+            with torch.amp.autocast(self.device.type, enabled=self.use_amp):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
                 t_sr = torch.randint(
                     self.generator.t_min,
@@ -465,7 +468,7 @@ class SD2RefGANSystem(LightningModule):
                             "[G step] LPIPS NaN/Inf (#%d)，跳过", self._nan_g_count
                         )
 
-                with torch.amp.autocast(self._device_type, enabled=False):
+                with torch.amp.autocast(self.device.type, enabled=False):
                     gan_loss = self.discriminator.compute_g_loss(
                         pred_sr_pixel.float(),
                         ref=ref.float(),
@@ -553,9 +556,9 @@ class SD2RefGANSystem(LightningModule):
         self._consecutive_nan_d = 0
 
         with torch.no_grad():
-            with torch.amp.autocast(self._device_type, enabled=self.use_amp):
+            with torch.amp.autocast(self.device.type, enabled=self.use_amp):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
-                t = torch.randint(0, 999, (bsz,), device=lr.device, dtype=torch.long)
+                t = torch.randint(0, 1000, (bsz,), device=lr.device, dtype=torch.long)
                 noise = torch.randn_like(sr_latent)
                 pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
                 pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
@@ -587,7 +590,7 @@ class SD2RefGANSystem(LightningModule):
             and self.discriminator.use_semantic_d
             and d_sem_opt is not None
         ):
-            with torch.amp.autocast(self._device_type, enabled=False):
+            with torch.amp.autocast(self.device.type, enabled=False):
                 loss_d_sem = self.discriminator.compute_d_loss(
                     real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
                 )
@@ -620,7 +623,7 @@ class SD2RefGANSystem(LightningModule):
             and self.discriminator.use_texture_d
             and d_tex_opt is not None
         ):
-            with torch.amp.autocast(self._device_type, enabled=False):
+            with torch.amp.autocast(self.device.type, enabled=False):
                 loss_d_tex = self.discriminator.compute_d_loss(
                     real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
                 )
@@ -725,7 +728,7 @@ class SD2RefGANSystem(LightningModule):
         os.makedirs(save_dir, exist_ok=True)
 
         with torch.no_grad():
-            with torch.amp.autocast(self._device_type, enabled=False):
+            with torch.amp.autocast(self.device.type, enabled=False):
                 sr_prior = (
                     self.sr_model(lr.float(), ref.float())
                     if self.sr_model is not None
