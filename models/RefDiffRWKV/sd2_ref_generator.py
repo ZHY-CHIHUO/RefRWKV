@@ -52,6 +52,11 @@ class SD2RefGenerator(LightningModule):
     """SD2 参考引导生成器，支持 8 通道 UNet 输入（噪声 + SR 条件）。"""
 
     CROSS_ATTN_CTX_LEN: int = 77  # SD2 cross-attention 固定上下文长度
+    # 纹理引导初始化的时间步参数
+    _TEX_T_FLAT_FLOOR: int = 200
+    _TEX_T_OFFSET_LOW: int = 500
+    _TEX_T_MAX: int = 999
+    _TEX_T_OFFSET_HIGH: int = 200
 
     def __init__(
         self,
@@ -92,14 +97,12 @@ class SD2RefGenerator(LightningModule):
         self.hr_key = hr_key
         self.t_min = t_min
         self.t_max = t_max
+        assert t_min <= t_max, f"t_min({t_min}) 必须 <= t_max({t_max})"
         self.cfg_drop_prob = cfg_drop_prob
         self.control_scale = control_scale
         self.normalize_input = normalize_input
         self.sr_model = sr_model
         self.use_sr_latent_cond = use_sr_latent_cond
-
-        # [FIX] 动态设备类型，避免硬编码 "cuda"
-        self._device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
         # ═══════════════════════════════════════
         #  VAE（冻结）
@@ -186,14 +189,10 @@ class SD2RefGenerator(LightningModule):
             new_conv.weight[:, :4] = old_weight
             # [FIX] xavier_uniform_ 对切片不生效，手动计算 std 后 normal_ 赋值
             fan_in = (
-                old_weight.shape[1]
-                * old_conv.kernel_size[0]
-                * old_conv.kernel_size[1]
+                old_weight.shape[1] * old_conv.kernel_size[0] * old_conv.kernel_size[1]
             )
             fan_out = (
-                old_weight.shape[0]
-                * old_conv.kernel_size[0]
-                * old_conv.kernel_size[1]
+                old_weight.shape[0] * old_conv.kernel_size[0] * old_conv.kernel_size[1]
             )
             std = 0.1 * (2.0 / (fan_in + fan_out)) ** 0.5
             new_conv.weight[:, 4:].normal_(0, std)
@@ -231,6 +230,7 @@ class SD2RefGenerator(LightningModule):
                 p.requires_grad = False
         # [FIX] 切片无法设置 requires_grad；整体开启后用 hook 屏蔽前 4 通道梯度
         self.unet.conv_in.weight.requires_grad = True
+        self.unet.conv_in.bias.requires_grad = True
 
         def _mask_pretrained_grad(grad: torch.Tensor) -> torch.Tensor:
             grad[:, :4] = 0
@@ -287,7 +287,7 @@ class SD2RefGenerator(LightningModule):
             return torch.cat([empty_ctx, sem_tokens], dim=1)
         return empty_ctx
 
-    # 向后兼容别名
+    # 向后兼容别名  # TODO: 确认无外部调用后移除
     _build_context = build_context
 
     # ═══════════════════════════════════════════════════════
@@ -313,7 +313,7 @@ class SD2RefGenerator(LightningModule):
         return residuals
 
     # 向后兼容别名
-    _build_down_intrablock = build_down_intrablock
+    _build_down_intrablock = build_down_intrablock  # TODO: 确认无外部调用后移除
 
     # ═══════════════════════════════════════════════════════
     #  核心 UNet 前向
@@ -375,17 +375,21 @@ class SD2RefGenerator(LightningModule):
     # ═══════════════════════════════════════════════════════
     #  SR latent 条件生成
     # ═══════════════════════════════════════════════════════
+    def _compute_sr_prior(self, lr: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """统一的 SR prior 计算入口：SR 模型前向 + 数值安全处理。"""
+        with torch.amp.autocast(self.device.type, enabled=False):
+            sr_prior = self.sr_model(lr.float(), ref.float())
+            sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0)
+            return sr_prior.clamp(-1.0, 1.0)
+
     def _get_sr_latent_cond(
         self, lr: torch.Tensor, ref: torch.Tensor
     ) -> Optional[torch.Tensor]:
         if self.sr_model is None or not self.use_sr_latent_cond:
             return None
         with torch.no_grad():
-            with torch.amp.autocast(self._device_type, enabled=False):
-                sr_prior = self.sr_model(lr.float(), ref.float())
-                sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0)
-                sr_prior = sr_prior.clamp(-1.0, 1.0)
-                return self.encode_latent(sr_prior.to(self.vae.dtype))
+            sr_prior = self._compute_sr_prior(lr, ref)
+            return self.encode_latent(sr_prior.to(self.vae.dtype))
 
     # ═══════════════════════════════════════════════════════
     #  拼接 sr_latent
@@ -401,7 +405,7 @@ class SD2RefGenerator(LightningModule):
         )
 
     # 向后兼容别名
-    _concat_sr_latent = concat_sr_latent
+    _concat_sr_latent = concat_sr_latent  # TODO: 确认无外部调用后移除
 
     # ═══════════════════════════════════════════════════════
     #  训练前向
@@ -461,12 +465,13 @@ class SD2RefGenerator(LightningModule):
     def _prepare_sr_cond(self, lr, ref, actual_sr):
         if actual_sr is None:
             return None, None
-        with torch.amp.autocast(self._device_type, enabled=False):
-            sr_prior = actual_sr(lr.float(), ref.float())
-            sr_prior = torch.nan_to_num(
-                sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
-            ).clamp(-1.0, 1.0)
-            sr_latent = self.encode_latent(sr_prior.to(self.vae.dtype))
+        orig_sr = self.sr_model
+        try:
+            self.sr_model = actual_sr
+            sr_prior = self._compute_sr_prior(lr, ref)
+        finally:
+            self.sr_model = orig_sr
+        sr_latent = self.encode_latent(sr_prior.to(self.vae.dtype))
         return sr_latent, sr_prior
 
     @torch.no_grad()
@@ -503,7 +508,8 @@ class SD2RefGenerator(LightningModule):
             tex_norm = ((flat - tmin) / (tmax - tmin).clamp(min=1e-8)).view_as(
                 tex_map_latent
             )
-            t_flat, t_detail = max(200, t_start - 500), min(999, t_start + 200)
+            t_flat = max(self._TEX_T_FLAT_FLOOR, t_start - self._TEX_T_OFFSET_LOW)
+            t_detail = min(self._TEX_T_MAX, t_start + self._TEX_T_OFFSET_HIGH)
             noise = torch.randn_like(sr_latent)
             t_flat_t = torch.full((bsz,), t_flat, device=device, dtype=torch.long)
             t_detail_t = torch.full((bsz,), t_detail, device=device, dtype=torch.long)
@@ -519,6 +525,8 @@ class SD2RefGenerator(LightningModule):
         bsz = x_t.shape[0]
         t_tensor = torch.full((bsz,), t_int, device=x_t.device, dtype=torch.long)
         if sr_target is not None and guidance_scale > 0 and t_int > t_stop:
+            # DPS 近似（Chung et al. 2023）：noise_pred 对应梯度修改前的 x_t，
+            # 修改后的 x_t 与原始 noise_pred 配合送入 scheduler.step
             with torch.enable_grad():
                 x_t.requires_grad_(True)
                 x_t_input = self.concat_sr_latent(x_t, sr_latent_cond)
@@ -577,18 +585,14 @@ class SD2RefGenerator(LightningModule):
     ) -> List[torch.Tensor]:
         bsz, device, actual_sr = lr.shape[0], self.device, sr_model or self.sr_model
         if actual_sr is not None:
-            with torch.amp.autocast(self._device_type, enabled=False):
-                sr_prior = actual_sr(lr.float(), ref.float())
-                sr_prior = torch.nan_to_num(
-                    sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
-                ).clamp(-1.0, 1.0)
-                x_t = self.encode_latent(sr_prior.to(self.vae.dtype))
+            sr_latent_cond, sr_prior = self._prepare_sr_cond(lr, ref, actual_sr)
+            x_t = sr_latent_cond  # 以 SR latent 作为初始噪声
         else:
             latent_h, latent_w = _compute_latent_size(ref, hr)
             x_t = torch.randn(bsz, 4, latent_h, latent_w, device=device, dtype=lr.dtype)
+            sr_latent_cond = self._get_sr_latent_cond(lr, ref)
         self.noise_scheduler.set_timesteps(steps, device=device)
         pixel_each_step = []
-        sr_latent_cond = self._get_sr_latent_cond(lr, ref)
         for t in self.noise_scheduler.timesteps:
             t_tensor = torch.full((bsz,), int(t), device=device, dtype=torch.long)
             x_t_input = self.concat_sr_latent(x_t, sr_latent_cond)
@@ -701,10 +705,14 @@ class SD2RefGenerator(LightningModule):
             loss, log_dict = self.p_losses(lr, ref, hr)
             self.log_dict(log_dict, on_step=True, prog_bar=True)
             return loss
-        except (ValueError, RuntimeError) as e:
+        except ValueError as e:
             logger.warning("Generator training_step 异常: %s", e)
             torch.cuda.empty_cache()
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
+            return None
+        except RuntimeError as e:
+            logger.error("Generator training_step RuntimeError: %s", e)
+            torch.cuda.empty_cache()
+            return None
 
     def validation_step(self, batch, batch_idx):
         try:
@@ -715,7 +723,7 @@ class SD2RefGenerator(LightningModule):
         except (ValueError, RuntimeError) as e:
             logger.warning("Generator validation_step 异常: %s", e)
             torch.cuda.empty_cache()
-            return torch.tensor(0.0, device=self.device)
+            return None
 
     def configure_optimizers(self):
         params = []
@@ -726,9 +734,7 @@ class SD2RefGenerator(LightningModule):
         # [FIX] 空参数保护，避免 AdamW 收到空列表报错
         if not params:
             logger.warning("Generator 无可训练参数")
-            return torch.optim.AdamW(
-                [torch.zeros(1, requires_grad=True)], lr=1e-8
-            )
+            return None
         return torch.optim.AdamW(
             params, lr=self.learning_rate, weight_decay=self.weight_decay
         )
