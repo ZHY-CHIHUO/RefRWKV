@@ -346,6 +346,7 @@ class SD2RefGenerator(LightningModule):
                     feat, size=(th, tw), mode="bilinear", align_corners=False
                 )
             residuals.append(feat * self.control_scale)
+        return residuals
 
     # ═══════════════════════════════════════════════════════
     #  核心 UNet 前向
@@ -410,6 +411,7 @@ class SD2RefGenerator(LightningModule):
     ) -> torch.Tensor:
         alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(x_t.device)
         a_bar = alphas_cumprod[t].float().view(-1, 1, 1, 1)
+        return (x_t - (1.0 - a_bar).sqrt() * noise_pred) / (a_bar.sqrt() + 1e-8)
 
     # ═══════════════════════════════════════════════════════
     #  SR latent 条件生成
