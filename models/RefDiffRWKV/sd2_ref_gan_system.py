@@ -169,7 +169,7 @@ class SD2RefGANSystem(LightningModule):
                 else self._build_zero_intrablock(x_input)
             ),
         ).sample
-        pred_x0 = self.generator._predict_x0_from_eps(x_t, t, eps_pred)
+        pred_x0 = self.generator.predict_x0_from_eps(x_t, t, eps_pred)
         pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
             -20.0, 20.0
         )
@@ -212,8 +212,8 @@ class SD2RefGANSystem(LightningModule):
             with torch.no_grad():
                 sem_pyramid = self.generator.global_semantic(ref)
                 sem_tokens = self.generator.build_sem_tokens(sem_pyramid)
-        context = self.generator._build_context(bsz, sem_tokens)
-        down_intrablock = self.generator._build_down_intrablock(
+        context = self.generator.build_context(bsz, sem_tokens)
+        down_intrablock = self.generator.build_down_intrablock(
             ref_feats, latent_h, latent_w
         )
         return self._pred_x0_base(
@@ -559,7 +559,8 @@ class SD2RefGANSystem(LightningModule):
         with torch.no_grad():
             with torch.amp.autocast(self.device.type, enabled=self.use_amp):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
-                t = torch.randint(0, 1000, (bsz,), device=lr.device, dtype=torch.long)
+                _num_t = self.generator.noise_scheduler.config.num_train_timesteps
+                t = torch.randint(0, _num_t, (bsz,), device=lr.device, dtype=torch.long)
                 noise = torch.randn_like(sr_latent)
                 pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
                 pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
@@ -720,7 +721,7 @@ class SD2RefGANSystem(LightningModule):
             return loss_diff
         except Exception as e:
             logger.warning("validation_step 异常: %s", e)
-            return torch.tensor(0.0, device=self.device)
+            return None
 
     def _save_validation_images(self, val_results, lr, ref, hr):
         if self.logger is None:
