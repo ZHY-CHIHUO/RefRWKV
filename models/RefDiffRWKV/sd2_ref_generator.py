@@ -245,6 +245,9 @@ class SD2RefGenerator(LightningModule):
     def encode_latent(self, img: torch.Tensor) -> torch.Tensor:
         return self.vae.encode(img).latent_dist.sample() * self.vae_scale_factor
 
+    def encode_latent_with_grad(self, img: torch.Tensor) -> torch.Tensor:
+        return self.vae.encode(img).latent_dist.sample() * self.vae_scale_factor
+
     def decode_latent(self, z: torch.Tensor) -> torch.Tensor:
         return self.vae.decode(z / self.vae_scale_factor).sample
 

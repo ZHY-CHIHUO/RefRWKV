@@ -51,6 +51,7 @@ class SD2RefGANSystem(LightningModule):
         fr_metrics: Optional[List[str]] = None,
         sr_model: Optional[torch.nn.Module] = None,
         sr_fixed: bool = True,
+        sr_lr: float = 1e-5,
         t_start: Optional[int] = None,
         guidance_scale: float = 0.0,
         t_stop: int = 200,
@@ -78,6 +79,7 @@ class SD2RefGANSystem(LightningModule):
         self.grad_clip_val = grad_clip_val
         self.grad_warn_threshold = grad_warn_threshold
         self.max_consecutive_nan = max_consecutive_nan
+        
 
         self._nan_g_count = 0
         self._nan_d_count = 0
