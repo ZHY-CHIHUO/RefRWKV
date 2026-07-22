@@ -118,7 +118,7 @@ class SD2RefGANSystem(LightningModule):
             from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
             self.iqa = IQAEngine(
-                device=self.device.type,
+                device="cuda" if torch.cuda.is_available() else "cpu",
                 nr_metrics=[],
                 fr_metrics=fr_metrics or ["psnr", "ssim", "lpips", "dists"],
                 use_y_channel=True,
@@ -254,20 +254,25 @@ class SD2RefGANSystem(LightningModule):
     #  优化器 / 状态持久化
     # ═══════════════════════════════════════════════════════
 
+    def _get_opt(self, key: str):
+        """安全获取优化器（兼容 PL 单优化器返回对象而非列表的行为）。"""
+        opts = self.optimizers()
+        if not isinstance(opts, list):
+            return opts if key == "g" else None
+        idx = self._opt_idx.get(key)
+        return opts[idx] if idx is not None else None
+
     def _get_g_opt(self):
-        return self.optimizers()[self._opt_idx["g"]]
+        return self._get_opt("g")
 
     def _get_d_sem_opt(self):
-        idx = self._opt_idx.get("d_sem", None)
-        return self.optimizers()[idx] if idx is not None else None
+        return self._get_opt("d_sem")
 
     def _get_d_tex_opt(self):
-        idx = self._opt_idx.get("d_tex", None)
-        return self.optimizers()[idx] if idx is not None else None
+        return self._get_opt("d_tex")
 
     def _get_sr_opt(self):
-        idx = self._opt_idx.get("sr", None)
-        return self.optimizers()[idx] if idx is not None else None
+        return self._get_opt("sr")
 
     def configure_optimizers(self):
         opts = []
@@ -393,9 +398,10 @@ class SD2RefGANSystem(LightningModule):
         return result
 
     def _override_lr_on_resume(self):
-        optimizers = self.optimizers()
-        if not optimizers:
+        opts = self.optimizers()
+        if not opts:
             return
+        optimizers = opts if isinstance(opts, list) else [opts]
 
         old_g = None
         for pg in optimizers[self._opt_idx["g"]].param_groups:
