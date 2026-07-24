@@ -94,11 +94,7 @@ class SD2RefGANSystem(LightningModule):
         self.automatic_optimization = False
 
         self.use_amp = use_amp
-        self.scaler_g = (
-            torch.amp.GradScaler("cuda", enabled=True)
-            if (use_amp and torch.cuda.is_available())
-            else None
-        )
+        self.scaler_g = None
 
         self._g_accum_count = 0
         self._d_sem_accum_count = 0
@@ -522,7 +518,9 @@ class SD2RefGANSystem(LightningModule):
         lr, ref, hr = self.generator.get_input(batch)
 
         # ── Phase 1: 扩散 ε-prediction loss ──
-        with torch.amp.autocast(self.device.type, enabled=self.use_amp):
+        with torch.amp.autocast(
+            self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
+        ):
             out = self.generator.forward(lr, ref, hr)
             loss = out["loss"]
 
@@ -558,7 +556,9 @@ class SD2RefGANSystem(LightningModule):
 
         if phase2_enabled:
             bsz = lr.shape[0]
-            with torch.amp.autocast(self.device.type, enabled=self.use_amp):
+            with torch.amp.autocast(
+                self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
+            ):
                 # 获取 SR latent（sr_fixed=False 时保留梯度）
                 if not self.sr_fixed:
                     sr_latent = self._get_sr_latent_with_grad(lr, ref)
@@ -729,7 +729,9 @@ class SD2RefGANSystem(LightningModule):
 
         # 生成 fake / real（全部 no_grad，D 不需要 G 的梯度）
         with torch.no_grad():
-            with torch.amp.autocast(self.device.type, enabled=self.use_amp):
+            with torch.amp.autocast(
+                self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
+            ):
                 sr_latent = self._get_sr_latent_precomputed(lr, ref)
 
                 _num_t = self.generator.noise_scheduler.config.num_train_timesteps
