@@ -893,8 +893,7 @@ class SD2RefGANSystem(LightningModule):
                     n = len(sr_batch)
                     for k, v in agg.items():
                         self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
-                        if k == "psnr":
-                            self.log("val_psnr", v / n, on_epoch=True)
+                        self.log(f"val_{k}", v / n, on_epoch=True)
                 except Exception as e:
                     logger.warning("IQA 评估失败: %s", e)
 
