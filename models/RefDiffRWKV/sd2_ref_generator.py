@@ -420,9 +420,10 @@ class SD2RefGenerator(LightningModule):
     def _compute_sr_prior(self, lr: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         """统一的 SR prior 计算入口：SR 模型前向 + 数值安全处理。"""
         with torch.amp.autocast(self.device.type, enabled=False):
-            sr_prior = self.sr_model(lr.float(), ref.float())
-        sr_prior = torch.nan_to_num(sr_prior, nan=0.0, posinf=1.0, neginf=-1.0)
-        return sr_prior.clamp(-1.0, 1.0)
+            # ★ 确保 SR 模型在正确设备上
+            sr_pixel = self.sr_model(lr.float(), ref.float())
+        sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0)
+        return sr_pixel.clamp(-1.0, 1.0)
 
     def _get_sr_latent_cond(
         self, lr: torch.Tensor, ref: torch.Tensor
