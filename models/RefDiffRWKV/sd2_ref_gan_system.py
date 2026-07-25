@@ -518,11 +518,28 @@ class SD2RefGANSystem(LightningModule):
         lr, ref, hr = self.generator.get_input(batch)
 
         # ── Phase 1: 扩散 ε-prediction loss ──
-        with torch.amp.autocast(
-            self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
-        ):
-            out = self.generator.forward(lr, ref, hr)
-            loss = out["loss"]
+        try:
+            with torch.amp.autocast(
+                self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
+            ):
+                out = self.generator.forward(lr, ref, hr)
+                loss = out["loss"]
+        except (RuntimeError, TypeError, AttributeError) as e:
+            err_msg = str(e)
+            if any(kw in err_msg for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")):
+                logger.warning(
+                    "[G step] Phase1 CUDA/设备异常 (batch=%d): %s，跳过并重置",
+                    batch_idx, e
+                )
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                g_opt.zero_grad(set_to_none=True)
+                self._g_accum_count = 0
+                # 重新将 SR 模型移到 GPU（修复可能的设备漂移）
+                if self.sr_model is not None:
+                    self.sr_model.to(self.device)
+                return None
+            raise
 
         if torch.isnan(loss) or torch.isinf(loss):
             logger.warning("[G step] Phase1 loss NaN/Inf, batch=%d", batch_idx)
@@ -556,81 +573,121 @@ class SD2RefGANSystem(LightningModule):
 
         if phase2_enabled:
             bsz = lr.shape[0]
-            with torch.amp.autocast(
-                self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
-            ):
-                # 获取 SR latent（sr_fixed=False 时保留梯度）
-                if not self.sr_fixed:
-                    sr_latent = self._get_sr_latent_with_grad(lr, ref)
-                else:
-                    sr_latent = self._get_sr_latent_precomputed(lr, ref)
+            try:
+                with torch.amp.autocast(
+                    self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
+                ):
+                    # 获取 SR latent（sr_fixed=False 时保留梯度）
+                    if not self.sr_fixed:
+                        sr_latent = self._get_sr_latent_with_grad(lr, ref)
+                    else:
+                        sr_latent = self._get_sr_latent_precomputed(lr, ref)
 
-                t_sr = torch.randint(
-                    self.generator.t_min,
-                    self.generator.t_max + 1,
-                    (bsz,),
-                    device=lr.device,
-                    dtype=torch.long,
-                )
-                noise_sr = torch.randn_like(sr_latent)
-
-                # real target：no_grad（_no_adapter_pred_x0 自带 @torch.no_grad）
-                pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t_sr, noise_sr)
-                # fake：需要梯度穿透到 UNet / Adapter（不加 no_grad）
-                pred_sr_pixel = self._adapter_pred_x0(
-                    lr, ref, sr_latent, t_sr, noise_sr
-                )
-
-                phase2_loss = 0.0
-
-                if self.lambda_diff_sr > 0:
-                    loss_diff_sr = F.mse_loss(pred_sr_pixel, pred_hr_pixel.detach())
-                    phase2_loss = phase2_loss + self.lambda_diff_sr * loss_diff_sr
-                    self.log("train/G_diff_sr", loss_diff_sr.detach(), on_step=True)
-
-                if self.lambda_lpips > 0:
-                    loss_lpips_sr = (
-                        self.net_lpips(pred_sr_pixel, hr).mean() * self.lambda_lpips
+                    t_sr = torch.randint(
+                        self.generator.t_min,
+                        self.generator.t_max + 1,
+                        (bsz,),
+                        device=lr.device,
+                        dtype=torch.long,
                     )
-                    if not torch.isnan(loss_lpips_sr) and not torch.isinf(
-                        loss_lpips_sr
-                    ):
-                        phase2_loss = phase2_loss + loss_lpips_sr
-                        self.log("train/G_lpips", loss_lpips_sr.detach(), on_step=True)
+                    noise_sr = torch.randn_like(sr_latent)
+
+                    # real target：no_grad（_no_adapter_pred_x0 自带 @torch.no_grad）
+                    pred_hr_pixel = self._no_adapter_pred_x0(
+                        hr, sr_latent, t_sr, noise_sr
+                    )
+                    # fake：需要梯度穿透到 UNet / Adapter（不加 no_grad）
+                    pred_sr_pixel = self._adapter_pred_x0(
+                        lr, ref, sr_latent, t_sr, noise_sr
+                    )
+
+                    phase2_loss = 0.0
+
+                    if self.lambda_diff_sr > 0:
+                        loss_diff_sr = F.mse_loss(
+                            pred_sr_pixel, pred_hr_pixel.detach()
+                        )
+                        phase2_loss = phase2_loss + self.lambda_diff_sr * loss_diff_sr
+                        self.log(
+                            "train/G_diff_sr", loss_diff_sr.detach(), on_step=True
+                        )
+
+                    if self.lambda_lpips > 0:
+                        loss_lpips_sr = (
+                            self.net_lpips(pred_sr_pixel, hr).mean()
+                            * self.lambda_lpips
+                        )
+                        if not torch.isnan(loss_lpips_sr) and not torch.isinf(
+                            loss_lpips_sr
+                        ):
+                            phase2_loss = phase2_loss + loss_lpips_sr
+                            self.log(
+                                "train/G_lpips",
+                                loss_lpips_sr.detach(),
+                                on_step=True,
+                            )
+                        else:
+                            self._nan_g_count += 1
+                            logger.warning(
+                                "[G step] LPIPS NaN/Inf (#%d)，跳过",
+                                self._nan_g_count,
+                            )
+
+                    with torch.amp.autocast(self.device.type, enabled=False):
+                        gan_loss = self.discriminator.compute_g_loss(
+                            pred_sr_pixel.float(),
+                            ref=ref.float(),
+                            lambda_semantic=self.lambda_gan_semantic,
+                            lambda_texture=self.lambda_gan_texture,
+                        )
+                    if not torch.isnan(gan_loss) and not torch.isinf(gan_loss):
+                        phase2_loss = phase2_loss + gan_loss
+                        self.log("train/G_gan", gan_loss.detach(), on_step=True)
                     else:
                         self._nan_g_count += 1
                         logger.warning(
-                            "[G step] LPIPS NaN/Inf (#%d)，跳过", self._nan_g_count
+                            "[G step] GAN NaN/Inf (#%d)", self._nan_g_count
                         )
 
-                with torch.amp.autocast(self.device.type, enabled=False):
-                    gan_loss = self.discriminator.compute_g_loss(
-                        pred_sr_pixel.float(),
-                        ref=ref.float(),
-                        lambda_semantic=self.lambda_gan_semantic,
-                        lambda_texture=self.lambda_gan_texture,
-                    )
-                if not torch.isnan(gan_loss) and not torch.isinf(gan_loss):
-                    phase2_loss = phase2_loss + gan_loss
-                    self.log("train/G_gan", gan_loss.detach(), on_step=True)
-                else:
-                    self._nan_g_count += 1
-                    logger.warning("[G step] GAN NaN/Inf (#%d)", self._nan_g_count)
+                    if (
+                        isinstance(phase2_loss, torch.Tensor)
+                        and phase2_loss.item() != 0
+                    ):
+                        phase2_loss_val = phase2_loss.detach()
+                        phase2_loss_scaled = (
+                            phase2_loss / self.accumulate_grad_batches
+                        )
+                        if self.scaler_g is not None:
+                            self.scaler_g.scale(phase2_loss_scaled).backward()
+                        else:
+                            phase2_loss_scaled.backward()
 
-                if isinstance(phase2_loss, torch.Tensor) and phase2_loss.item() != 0:
-                    phase2_loss_val = phase2_loss.detach()
-                    phase2_loss_scaled = phase2_loss / self.accumulate_grad_batches
-                    if self.scaler_g is not None:
-                        self.scaler_g.scale(phase2_loss_scaled).backward()
-                    else:
-                        phase2_loss_scaled.backward()
+            except (RuntimeError, TypeError, AttributeError) as e:
+                err_msg = str(e)
+                if any(
+                    kw in err_msg
+                    for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")
+                ):
+                    logger.warning(
+                        "[G step] Phase2 CUDA/设备异常 (batch=%d): %s，跳过 Phase2",
+                        batch_idx, e,
+                    )
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Phase2 异常不影响 Phase1 已累积的梯度，继续走 optimizer step
+                    if self.sr_model is not None:
+                        self.sr_model.to(self.device)
+                else:
+                    raise
 
         # ── 梯度累积 & Optimizer Step（无论是否有 Phase2 都执行）──
         self._g_accum_count += 1
 
         if self._g_accum_count >= self.accumulate_grad_batches:
             sr_opt = (
-                self._get_sr_opt() if (not self.sr_fixed and phase2_enabled) else None
+                self._get_sr_opt()
+                if (not self.sr_fixed and phase2_enabled)
+                else None
             )
 
             # 1. unscale 全部
@@ -683,7 +740,9 @@ class SD2RefGANSystem(LightningModule):
             phase2_loss_val if phase2_loss_val is not None else 0.0
         )
         self.log("train/G_total", g_total, on_step=True, prog_bar=True)
-        self.log("train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True)
+        self.log(
+            "train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True
+        )
 
         return g_total
 
