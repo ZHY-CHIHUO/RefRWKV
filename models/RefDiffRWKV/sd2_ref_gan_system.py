@@ -488,12 +488,12 @@ class SD2RefGANSystem(LightningModule):
             return None
         with torch.amp.autocast(self.device.type, enabled=False):
             sr_pixel = self.sr_model(lr.float(), ref.float())
-        sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0).clamp(
-            -1.0, 1.0
-        )
-        return self.generator.encode_latent_with_grad(
-            sr_pixel.to(self.generator.vae.dtype)
-        )
+            sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0).clamp(
+                -1.0, 1.0
+            )
+            return self.generator.encode_latent_with_grad(
+                sr_pixel.to(self.generator.vae.dtype)
+            )
 
     # ═══════════════════════════════════════════════════════
     #  Early Stop
@@ -544,13 +544,18 @@ class SD2RefGANSystem(LightningModule):
                     "[G step] Phase1 CUDA/设备异常 (batch=%d): %s，跳过并重置",
                     batch_idx, e
                 )
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except RuntimeError:
+                    pass  # CUDA 上下文已损坏，无法清理
                 g_opt.zero_grad(set_to_none=True)
                 self._g_accum_count = 0
-                # 重新将 SR 模型移到 GPU（修复可能的设备漂移）
                 if self.sr_model is not None:
-                    self.sr_model.to(self.device)
+                    try:
+                        self.sr_model.to(self.device)
+                    except RuntimeError:
+                        pass
                 return None
             raise
 
@@ -685,11 +690,16 @@ class SD2RefGANSystem(LightningModule):
                         "[G step] Phase2 CUDA/设备异常 (batch=%d): %s，跳过 Phase2",
                         batch_idx, e,
                     )
+                try:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
-                    # Phase2 异常不影响 Phase1 已累积的梯度，继续走 optimizer step
-                    if self.sr_model is not None:
+                except RuntimeError:
+                    pass
+                if self.sr_model is not None:
+                    try:
                         self.sr_model.to(self.device)
+                    except RuntimeError:
+                        pass
                 else:
                     raise
 
@@ -800,20 +810,39 @@ class SD2RefGANSystem(LightningModule):
         self._consecutive_nan_d = 0
 
         # 生成 fake / real（全部 no_grad，D 不需要 G 的梯度）
-        with torch.no_grad():
-            with torch.amp.autocast(
-                self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
-            ):
-                sr_latent = self._get_sr_latent_precomputed(lr, ref)
 
-                _num_t = self.generator.noise_scheduler.config.num_train_timesteps
-                t = torch.randint(0, _num_t, (bsz,), device=lr.device, dtype=torch.long)
-                noise = torch.randn_like(sr_latent)
 
-                pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
-                pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
 
-        real, fake = pred_hr_pixel.detach().float(), pred_sr_pixel.detach().float()
+        try:
+            with torch.no_grad():
+                with torch.amp.autocast(
+                    self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
+                ):
+                    sr_latent = self._get_sr_latent_precomputed(lr, ref)
+                    _num_t = self.generator.noise_scheduler.config.num_train_timesteps
+                    t = torch.randint(0, _num_t, (bsz,), device=lr.device, dtype=torch.long)
+                    noise = torch.randn_like(sr_latent)
+                    pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
+                    pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
+                    real, fake = pred_hr_pixel.detach().float(), pred_sr_pixel.detach().float()
+        except (RuntimeError, TypeError, AttributeError) as e:
+            err_msg = str(e)
+            if any(kw in err_msg for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")):
+                logger.warning("[D step] CUDA/设备异常 (batch=%d): %s，跳过", batch_idx, e)
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass
+                if d_sem_opt is not None:
+                    d_sem_opt.zero_grad(set_to_none=True)
+                if d_tex_opt is not None:
+                    d_tex_opt.zero_grad(set_to_none=True)
+                self._d_sem_accum_count = 0
+                self._d_tex_accum_count = 0
+                self._freeze_discriminator()
+                self._gd_phase = 0
+                return None
+            raise
 
         for name, tensor in [("fake", fake), ("real", real)]:
             if torch.isnan(tensor).any() or torch.isinf(tensor).any():
