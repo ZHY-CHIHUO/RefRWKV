@@ -377,20 +377,33 @@ class SD2RefGANSystem(LightningModule):
         self._g_steps_since_d = checkpoint.get("g_steps_since_d", 0)
 
     def load_state_dict(self, state_dict, strict=True):
+        # ★ Phase2 从 Phase1 checkpoint 恢复时，discriminator 权重不存在
+        if self.discriminator is not None:
+            disc_keys_in_ckpt = [k for k in state_dict if k.startswith("discriminator.")]
+            disc_keys_expected = list(self.discriminator.state_dict().keys())
+            if disc_keys_expected and not disc_keys_in_ckpt:
+                logger.info(
+                    "Discriminator 权重不在 checkpoint 中（%d keys），使用随机初始化",
+                    len(disc_keys_expected),
+                )
+                strict = False
+
         result = super().load_state_dict(state_dict, strict=strict)
         missing, unexpected = result.missing_keys, result.unexpected_keys
 
+        # 只警告非 discriminator 的缺失 key
         if missing:
-            logger.warning("load_state_dict: %d missing keys", len(missing))
-            for k in missing[:10]:
-                logger.warning("  - %s", k)
+            non_disc = [k for k in missing if not k.startswith("discriminator.")]
+            if non_disc:
+                logger.warning("load_state_dict: %d missing keys", len(non_disc))
+                for k in non_disc[:10]:
+                    logger.warning("  - %s", k)
         if unexpected:
             logger.warning("load_state_dict: %d unexpected keys", len(unexpected))
             for k in unexpected[:10]:
                 logger.warning("  - %s", k)
         if not missing and not unexpected:
             logger.info("load_state_dict: all keys matched")
-
         return result
 
     def _override_lr_on_resume(self):
