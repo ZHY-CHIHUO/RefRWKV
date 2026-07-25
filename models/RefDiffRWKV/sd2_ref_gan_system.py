@@ -379,7 +379,9 @@ class SD2RefGANSystem(LightningModule):
     def load_state_dict(self, state_dict, strict=True):
         # ★ Phase2 从 Phase1 checkpoint 恢复时，discriminator 权重不存在
         if self.discriminator is not None:
-            disc_keys_in_ckpt = [k for k in state_dict if k.startswith("discriminator.")]
+            disc_keys_in_ckpt = [
+                k for k in state_dict if k.startswith("discriminator.")
+            ]
             disc_keys_expected = list(self.discriminator.state_dict().keys())
             if disc_keys_expected and not disc_keys_in_ckpt:
                 logger.info(
@@ -474,9 +476,8 @@ class SD2RefGANSystem(LightningModule):
             return None
         with torch.amp.autocast(self.device.type, enabled=False):
             sr_pixel = self.sr_model(lr.float(), ref.float())
-        sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0)
-        sr_pixel = sr_pixel.clamp(-1.0, 1.0)
-        return self.generator.encode_latent(sr_pixel.to(self.generator.vae.dtype))
+            sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+            return self.generator.encode_latent(sr_pixel.to(self.generator.vae.dtype))
 
     def _get_sr_latent_with_grad(self, lr, ref):
         """SR latent（保留计算图，用于 sr_fixed=False 的 G step，梯度反传到 SR 模型）。
@@ -488,9 +489,9 @@ class SD2RefGANSystem(LightningModule):
             return None
         with torch.amp.autocast(self.device.type, enabled=False):
             sr_pixel = self.sr_model(lr.float(), ref.float())
-            sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0).clamp(
-                -1.0, 1.0
-            )
+            sr_pixel = torch.nan_to_num(
+                sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0
+            ).clamp(-1.0, 1.0)
             return self.generator.encode_latent_with_grad(
                 sr_pixel.to(self.generator.vae.dtype)
             )
@@ -516,6 +517,10 @@ class SD2RefGANSystem(LightningModule):
     # ═══════════════════════════════════════════════════════
 
     def training_step(self, batch, batch_idx):
+        # 前 3000 步只训练 D
+        if self.global_step < 3000:
+            return self._discriminator_step(batch, batch_idx)
+        # 之后正常 G/D 交替
         if self._gd_phase == 0:
             return self._generator_step(batch, batch_idx)
         return self._discriminator_step(batch, batch_idx)
@@ -539,10 +544,14 @@ class SD2RefGANSystem(LightningModule):
                 loss = out["loss"]
         except (RuntimeError, TypeError, AttributeError) as e:
             err_msg = str(e)
-            if any(kw in err_msg for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")):
+            if any(
+                kw in err_msg
+                for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")
+            ):
                 logger.warning(
                     "[G step] Phase1 CUDA/设备异常 (batch=%d): %s，跳过并重置",
-                    batch_idx, e
+                    batch_idx,
+                    e,
                 )
                 try:
                     torch.cuda.empty_cache()
@@ -622,18 +631,13 @@ class SD2RefGANSystem(LightningModule):
                     phase2_loss = 0.0
 
                     if self.lambda_diff_sr > 0:
-                        loss_diff_sr = F.mse_loss(
-                            pred_sr_pixel, pred_hr_pixel.detach()
-                        )
+                        loss_diff_sr = F.mse_loss(pred_sr_pixel, pred_hr_pixel.detach())
                         phase2_loss = phase2_loss + self.lambda_diff_sr * loss_diff_sr
-                        self.log(
-                            "train/G_diff_sr", loss_diff_sr.detach(), on_step=True
-                        )
+                        self.log("train/G_diff_sr", loss_diff_sr.detach(), on_step=True)
 
                     if self.lambda_lpips > 0:
                         loss_lpips_sr = (
-                            self.net_lpips(pred_sr_pixel, hr).mean()
-                            * self.lambda_lpips
+                            self.net_lpips(pred_sr_pixel, hr).mean() * self.lambda_lpips
                         )
                         if not torch.isnan(loss_lpips_sr) and not torch.isinf(
                             loss_lpips_sr
@@ -663,18 +667,14 @@ class SD2RefGANSystem(LightningModule):
                         self.log("train/G_gan", gan_loss.detach(), on_step=True)
                     else:
                         self._nan_g_count += 1
-                        logger.warning(
-                            "[G step] GAN NaN/Inf (#%d)", self._nan_g_count
-                        )
+                        logger.warning("[G step] GAN NaN/Inf (#%d)", self._nan_g_count)
 
                     if (
                         isinstance(phase2_loss, torch.Tensor)
                         and phase2_loss.item() != 0
                     ):
                         phase2_loss_val = phase2_loss.detach()
-                        phase2_loss_scaled = (
-                            phase2_loss / self.accumulate_grad_batches
-                        )
+                        phase2_loss_scaled = phase2_loss / self.accumulate_grad_batches
                         if self.scaler_g is not None:
                             self.scaler_g.scale(phase2_loss_scaled).backward()
                         else:
@@ -688,7 +688,8 @@ class SD2RefGANSystem(LightningModule):
                 ):
                     logger.warning(
                         "[G step] Phase2 CUDA/设备异常 (batch=%d): %s，跳过 Phase2",
-                        batch_idx, e,
+                        batch_idx,
+                        e,
                     )
                 try:
                     torch.cuda.empty_cache()
@@ -708,9 +709,7 @@ class SD2RefGANSystem(LightningModule):
 
         if self._g_accum_count >= self.accumulate_grad_batches:
             sr_opt = (
-                self._get_sr_opt()
-                if (not self.sr_fixed and phase2_enabled)
-                else None
+                self._get_sr_opt() if (not self.sr_fixed and phase2_enabled) else None
             )
 
             # 1. unscale 全部
@@ -763,9 +762,7 @@ class SD2RefGANSystem(LightningModule):
             phase2_loss_val if phase2_loss_val is not None else 0.0
         )
         self.log("train/G_total", g_total, on_step=True, prog_bar=True)
-        self.log(
-            "train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True
-        )
+        self.log("train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True)
 
         return g_total
 
@@ -811,8 +808,6 @@ class SD2RefGANSystem(LightningModule):
 
         # 生成 fake / real（全部 no_grad，D 不需要 G 的梯度）
 
-
-
         try:
             with torch.no_grad():
                 with torch.amp.autocast(
@@ -820,15 +815,25 @@ class SD2RefGANSystem(LightningModule):
                 ):
                     sr_latent = self._get_sr_latent_precomputed(lr, ref)
                     _num_t = self.generator.noise_scheduler.config.num_train_timesteps
-                    t = torch.randint(0, _num_t, (bsz,), device=lr.device, dtype=torch.long)
+                    t = torch.randint(
+                        0, _num_t, (bsz,), device=lr.device, dtype=torch.long
+                    )
                     noise = torch.randn_like(sr_latent)
                     pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
                     pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
-                    real, fake = pred_hr_pixel.detach().float(), pred_sr_pixel.detach().float()
+                    real, fake = (
+                        pred_hr_pixel.detach().float(),
+                        pred_sr_pixel.detach().float(),
+                    )
         except (RuntimeError, TypeError, AttributeError) as e:
             err_msg = str(e)
-            if any(kw in err_msg for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")):
-                logger.warning("[D step] CUDA/设备异常 (batch=%d): %s，跳过", batch_idx, e)
+            if any(
+                kw in err_msg
+                for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")
+            ):
+                logger.warning(
+                    "[D step] CUDA/设备异常 (batch=%d): %s，跳过", batch_idx, e
+                )
                 try:
                     torch.cuda.empty_cache()
                 except RuntimeError:
