@@ -162,8 +162,11 @@ class SD2RefGenerator(LightningModule):
             else None
         )
         if self.global_semantic is not None:
-            self.global_semantic.eval()
-            self.global_semantic.requires_grad_(False)
+            # 只冻结 DINOv2 backbone（GlobalSemanticModule.__init__ 内部已处理）
+            # proj 和 semantic_pyramid 保持可训练
+            # 仅确保 DINOv2 保持 eval（关闭 Dropout）
+            self.global_semantic.dinov2.eval()
+            self.global_semantic.dinov2.requires_grad_(False)
 
         self.sem_proj: Optional[nn.Linear] = (
             nn.Linear(sem_base_dim, self.cross_attn_dim) if self.use_semantic else None
@@ -367,9 +370,10 @@ class SD2RefGenerator(LightningModule):
 
         sem_tokens = None
         if self.use_semantic:
-            with torch.no_grad():
-                sem_pyramid = self.global_semantic(ref_input)
-                sem_tokens = self.build_sem_tokens(sem_pyramid)
+            # DINOv2 前向在 GlobalSemanticModule.forward 内部已有 no_grad 保护
+            # proj 和 semantic_pyramid 需要梯度，不能包裹 no_grad
+            sem_pyramid = self.global_semantic(ref_input)
+            sem_tokens = self.build_sem_tokens(sem_pyramid)
 
         context = self.build_context(bsz, sem_tokens)
 

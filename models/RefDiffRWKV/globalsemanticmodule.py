@@ -334,32 +334,20 @@ class GlobalSemanticModule(nn.Module):
             use_checkpoint=use_checkpoint,
         )
 
+        # 注册 ImageNet 归一化 buffer（避免每次 forward 创建 tensor）
+        self.register_buffer(
+            "_dino_mean",
+            torch.tensor(self.IMAGENET_MEAN).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "_dino_std",
+            torch.tensor(self.IMAGENET_STD).view(1, 3, 1, 1),
+        )
 
     def _normalize_for_dinov2(self, ref_img: torch.Tensor) -> torch.Tensor:
-        """
-        对输入图像应用 ImageNet 归一化，使其符合 DINOv2 预训练分布。
-
-        自动检测输入值域:
-            - 若存在负值 → 假定 [-1, 1]，先映射到 [0, 1]
-            - 若全为非负 → 假定已是 [0, 1]，直接归一化
-
-        Args:
-            ref_img: (B, 3, H, W)，值域 [-1, 1] 或 [0, 1]
-
-        Returns:
-            normalized: (B, 3, H, W)，经 ImageNet 均值/标准差归一化
-        """
-        if ref_img.min() < 0:
-            ref_img = (ref_img + 1) / 2  # [-1, 1] → [0, 1]
-
-        mean = torch.tensor(
-            self.IMAGENET_MEAN, device=ref_img.device, dtype=ref_img.dtype
-        ).view(1, 3, 1, 1)
-        std = torch.tensor(
-            self.IMAGENET_STD, device=ref_img.device, dtype=ref_img.dtype
-        ).view(1, 3, 1, 1)
-
-        return (ref_img - mean) / std
+        # 数据契约：输入值域为 [-1, 1]，直接转换，不做动态检测
+        ref_01 = (ref_img + 1.0) / 2.0  # [-1, 1] → [0, 1]
+        return (ref_01 - self._dino_mean) / self._dino_std
 
     def forward(self, ref_img: torch.Tensor):
         """
@@ -403,7 +391,3 @@ class GlobalSemanticModule(nn.Module):
 
         # ── Step 6: 直接返回 base_dim token，由调用方投影 ──
         return base_pyramid
-
-
-
-
