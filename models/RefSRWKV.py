@@ -403,9 +403,6 @@ class RefSRWKV(nn.Module):
         )
 
         # ── Ref 编码器 ──
-        self.ref_stem = nn.Conv2d(
-            out_channels, dim, kernel_size=3, padding=1, bias=False
-        )
         self.ref_to_level1 = nn.Sequential(
             nn.PixelUnshuffle(4),
             nn.Conv2d(out_channels * 16, dim, kernel_size=1, bias=False),

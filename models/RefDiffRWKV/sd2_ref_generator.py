@@ -58,12 +58,6 @@ class SD2RefGenerator(LightningModule):
 
     CROSS_ATTN_CTX_LEN: int = 77  # SD2 cross-attention 固定上下文长度
 
-    # 纹理引导初始化的时间步参数
-    _TEX_T_FLAT_FLOOR: int = 200
-    _TEX_T_OFFSET_LOW: int = 500
-    _TEX_T_MAX: int = 999
-    _TEX_T_OFFSET_HIGH: int = 200
-
     def __init__(
         self,
         strategy: str = "rwkv",
@@ -546,34 +540,15 @@ class SD2RefGenerator(LightningModule):
             and sr_latent is not None
             and sr_prior is not None
         ):
+            # SR target 用于 DPS guidance（_denoise_step 中引导生成向 SR 结果靠近）
             sr_target = sr_latent.detach().clone()
 
-            sr_pixel_01 = (sr_prior + 1.0) / 2.0
-            ref_pixel_01 = (ref + 1.0) / 2.0
-            tex_map = (sr_pixel_01 - ref_pixel_01).abs().mean(dim=1, keepdim=True)
-            tex_map_latent = F.interpolate(
-                tex_map, size=sr_latent.shape[2:], mode="bilinear", align_corners=False
-            )
-
-            # [FIX] 向量化 per-sample min-max 归一化，替代逐样本 for 循环
-            flat = tex_map_latent.flatten(1)  # (B, H*W)
-            tmin = flat.amin(dim=1, keepdim=True)
-            tmax = flat.amax(dim=1, keepdim=True)
-            tex_norm = ((flat - tmin) / (tmax - tmin).clamp(min=1e-8)).view_as(
-                tex_map_latent
-            )
-
-            t_flat = max(self._TEX_T_FLAT_FLOOR, t_start - self._TEX_T_OFFSET_LOW)
-            t_detail = min(self._TEX_T_MAX, t_start + self._TEX_T_OFFSET_HIGH)
-
+            # 统一使用 t_start 作为噪声水平，保证与 scheduler 首步一致
             noise = torch.randn_like(sr_latent)
-            t_flat_t = torch.full((bsz,), t_flat, device=device, dtype=torch.long)
-            t_detail_t = torch.full((bsz,), t_detail, device=device, dtype=torch.long)
+            t_noise_t = torch.full((bsz,), t_start, device=device, dtype=torch.long)
+            x_t = self.noise_scheduler.add_noise(sr_latent, noise, t_noise_t)
 
-            x_t_flat = self.noise_scheduler.add_noise(sr_latent, noise, t_flat_t)
-            x_t_detail = self.noise_scheduler.add_noise(sr_latent, noise, t_detail_t)
-
-            return tex_norm * x_t_detail + (1.0 - tex_norm) * x_t_flat, sr_target
+            return x_t, sr_target
 
         return torch.randn(bsz, 4, latent_h, latent_w, device=device, dtype=dtype), None
 
@@ -612,6 +587,7 @@ class SD2RefGenerator(LightningModule):
         t_start=None,
         guidance_scale=0.0,
         t_stop=200,
+        val_seed: int = None,
     ):
         if torch.isnan(lr).any() or torch.isnan(ref).any():
             raise ValueError("sample_log: Input contains NaN")
@@ -620,6 +596,16 @@ class SD2RefGenerator(LightningModule):
 
         sr_latent_cond, sr_prior = self._prepare_sr_cond(lr, ref, actual_sr)
         latent_h, latent_w = _compute_latent_size(ref, hr)
+
+        # 验证时固定噪声，保证跨 epoch 可比较
+        if val_seed is not None:
+            rng_state = torch.random.get_rng_state()
+            cuda_rng_state = (
+                torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            )
+            torch.manual_seed(val_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(val_seed)
 
         x_t, sr_target = self._initialize_latent(
             bsz,
@@ -633,6 +619,11 @@ class SD2RefGenerator(LightningModule):
             ref,
             t_start,
         )
+
+        if val_seed is not None:
+            torch.random.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
 
         self.noise_scheduler.set_timesteps(steps, device=device)
         timesteps = self.noise_scheduler.timesteps
@@ -689,6 +680,7 @@ class SD2RefGenerator(LightningModule):
         t_start=None,
         guidance_scale=0.0,
         t_stop=200,
+        val_seed: int = 42,
     ):
         lr, ref, hr = self.get_input(batch)
         samples = self.sample_log(
@@ -700,6 +692,7 @@ class SD2RefGenerator(LightningModule):
             t_start=t_start,
             guidance_scale=guidance_scale,
             t_stop=t_stop,
+            val_seed=val_seed,
         )
         result = {
             "lq": (lr + 1.0) / 2.0,

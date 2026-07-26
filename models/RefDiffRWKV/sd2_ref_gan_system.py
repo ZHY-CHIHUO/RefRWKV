@@ -691,14 +691,15 @@ class SD2RefGANSystem(LightningModule):
 
             except (RuntimeError, TypeError, AttributeError) as e:
                 err_msg = str(e)
-                if any(
-                    kw in err_msg
-                    for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")
-                ):
+                is_cuda_error = isinstance(e, RuntimeError) and (
+                    "CUDA" in err_msg or "cuda" in err_msg or "CUBLAS" in err_msg
+                )
+                if is_cuda_error:
                     logger.warning(
                         "[G step] Phase2 CUDA/设备异常 (batch=%d): %s，跳过 Phase2",
                         batch_idx,
                         e,
+                        exc_info=True,
                     )
                     try:
                         torch.cuda.empty_cache()
@@ -841,12 +842,15 @@ class SD2RefGANSystem(LightningModule):
                     )
         except (RuntimeError, TypeError, AttributeError) as e:
             err_msg = str(e)
-            if any(
-                kw in err_msg
-                for kw in ("CUDA", "is_cuda", "not callable", "has no attribute")
-            ):
+            is_cuda_error = isinstance(e, RuntimeError) and (
+                "CUDA" in err_msg or "cuda" in err_msg or "CUBLAS" in err_msg
+            )
+            if is_cuda_error:
                 logger.warning(
-                    "[D step] CUDA/设备异常 (batch=%d): %s，跳过", batch_idx, e
+                    "[D step] CUDA 异常 (batch=%d): %s，跳过",
+                    batch_idx,
+                    e,
+                    exc_info=True,
                 )
                 try:
                     torch.cuda.empty_cache()
@@ -1001,6 +1005,7 @@ class SD2RefGANSystem(LightningModule):
                     t_start=self.t_start,
                     guidance_scale=self.guidance_scale,
                     t_stop=self.t_stop,
+                    val_seed=42,
                 )
 
             if self.iqa is not None:
@@ -1052,7 +1057,7 @@ class SD2RefGANSystem(LightningModule):
         if self.logger is None:
             return
 
-        save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
+        save_dir = os.path.join(self.logger.log_dir, "validation_tmp")
         os.makedirs(save_dir, exist_ok=True)
 
         with torch.no_grad():
@@ -1120,7 +1125,7 @@ class SD2RefGANSystem(LightningModule):
     def on_validation_epoch_start(self):
         self._freeze_discriminator()
         if self.logger is not None:
-            save_dir = os.path.join(self.logger.save_dir, "validation_tmp")
+            save_dir = os.path.join(self.logger.log_dir, "validation_tmp")
             if os.path.exists(save_dir):
                 shutil.rmtree(save_dir)
                 logger.info("已清理 validation_tmp 目录")
