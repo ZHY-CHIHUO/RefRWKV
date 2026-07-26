@@ -88,6 +88,11 @@ class SD2RefGenerator(LightningModule):
         local_files_only: bool = True,
         sr_model: Optional[torch.nn.Module] = None,
         use_sr_latent_cond: bool = True,
+        use_confidence_gate: bool = False,
+        confidence_alpha: float = 0.2,
+        use_temporal_gate: bool = False,
+        control_scale_min: float = 0.3,
+        control_scale_max: float = 1.5,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["sr_model"])
@@ -103,6 +108,11 @@ class SD2RefGenerator(LightningModule):
         self.normalize_input = normalize_input
         self.sr_model = sr_model
         self.use_sr_latent_cond = use_sr_latent_cond
+        self.use_confidence_gate = use_confidence_gate
+        self.confidence_alpha = confidence_alpha
+        self.use_temporal_gate = use_temporal_gate
+        self.control_scale_min = control_scale_min
+        self.control_scale_max = control_scale_max
 
         # ═══════════════════════════════════════
         #  VAE（冻结）
@@ -324,17 +334,37 @@ class SD2RefGenerator(LightningModule):
     # ═══════════════════════════════════════════════════════
 
     def build_down_intrablock(
-        self, ref_feats: List[torch.Tensor], latent_h: int, latent_w: int
+        self,
+        ref_feats: List[torch.Tensor],
+        latent_h: int,
+        latent_w: int,
+        t: Optional[torch.Tensor] = None,
+        cos_maps: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
         f320, f640, f1280 = ref_feats
-
         h0, w0 = latent_h, latent_w
         h1, w1 = _half_resolution(h0, w0)
         h2, w2 = _half_resolution(h1, w1)
         h3, w3 = _half_resolution(h2, w2)
-
         target_sizes = [(h0, w0), (h1, w1), (h2, w2), (h3, w3)]
         feats = [f320, f640, f1280, f1280]
+
+        # ── 方案B：时序门控 ──
+        if self.use_temporal_gate and t is not None:
+            t_ratio = 1.0 - t.float().mean().item() / self.t_max
+            scale = (
+                self.control_scale_min
+                + (self.control_scale_max - self.control_scale_min) * t_ratio
+            )
+        else:
+            scale = self.control_scale
+
+        # ── 方案A：置信门控（取 scale1 的 cos_map）──
+        conf = None
+        if self.use_confidence_gate and cos_maps is not None and len(cos_maps) > 0:
+            conf = cos_maps[0]  # (B, 1, H_conf, W_conf) 或 (B, heads, H, W)
+            if conf.dim() == 4 and conf.shape[1] > 1:
+                conf = conf.mean(dim=1, keepdim=True)
 
         residuals = []
         for feat, (th, tw) in zip(feats, target_sizes):
@@ -342,7 +372,16 @@ class SD2RefGenerator(LightningModule):
                 feat = F.interpolate(
                     feat, size=(th, tw), mode="bilinear", align_corners=False
                 )
-            residuals.append(feat * self.control_scale)
+            gated = feat * scale
+            if conf is not None:
+                conf_resized = F.interpolate(
+                    conf, size=(th, tw), mode="bilinear", align_corners=False
+                )
+                gate = (
+                    self.confidence_alpha + (1.0 - self.confidence_alpha) * conf_resized
+                )
+                gated = gated * gate
+            residuals.append(gated)
         return residuals
 
     # ═══════════════════════════════════════════════════════
@@ -360,7 +399,12 @@ class SD2RefGenerator(LightningModule):
         bsz = x_input.shape[0]
         ref_input = ref if ref_input is None else ref_input
 
-        ref_feats = self.adapter(lr, ref_input)
+        # ── 方案A：获取置信图 ──
+        if self.use_confidence_gate:
+            ref_feats, cos_maps = self.adapter(lr, ref_input, return_cos_sim_map=True)
+        else:
+            ref_feats = self.adapter(lr, ref_input)
+            cos_maps = None
 
         sem_tokens = None
         if self.use_semantic:
@@ -368,12 +412,11 @@ class SD2RefGenerator(LightningModule):
             # proj 和 semantic_pyramid 需要梯度，不能包裹 no_grad
             sem_pyramid = self.global_semantic(ref_input)
             sem_tokens = self.build_sem_tokens(sem_pyramid)
-
         context = self.build_context(bsz, sem_tokens)
-
         _, _, latent_h, latent_w = x_input.shape
-        down_intrablock = self.build_down_intrablock(ref_feats, latent_h, latent_w)
-
+        down_intrablock = self.build_down_intrablock(
+            ref_feats, latent_h, latent_w, t=t, cos_maps=cos_maps
+        )
         return self.unet(
             x_input,
             t,

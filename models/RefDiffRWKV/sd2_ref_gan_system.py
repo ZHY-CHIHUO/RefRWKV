@@ -59,6 +59,8 @@ class SD2RefGANSystem(LightningModule):
         grad_warn_threshold: float = 100.0,
         max_consecutive_nan: int = 10,
         gan_enabled: bool = False,
+        use_swap_test: bool = False,
+        swap_ratio: float = 0.5,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["generator", "discriminator", "sr_model"])
@@ -88,6 +90,9 @@ class SD2RefGANSystem(LightningModule):
         self.sr_lr = sr_lr
 
         self.gan_enabled = gan_enabled and discriminator is not None
+
+        self.use_swap_test = use_swap_test
+        self.swap_ratio = swap_ratio
 
         self._nan_g_count = 0
         self._nan_d_count = 0
@@ -226,21 +231,22 @@ class SD2RefGANSystem(LightningModule):
         latent_h, latent_w = sr_latent_precomputed.shape[2:]
         bsz = lr.shape[0]
 
-        ref_feats = self.generator.adapter(lr, ref)
+        if self.generator.use_confidence_gate:
+            ref_feats, cos_maps = self.generator.adapter(
+                lr, ref, return_cos_sim_map=True
+            )
+        else:
+            ref_feats = self.generator.adapter(lr, ref)
+            cos_maps = None
 
         sem_tokens = None
         if self.generator.use_semantic:
-            # DINOv2 前向在 GlobalSemanticModule.forward 内部已有 no_grad 保护
-            # proj 和 semantic_pyramid 需要梯度
             sem_pyramid = self.generator.global_semantic(ref)
             sem_tokens = self.generator.build_sem_tokens(sem_pyramid)
-
         context = self.generator.build_context(bsz, sem_tokens)
-
         down_intrablock = self.generator.build_down_intrablock(
-            ref_feats, latent_h, latent_w
+            ref_feats, latent_h, latent_w, t=t, cos_maps=cos_maps
         )
-
         return self._pred_x0_base(
             latent=sr_latent_precomputed,
             sr_latent_cond=sr_latent_precomputed.detach(),
@@ -927,9 +933,18 @@ class SD2RefGANSystem(LightningModule):
             and self.discriminator.use_texture_d
             and d_tex_opt is not None
         ):
+            # ── 方案C：Swap Test ──
+            if self.use_swap_test and bsz > 1:
+                n_swap = int(bsz * self.swap_ratio)
+                ref_for_d = ref.clone()
+                if n_swap > 0:
+                    ref_for_d[-n_swap:] = torch.roll(ref[-n_swap:], shifts=1, dims=0)
+            else:
+                ref_for_d = ref
+
             with torch.amp.autocast(self.device.type, enabled=False):
                 loss_d_tex = self.discriminator.compute_d_loss(
-                    real, fake, ref=ref, lambda_semantic=0.0, lambda_texture=1.0
+                    real, fake, ref=ref_for_d, lambda_semantic=0.0, lambda_texture=1.0
                 )
 
             if not torch.isnan(loss_d_tex) and not torch.isinf(loss_d_tex):
