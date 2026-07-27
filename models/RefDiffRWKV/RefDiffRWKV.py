@@ -244,7 +244,7 @@ class RWKVBlock(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SR 自相似纹理迁移模块
+# SR 自相似纹理迁移模块（决策链闭环版）
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -332,7 +332,10 @@ class RefDiffRWKV(nn.Module):
         3. scale2：融合特征整体过 SelfSimTransfer（输出喂给下一尺度）
         4. scale3：LCA 与 Mask 两个分支各自独立过 SelfSimTransfer，
            保持分支差异，避免 sr_cond2 信息重复
-        5. 最终输出单尺度特征图 (B, out_channel, H/8, W/8)
+        5. 返回三元组 (feats, cos_maps, raw_cos_maps)：
+           cos_maps 为传播后置信（注入门控用），
+           raw_cos_maps 为传播前局部置信（D_tex 加权用）。
+           use_self_sim_transfer=False 时两者相同。
 
     空间分辨率（以 Ref 480x480, patch_size=4 为例）：
         scale1: 120x120
@@ -515,6 +518,7 @@ class RefDiffRWKV(nn.Module):
 
         # 用于收集返回的 map
         cos_maps = []
+        raw_cos_maps = []  # 传播前局部置信（D_tex 加权用），与 cos_maps 索引对齐
         learned_maps = []
 
         # ===================== Scale 1: H/4 =====================
@@ -532,6 +536,7 @@ class RefDiffRWKV(nn.Module):
         )
         if cos_map1 is not None:
             cos_maps.append(cos_map1)
+            raw_cos_maps.append(cos_map1)  # scale1 无传播，raw 即自身
         if learned_map1 is not None:
             learned_maps.append(learned_map1)
 
@@ -564,6 +569,7 @@ class RefDiffRWKV(nn.Module):
         sr_fused = sr_cond1 + sr_cond2
 
         # ── SR 自相似迁移（scale2，融合特征整体传播）──
+        raw_cos_map2 = cos_map2  # 保存传播前的局部置信
         if self.use_self_sim_transfer:
             sr_fused, conf_prop2 = self.sim_transfer2(
                 sr_feat, sr_fused, conf_map=cos_map2
@@ -573,6 +579,7 @@ class RefDiffRWKV(nn.Module):
 
         if cos_map2 is not None:
             cos_maps.append(cos_map2)
+            raw_cos_maps.append(raw_cos_map2)
         if learned_map2 is not None:
             learned_maps.append(learned_map2)
 
@@ -596,6 +603,7 @@ class RefDiffRWKV(nn.Module):
         # ── SR 自相似迁移（scale3，分分支传播）──
         # LCA 与 Mask 各自独立传播，保持分支差异：
         # 避免 cat([sr_fused, sr_cond2]) 导致 sr_cond2 信息被重复计入
+        raw_cos_map3 = cos_map3  # 保存传播前的局部置信
         if self.use_self_sim_transfer:
             sr_cond1, conf_prop3 = self.sim_transfer3_lca(
                 sr_feat, sr_cond1, conf_map=cos_map3
@@ -606,6 +614,7 @@ class RefDiffRWKV(nn.Module):
 
         if cos_map3 is not None:
             cos_maps.append(cos_map3)
+            raw_cos_maps.append(raw_cos_map3)
         if learned_map3 is not None:
             learned_maps.append(learned_map3)
 
@@ -617,7 +626,8 @@ class RefDiffRWKV(nn.Module):
         if not return_cos_sim_map and not return_learned_sim_map:
             return out
         elif return_cos_sim_map:
-            return out, cos_maps
+            # 三元组：feats, 传播后置信（门控用）, 传播前局部置信（D_tex 加权用）
+            return out, cos_maps, raw_cos_maps
         elif return_learned_sim_map:
             return out, learned_maps
         else:
@@ -699,9 +709,15 @@ if __name__ == "__main__":
     Ref = torch.randn(B, 3, 480, 480).to(device)
 
     with torch.no_grad():
-        out, cos_maps = model(LR, Ref, return_cos_sim_map=True)
+        # 三元组解包
+        out, cos_maps, raw_maps = model(LR, Ref, return_cos_sim_map=True)
     print(f"Input:  LR={LR.shape}, Ref={Ref.shape}")
     print(f"Output: {out.shape}")
-    print(f"cos_maps: {[m.shape for m in cos_maps]}")
+    print(f"cos_maps (prop): {[m.shape for m in cos_maps]}")
+    print(f"raw_maps:        {[m.shape for m in raw_maps]}")
+    # 验证 raw 和 prop 不是同一份（传播改变了数值）
+    if len(cos_maps) > 1 and len(raw_maps) > 1:
+        diff = (cos_maps[1] - raw_maps[1]).abs().max().item()
+        print(f"scale2 prop vs raw max diff: {diff:.4f} (应 > 0)")
     print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Breakdown: {model.get_parameter_count()}")
