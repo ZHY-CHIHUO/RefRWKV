@@ -1,6 +1,18 @@
 """
 sd2_ref_discriminator.py — 双判别器：语义 D + 纹理一致性 D
 与 SD2RefGenerator 分离，独立 LightningModule
+
+本版变更（D_tex 置信加权，Phase2 专用）：
+1. TextureConsistencyDiscriminator.forward 新增 weight 参数：
+   用局部匹配置信图（raw cos_map，传播前）对各尺度特征差做
+   加权平均池化——只在 ref 局部可信的区域强制"生成图纹理与 ref 一致"，
+   匹配失败区（借来的纹理 / 脑补区）不执法，避免强迫 G 复制错误状态。
+2. weight 语义是 conf 而非 (1-conf)：高 conf = 局部 ref 纹理被注入 =
+   需要 D_tex 监督；低 conf = 纹理来自别处或扩散先验 = D_tex 应放手。
+3. 采用加权平均池化（除以权重和）而非先乘权再全局均值，
+   避免 logit 尺度随可信面积占比漂移；权重全零时 logit=bias、
+   G 侧梯度为 0，自动实现"无可信区域则不执法"。
+4. weight=None（默认）时行为与旧版完全一致，向后兼容。
 """
 
 import logging
@@ -251,11 +263,30 @@ class ImageConvNextDiscriminator(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  TextureConsistencyDiscriminator（纹理一致性判别器）
+#  TextureConsistencyDiscriminator（纹理一致性判别器，置信加权版）
 # ══════════════════════════════════════════════════════════════
 
 
 class TextureConsistencyDiscriminator(nn.Module):
+    """纹理一致性判别器：比较生成图与 ref 的多尺度特征差。
+
+    weight 语义（重要）：
+        weight 是局部匹配置信图（raw cos_map，传播前），取 scale2 的
+        (B, 1, 60, 60)。高 conf 区域 = 局部 ref 纹理被注入生成图，
+        D_tex 在此执法（强制纹理一致）；低 conf 区域 = 纹理借自别处
+        或由扩散先验脑补，与局部 ref 比较是错靶，D_tex 不执法。
+
+        必须用 raw（传播前）而非传播后的 conf_prop：传播后的高 conf
+        表示"纹理借自其他位置"，与局部 ref 比较同样是错靶。
+
+    池化方式：
+        加权平均池化 pooled = Σ(h·w) / Σw，而非先乘权再全局均值——
+        后者会让 logit 尺度随可信面积占比漂移（10% 可信 vs 90% 可信
+        的样本 logit 差 9 倍），判别强度不应由内容占比决定。
+        权重全零时分母 clamp 到 1，pooled=0，logit=bias，
+        G 侧梯度恒为 0：无可信区域时 D_tex 完全不执法。
+    """
+
     check_input_finite: bool = True
 
     def __init__(self, in_ch=3, base_ch=48, num_scales=4, use_spectral=True):
@@ -301,7 +332,18 @@ class TextureConsistencyDiscriminator(nn.Module):
             feats.append(x)
         return feats
 
-    def forward(self, image, ref):
+    def forward(self, image, ref, weight=None):
+        """
+        Args:
+            image:  (B, 3, H, W) 生成图 / 真图，值域 [-1, 1]
+            ref:    (B, 3, H, W) 参考图
+            weight: (B, 1, h, w) 可选，局部匹配置信（raw cos_map）。
+                    None 时退化为旧版全局平均池化行为。
+
+        Returns:
+            weighted:          (B, 1) 加权融合后的 logit，clamp 到 [-5, 5]
+            per_scale_logits:  各尺度 logit（detach，供监控）
+        """
         if self.check_input_finite and (
             torch.isnan(image).any() or torch.isinf(image).any()
         ):
@@ -319,9 +361,30 @@ class TextureConsistencyDiscriminator(nn.Module):
         feats_image = self._extract_features(image)
         feats_ref = self._extract_features(ref)
 
+        # 权重预处理：detach 作门控信号，不回传梯度
+        if weight is not None:
+            weight = weight.detach().float().clamp(0.0, 1.0)
+            if weight.dim() == 3:
+                weight = weight.unsqueeze(1)
+
         per_scale_logits = []
         for i, head in enumerate(self.scale_heads):
-            per_scale_logits.append(head(torch.abs(feats_image[i] - feats_ref[i])))
+            diff = torch.abs(feats_image[i] - feats_ref[i])
+            conv_part, out_linear = head[:-3], head[-1]
+            h = conv_part(diff)  # (B, ch//4, h, w)
+
+            if weight is None:
+                # 旧行为：全局平均池化
+                pooled = h.mean(dim=(-2, -1))
+            else:
+                w = F.interpolate(
+                    weight, size=h.shape[-2:], mode="bilinear", align_corners=False
+                )
+                # 加权平均池化；全零时 pooled=0 → logit=bias → G 梯度为 0
+                denom = w.sum(dim=(-2, -1)).clamp(min=1.0)
+                pooled = (h * w).sum(dim=(-2, -1)) / denom
+
+            per_scale_logits.append(out_linear(pooled))
 
         weights = torch.softmax(self.scale_weights, dim=0)
         logits_stacked = torch.stack(per_scale_logits, dim=0)
@@ -337,7 +400,14 @@ class TextureConsistencyDiscriminator(nn.Module):
 
 
 class SD2RefDiscriminator(LightningModule):
-    """双判别器封装：语义 D + 纹理 D"""
+    """双判别器封装：语义 D + 纹理 D
+
+    tex_weight 透传约定：
+        compute_g_loss / compute_d_loss / forward 均接受可选 tex_weight
+        （raw cos_map scale2，(B,1,60,60)），仅作用于 D_tex；
+        D_sem 不加权——"是否像真实遥感图"是全局判断，脑补区也必须像真图。
+        默认 None = 旧行为，完全向后兼容。
+    """
 
     def __init__(
         self,
@@ -404,7 +474,14 @@ class SD2RefDiscriminator(LightningModule):
                     f"Input tensor {i} contains NaN/Inf: min={t.min().item()}, max={t.max().item()}"
                 )
 
-    def compute_g_loss(self, fake, ref=None, lambda_semantic=1.0, lambda_texture=1.0):
+    def compute_g_loss(
+        self,
+        fake,
+        ref=None,
+        lambda_semantic=1.0,
+        lambda_texture=1.0,
+        tex_weight=None,
+    ):
         self._validate_inputs(fake, ref)
         loss = self._zero_loss(fake)
         with torch.amp.autocast(self.device.type, enabled=False):
@@ -416,12 +493,18 @@ class SD2RefDiscriminator(LightningModule):
                 )
             if self.use_texture_d and lambda_texture > 0 and ref is not None:
                 ref_d = ref.detach().float()
-                fake_logit, _ = self.D_tex(fake.float(), ref_d)
+                fake_logit, _ = self.D_tex(fake.float(), ref_d, weight=tex_weight)
                 loss = loss + lambda_texture * (-fake_logit.mean())
         return loss
 
     def compute_d_loss(
-        self, real, fake, ref=None, lambda_semantic=1.0, lambda_texture=1.0
+        self,
+        real,
+        fake,
+        ref=None,
+        lambda_semantic=1.0,
+        lambda_texture=1.0,
+        tex_weight=None,
     ):
         self._validate_inputs(real, fake, ref)
         real, fake = real.detach(), fake.detach()
@@ -436,14 +519,14 @@ class SD2RefDiscriminator(LightningModule):
                 )
             if self.use_texture_d and lambda_texture > 0 and ref is not None:
                 ref_f = ref.float()  # 缓存避免重复转换
-                real_logit, _ = self.D_tex(real.float(), ref_f)
-                fake_logit, _ = self.D_tex(fake.float(), ref_f)
+                real_logit, _ = self.D_tex(real.float(), ref_f, weight=tex_weight)
+                fake_logit, _ = self.D_tex(fake.float(), ref_f, weight=tex_weight)
                 loss = loss + lambda_texture * (
                     F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()
                 )
         return loss
 
-    def forward(self, real, fake, ref=None, mode="both"):
+    def forward(self, real, fake, ref=None, mode="both", tex_weight=None):
         self._validate_inputs(real, fake, ref)
         real_d, fake_d = real.detach(), fake.detach()
         ref_d = ref.detach() if ref is not None else None
@@ -462,13 +545,15 @@ class SD2RefDiscriminator(LightningModule):
                 log_dict["loss_D_sem"] = l_sem.detach()
             if mode in ("both", "texture") and self.use_texture_d and ref_d is not None:
                 ref_f = ref_d.float()
-                real_logit, _ = self.D_tex(r, ref_f)
-                fake_logit, _ = self.D_tex(f, ref_f)
+                real_logit, _ = self.D_tex(r, ref_f, weight=tex_weight)
+                fake_logit, _ = self.D_tex(f, ref_f, weight=tex_weight)
                 l_tex = (
                     F.relu(1.0 - real_logit).mean() + F.relu(1.0 + fake_logit).mean()
                 )
                 loss_D = loss_D + l_tex
                 log_dict["loss_D_tex"] = l_tex.detach()
+                if tex_weight is not None:
+                    log_dict["D_tex_conf"] = tex_weight.detach().float().mean()
 
         log_dict["loss_D_total"] = loss_D.detach()
         return loss_D, log_dict
@@ -530,6 +615,7 @@ if __name__ == "__main__":
     real = torch.randn(B, B3, 480, 480, device=device)
     fake = torch.randn(B, B3, 480, 480, device=device)
     ref = torch.randn(B, B3, 480, 480, device=device)
+
     print("D loss:", model.compute_d_loss(real, fake, ref=ref).item())
     print("G loss:", model.compute_g_loss(fake, ref=ref).item())
     loss, logs = model(real, fake, ref=ref, mode="both")
@@ -537,3 +623,36 @@ if __name__ == "__main__":
     print("logs:", {k: v.item() for k, v in logs.items()})
     loss.backward()
     print("backward ok")
+
+    # ── 置信加权语义验证 ──
+    print("\n--- tex_weight 语义验证 ---")
+    D_tex = model.D_tex
+
+    # 1. 全 1 权重必须等于旧行为（weight=None）
+    w_ones = torch.ones(B, 1, 60, 60, device=device)
+    l_old, _ = D_tex(fake, ref)
+    l_new, _ = D_tex(fake, ref, weight=w_ones)
+    diff = (l_old - l_new).abs().max().item()
+    print(f"全1权重 vs 旧行为 最大差异: {diff:.2e} (应 < 1e-5)")
+    assert diff < 1e-5, "全1权重不等于旧行为！"
+
+    # 2. 全 0 权重：G 侧梯度必须为 0（无可信区 → 完全不执法）
+    w_zero = torch.zeros(B, 1, 60, 60, device=device)
+    fake_g = fake.clone().requires_grad_(True)
+    l_zero, _ = D_tex(fake_g, ref, weight=w_zero)
+    g = torch.autograd.grad(l_zero.sum(), fake_g, retain_graph=True)[0]
+    gmax = g.abs().max().item()
+    print(f"全0权重 G 侧梯度最大值: {gmax:.2e} (应 < 1e-8)")
+    assert gmax < 1e-8, "全0权重下 G 仍有梯度！"
+
+    # 3. 半张图可信：logit 应介于全 0 与全 1 之间（尺度不漂移）
+    w_half = torch.zeros(B, 1, 60, 60, device=device)
+    w_half[:, :, :30] = 1.0
+    l_half, _ = D_tex(fake, ref, weight=w_half)
+    print(
+        f"全0: {l_zero.mean().item():.4f}, "
+        f"半图: {l_half.mean().item():.4f}, "
+        f"全1: {l_new.mean().item():.4f}"
+    )
+
+    print("✅ tex_weight 语义验证通过")

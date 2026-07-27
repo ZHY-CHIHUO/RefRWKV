@@ -7,6 +7,19 @@ sd2_ref_generator.py — SD2 Ref-guided Generator (latent ε-prediction)
    (down_intrablock_additional_residuals)，无需自定义 UNet；
 3. 借鉴 ControlLDM 的 get_input / p_losses / sample_log / log_images 接口。
 4. UNet conv_in 扩展为 8 通道：前 4 为 noisy_latent，后 4 为 sr_latent（条件）。
+
+本版变更（对接决策链）：
+1. 新增 use_sr_condition：透传给 GlobalSemanticModule，启用 SR latent
+   条件分支（语义金字塔同时看到 ref 与 SR 已重建的结构）。
+2. apply_model 从 x_input 后 4 通道切出 sr_latent_cond 喂给语义模块，
+   无需改签名，Phase1 forward / Phase2 _adapter_pred_x0 / 推理
+   _denoise_step 三条路径自动覆盖。
+3. 置信门控改用 scale2 的 cos_map：scale1 窗口大、cos 全图 ~0.92
+   无区分度（已实测）；scale2 窗口 4×4、range 0.40~0.55，有真实
+   匹配信息。门控用传播后置信（借来的区域要放行）。
+4. adapter 输出解包兼容三元组 (feats, cos_maps, raw_cos_maps)：
+   raw_cos_maps（传播前局部置信）供 gan_system 的 D_tex 加权使用，
+   通过 _unpack_adapter_out 静态方法复用。
 """
 
 import os
@@ -88,8 +101,9 @@ class SD2RefGenerator(LightningModule):
         local_files_only: bool = True,
         sr_model: Optional[torch.nn.Module] = None,
         use_sr_latent_cond: bool = True,
+        use_sr_condition: bool = False,
         use_confidence_gate: bool = False,
-        confidence_alpha: float = 0.2,
+        confidence_alpha: float = 0.4,
         use_temporal_gate: bool = False,
         control_scale_min: float = 0.3,
         control_scale_max: float = 1.5,
@@ -108,7 +122,10 @@ class SD2RefGenerator(LightningModule):
         self.normalize_input = normalize_input
         self.sr_model = sr_model
         self.use_sr_latent_cond = use_sr_latent_cond
+        self.use_sr_condition = use_sr_condition
         self.use_confidence_gate = use_confidence_gate
+        # 注：adapter 内部 SelfSimTransfer 已做 conf 加权（决策链闭环），
+        # 此处残差级门控为第二道，alpha 默认 0.4（原 0.2）以减弱二次压制
         self.confidence_alpha = confidence_alpha
         self.use_temporal_gate = use_temporal_gate
         self.control_scale_min = control_scale_min
@@ -157,11 +174,14 @@ class SD2RefGenerator(LightningModule):
         self.adapter = SD2_RefAdapter(strategy=strategy, rwkv_cfg=rwkv_cfg)
 
         # ═══════════════════════════════════════
-        #  DINOv2 语义路径（冻结）
+        #  DINOv2 语义路径（DINOv2 冻结，proj/pyramid 可训练）
         # ═══════════════════════════════════════
         self.use_semantic = use_semantic and (GlobalSemanticModule is not None)
         self.global_semantic = (
-            GlobalSemanticModule(dinov2_model_name=dinov2_model_name)
+            GlobalSemanticModule(
+                dinov2_model_name=dinov2_model_name,
+                use_sr_condition=use_sr_condition,
+            )
             if self.use_semantic
             else None
         )
@@ -291,6 +311,30 @@ class SD2RefGenerator(LightningModule):
         return self.vae.decode(z / self.vae_scale_factor).sample
 
     # ═══════════════════════════════════════════════════════
+    #  Adapter 输出解包（供 apply_model 与 gan_system 复用）
+    # ═══════════════════════════════════════════════════════
+
+    @staticmethod
+    def _unpack_adapter_out(out):
+        """解包 adapter 输出为 (feats, cos_maps, raw_cos_maps)。
+
+        兼容两种返回约定：
+          - (feats, cos_maps)                旧版 / 无 raw 分支
+          - (feats, cos_maps, raw_cos_maps)  SelfSimTransfer 版
+        非元组（仅 feats）时两个 map 均为 None。
+
+        cos_maps:     传播后置信（借来的区域被放行），用于注入门控
+        raw_cos_maps: 传播前置信（局部 LCA 匹配），用于 D_tex 加权；
+                      旧版无此分支时回退为 cos_maps（语义等价）
+        """
+        if isinstance(out, tuple):
+            if len(out) >= 3:
+                return out[0], out[1], out[2]
+            if len(out) == 2:
+                return out[0], out[1], out[1]
+        return out, None, None
+
+    # ═══════════════════════════════════════════════════════
     #  语义 token 构建
     # ═══════════════════════════════════════════════════════
 
@@ -359,10 +403,13 @@ class SD2RefGenerator(LightningModule):
         else:
             scale = self.control_scale
 
-        # ── 方案A：置信门控（取 scale1 的 cos_map）──
+        # ── 方案A：置信门控（取 scale2 的 cos_map）──
+        # scale1 (120×120, 窗口 8×8) cos 全图 ~0.92 无区分度（已实测）；
+        # scale2 (60×60, 窗口 4×4) range 0.40~0.55，有真实匹配信息，
+        # 且分辨率与 latent 最大尺度对齐，插值失真最小。
         conf = None
         if self.use_confidence_gate and cos_maps is not None and len(cos_maps) > 0:
-            conf = cos_maps[0]  # (B, 1, H_conf, W_conf) 或 (B, heads, H, W)
+            conf = cos_maps[1] if len(cos_maps) > 1 else cos_maps[0]
             if conf.dim() == 4 and conf.shape[1] > 1:
                 conf = conf.mean(dim=1, keepdim=True)
 
@@ -399,18 +446,25 @@ class SD2RefGenerator(LightningModule):
         bsz = x_input.shape[0]
         ref_input = ref if ref_input is None else ref_input
 
-        # ── 方案A：获取置信图 ──
+        # ── 方案A：获取置信图（传播后置信，用于注入门控）──
         if self.use_confidence_gate:
-            ref_feats, cos_maps = self.adapter(lr, ref_input, return_cos_sim_map=True)
+            adapter_out = self.adapter(lr, ref_input, return_cos_sim_map=True)
+            ref_feats, cos_maps, _ = self._unpack_adapter_out(adapter_out)
+            # raw_cos_maps（第三个返回值）在此丢弃：
+            # 它由 gan_system._adapter_pred_x0 直接调 adapter 取用（D_tex 加权）
         else:
             ref_feats = self.adapter(lr, ref_input)
             cos_maps = None
 
         sem_tokens = None
         if self.use_semantic:
+            # x_input = concat(x_t, sr_latent_cond)，后 4 通道即 SR 条件；
+            # sr_latent_cond=None 时 concat_sr_latent 拼的是全零，
+            # 经 SRLatentConditioner 后等价于固定偏置（无条件），行为可控
+            sr_latent_cond = x_input[:, 4:] if x_input.shape[1] == 8 else None
             # DINOv2 前向在 GlobalSemanticModule.forward 内部已有 no_grad 保护
             # proj 和 semantic_pyramid 需要梯度，不能包裹 no_grad
-            sem_pyramid = self.global_semantic(ref_input)
+            sem_pyramid = self.global_semantic(ref_input, sr_latent=sr_latent_cond)
             sem_tokens = self.build_sem_tokens(sem_pyramid)
         context = self.build_context(bsz, sem_tokens)
         _, _, latent_h, latent_w = x_input.shape

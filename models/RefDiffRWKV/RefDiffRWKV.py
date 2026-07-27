@@ -249,95 +249,77 @@ class RWKVBlock(nn.Module):
 
 
 class SelfSimTransfer(nn.Module):
-    """SR 自相似性纹理迁移模块。
+    """SR 自相似性纹理迁移模块（决策链闭环版）。
 
-    核心先验（来自任务本质）：
-        SR 上相似的区域，HR 上也相似 —— 它们应当共享来自 ref 的纹理。
-        LCA 逐位置独立匹配：若 a 因 SR 模糊匹配失败，但 a≈b（SR 相似）
-        且 b 匹配良好，则 a 应借用 b 的匹配结果。
+    三重决策的显式实现：
+        w = (1-α)·conf_own + α·conf_borrowed
+        - 局部匹配好            → w ≈ conf_own   → 注入自身匹配纹理
+        - 局部匹配差 & 有同伴   → w ≈ α·conf_prop → 注入借来的同类纹理（非局部借）
+        - 局部匹配差 & 无同伴   → w → 0           → 残差趋零，交还扩散先验（脑补）
 
-    机制：
-        1. 用 SR 特征计算自相似亲和矩阵 A（余弦相似）
-        2. 自亲和置零：自身贡献由 (1-α) 分支完整保留，
-           传播分支 α·(A·fused) 只负责"借同伴的"，语义清晰分离
-        3. topk 稀疏化：每个位置只向最相似的 k 个位置借，
-           避免稠密传播退化为全局模糊（已验证：topk=0 会把 cos_map
-           的区分度从 0.148 抹平到 0.0038，topk=8 保留 86%）
-        4. 同一个 A 传播匹配置信图（cos_map），供下游置信门控使用
-
-    注意：
-        topk 的 scatter 梯度只能经选中值回传，未选位置梯度为零。
-        topk>0 为推荐配置；topk=0 保留为消融对照。
+    与上一版的差异：norm 之后乘以 w。
+    顺序很关键——GroupNorm 的统计量按组全局计算，先 norm 再乘 w
+    才能让被压制位置真正趋零；反过来先乘 w 再 norm，
+    近零位置会被归一化拉成组内常数向量，压制失效。
     """
 
-    def __init__(self, dim: int, topk: int = 8, init_alpha: float = 0.3):
+    def __init__(
+        self, dim: int, topk: int = 8, init_alpha: float = 0.3, conf_gated: bool = True
+    ):
         super().__init__()
         self.dim = dim
         self.topk = topk
-        # sigmoid(-0.85) ≈ 0.30；训练初期以原始匹配为主，传播为辅
+        self.conf_gated = conf_gated
         init_logit = float(np.log(init_alpha / (1.0 - init_alpha)))
         self.gate = nn.Parameter(torch.tensor(init_logit))
-        # 亲和矩阵计算前的特征变换（可学习，让模型决定"用什么度量相似"）
         self.aff_proj = nn.Conv2d(dim, dim, 1, bias=False)
         self.norm = nn.GroupNorm(min(8, dim // 4), dim)
 
     def _build_affinity(self, sr_feat: torch.Tensor) -> torch.Tensor:
-        """SR 自相似亲和矩阵。
-
-        Args:
-            sr_feat: (B, C, H, W) SR 分支特征
-
-        Returns:
-            (B, N, N) 行归一化亲和矩阵，N=H*W
-        """
         B, C, H, W = sr_feat.shape
         f = self.aff_proj(sr_feat.float())
-        f = F.normalize(f.flatten(2), dim=1)  # (B, C, N)
-        aff = torch.bmm(f.transpose(1, 2), f)  # (B, N, N) ∈ [-1, 1]
+        f = F.normalize(f.flatten(2), dim=1)
+        aff = torch.bmm(f.transpose(1, 2), f)
 
-        # 1) 自亲和置零：强制"只向别人借"，自身贡献由 (1-α) 分支保留
         idx = torch.arange(aff.shape[1], device=aff.device)
         aff[:, idx, idx] = 0.0
 
-        # 2) topk 稀疏化：只向最相似的 k 个位置借
         if self.topk > 0:
             v, i = aff.topk(self.topk, dim=-1)
             aff = torch.zeros_like(aff).scatter(-1, i, v)
 
-        aff = aff.clamp(min=0)  # 只借不减
+        aff = aff.clamp(min=0)
         aff = aff / aff.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         return aff
 
     def forward(self, sr_feat, fused_feat, conf_map=None):
-        """
-        Args:
-            sr_feat:    (B, C, H, W) SR 分支特征（计算自相似性）
-            fused_feat: (B, C, H, W) 被传播的特征（LCA/Mask 分支或融合特征）
-            conf_map:   (B, 1, H, W) 可选，LCA 匹配置信图
-
-        Returns:
-            out:       (B, C, H, W) 传播后的特征
-            conf_prop: (B, 1, H, W) 或 None，传播后的置信图
-        """
         B, C, H, W = fused_feat.shape
         aff = self._build_affinity(sr_feat)
 
-        m = fused_feat.float().flatten(2).transpose(1, 2)  # (B, N, C)
-        m_prop = torch.bmm(aff, m)  # (B, N, C)
-        m_prop = m_prop.transpose(1, 2).reshape(B, C, H, W)
+        m = fused_feat.float().flatten(2).transpose(1, 2)
+        m_prop = torch.bmm(aff, m).transpose(1, 2).reshape(B, C, H, W)
 
         alpha = torch.sigmoid(self.gate)
         out = (1.0 - alpha) * fused_feat.float() + alpha * m_prop
-        out = self.norm(out).to(fused_feat.dtype)
+        out = self.norm(out)  # 先归一化：统计量来自真实内容
 
         conf_prop = None
         if conf_map is not None:
-            c = conf_map.float().flatten(2).transpose(1, 2)  # (B, N, 1)
-            conf_prop = torch.bmm(aff, c)
-            conf_prop = conf_prop.transpose(1, 2).reshape(B, 1, H, W)
+            conf = conf_map.detach().float()  # detach：作为门控信号，不回传梯度
+            c = conf.flatten(2).transpose(1, 2)
+            conf_prop = torch.bmm(aff, c).transpose(1, 2).reshape(B, 1, H, W)
+
+            if self.conf_gated:
+                # ── 决策链闭环 ──
+                # 自身支路按 own conf 压制（局部拒绝）
+                # 传播支路按同伴 conf 加权（非局部借）
+                # 两者都低 → w→0（先验脑补）
+                w = (1.0 - alpha) * conf + alpha * conf_prop
+                out = out * w
+
             conf_prop = conf_prop.to(conf_map.dtype)
 
-        return out, conf_prop
+        return out.to(fused_feat.dtype), conf_prop
 
 
 class RefDiffRWKV(nn.Module):

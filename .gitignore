@@ -21,7 +21,7 @@ checkpoints/
 logs/
 
 # ===== 配置 & 脚本 (按需隐藏) =====
-configs/
+# configs/
 scripts/
 
 # ===== 结果文件 (按需保留，如果不需要可取消注释) =====

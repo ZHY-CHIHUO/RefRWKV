@@ -111,9 +111,9 @@ class DiffAdapterBase(nn.Module):
             cond_list.append(x)  # 每个 stage 结束后再收集
 
         if isinstance(res, tuple) and len(res) > 1:
-            return cond_list, res[1:]
+            extra = res[1]  # cos_maps 本体（list），不是 (list,) 元组
+            return cond_list, extra
         return cond_list
-
 
 
 class _DualBranch(nn.Module):
@@ -159,7 +159,6 @@ class _DualBranch(nn.Module):
             feats.append(x)  # 每个 stage 结束后再收集
 
         return feats
-
 
 
 class _DualAdapterImpl(nn.Module):
@@ -254,6 +253,10 @@ class SD2_RefAdapter(nn.Module):
                     "patch_size": cfg.get("patch_size", 4),
                     "embed_dim": cfg.get("embed_dim", 384),
                     "upsample_mode": cfg.get("upsample_mode", "bilinear"),
+                    "ref_size": cfg.get("ref_size", 480),
+                    "use_self_sim_transfer": cfg.get("use_self_sim_transfer", False),
+                    "self_sim_topk": cfg.get("self_sim_topk", 8),
+                    "self_sim_init_alpha": cfg.get("self_sim_init_alpha", 0.3),
                 },
                 channels=channels,
                 nums_rb=kwargs.get("nums_rb", 2),

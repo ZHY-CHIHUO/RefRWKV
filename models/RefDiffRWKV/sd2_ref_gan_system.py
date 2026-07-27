@@ -8,6 +8,24 @@ sd2_ref_gan_system.py — G/D 分离 + 交替训练系统
 4. D step 中用单步 pred_x0 生成 fake/real，更新判别器；
 5. 所有进入判别器的图像统一保持在 [-1, 1] 值域。
 6. 无 adapter 路径复用 generator UNet + 零残差注入，零额外显存开销。
+
+本版变更（决策链接线）：
+1. 新增 dtex_conf_weight 开关（Phase2 专用）：D_tex 按局部匹配置信
+   （raw cos_map scale2，传播前）加权执法——可信区强制纹理一致，
+   借来的/脑补区不执法。weight 在 _adapter_pred_x0 内 detach，
+   作为门控信号不回传梯度。
+2. _adapter_pred_x0 支持 return_conf：通过 generator._unpack_adapter_out
+   解包 adapter 三元组 (feats, cos_maps, raw_cos_maps)，取 raw 的
+   scale2 (B,1,60,60) 作为 conf_dtex 返回。
+3. _adapter_pred_x0 的语义模块补传 sr_latent（SR 条件分支在
+   Phase2 / D step 路径同样生效，与 apply_model 行为对齐）。
+4. load_state_dict 跳过 generator.global_semantic.semantic_pyramid.*
+   —— WKV 扫描公式已从简化版（忽略 k）升级为标准 RWKV4（含 k 与 u），
+   旧金字塔权重语义不兼容，必须随机初始化重训；UNet/LoRA/Adapter/
+   sem_proj 权重不受影响，正常继承。
+5. Swap test 与 tex_weight 的关系：conf_dtex 不随 ref_for_d 交换——
+   conf 标记的是"fake 的哪些区域含有 ref 借来的纹理"，这些区域正是
+   与错误 ref 比对时能暴露不匹配的位置，保持原样即可。
 """
 
 import os
@@ -61,6 +79,7 @@ class SD2RefGANSystem(LightningModule):
         gan_enabled: bool = False,
         use_swap_test: bool = False,
         swap_ratio: float = 0.5,
+        dtex_conf_weight: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["generator", "discriminator", "sr_model"])
@@ -93,6 +112,10 @@ class SD2RefGANSystem(LightningModule):
 
         self.use_swap_test = use_swap_test
         self.swap_ratio = swap_ratio
+
+        # D_tex 置信加权（Phase2 专用；开启后 D_tex 只在 raw cos_map
+        # 高置信的局部匹配区域执法）
+        self.dtex_conf_weight = dtex_conf_weight
 
         self._nan_g_count = 0
         self._nan_d_count = 0
@@ -227,27 +250,48 @@ class SD2RefGANSystem(LightningModule):
     #  有 adapter 路径（G step Phase2 需要梯度穿透到 UNet/Adapter）
     # ═══════════════════════════════════════════════════════
 
-    def _adapter_pred_x0(self, lr, ref, sr_latent_precomputed, t, noise):
+    def _adapter_pred_x0(
+        self, lr, ref, sr_latent_precomputed, t, noise, return_conf: bool = False
+    ):
+        """adapter 路径单步 pred_x0。
+
+        Args:
+            return_conf: True 时额外返回 conf_dtex——raw cos_map 的
+                scale2 (B,1,60,60)，传播前的局部匹配置信，已 detach，
+                供 D_tex 置信加权使用。
+
+        Returns:
+            pred 或 (pred, conf_dtex)
+        """
         latent_h, latent_w = sr_latent_precomputed.shape[2:]
         bsz = lr.shape[0]
 
-        if self.generator.use_confidence_gate:
-            ref_feats, cos_maps = self.generator.adapter(
-                lr, ref, return_cos_sim_map=True
+        # 置信门控需要 cos_maps；D_tex 加权也需要（取 raw 分支）
+        need_cos = self.generator.use_confidence_gate or (
+            self.dtex_conf_weight and return_conf
+        )
+        cos_maps = cos_maps_raw = None
+        if need_cos:
+            adapter_out = self.generator.adapter(lr, ref, return_cos_sim_map=True)
+            ref_feats, cos_maps, cos_maps_raw = self.generator._unpack_adapter_out(
+                adapter_out
             )
         else:
             ref_feats = self.generator.adapter(lr, ref)
-            cos_maps = None
 
         sem_tokens = None
         if self.generator.use_semantic:
-            sem_pyramid = self.generator.global_semantic(ref)
+            # SR 条件分支：与 apply_model 对齐，Phase2/D step 同样让
+            # 语义金字塔看到 SR 已重建的结构（detach 与 UNet 输入一致）
+            sem_pyramid = self.generator.global_semantic(
+                ref, sr_latent=sr_latent_precomputed.detach()
+            )
             sem_tokens = self.generator.build_sem_tokens(sem_pyramid)
         context = self.generator.build_context(bsz, sem_tokens)
         down_intrablock = self.generator.build_down_intrablock(
             ref_feats, latent_h, latent_w, t=t, cos_maps=cos_maps
         )
-        return self._pred_x0_base(
+        pred = self._pred_x0_base(
             latent=sr_latent_precomputed,
             sr_latent_cond=sr_latent_precomputed.detach(),
             t=t,
@@ -255,6 +299,15 @@ class SD2RefGANSystem(LightningModule):
             context=context,
             down_intrablock=down_intrablock,
         )
+
+        if return_conf:
+            conf_dtex = None
+            if cos_maps_raw is not None and len(cos_maps_raw) > 1:
+                # scale2 raw（传播前局部置信，60×60）；
+                # 旧版 adapter 无 raw 分支时 _unpack_adapter_out 已回退为 cos_maps
+                conf_dtex = cos_maps_raw[1].detach().float()
+            return pred, conf_dtex
+        return pred
 
     # ═══════════════════════════════════════════════════════
     #  优化器 / 状态持久化
@@ -393,6 +446,22 @@ class SD2RefGANSystem(LightningModule):
         self._g_steps_since_d = 0
 
     def load_state_dict(self, state_dict, strict=True):
+        # ★ WKV 公式变更：WKV 扫描从简化版（忽略 k）升级为标准 RWKV4
+        # （含 k 加权与 first/u bonus），旧金字塔权重语义不兼容，
+        # 跳过让其随机初始化重训。UNet/LoRA/Adapter/sem_proj/proj
+        # 均不受影响，正常继承。
+        skip_prefix = "generator.global_semantic.semantic_pyramid."
+        skipped = [k for k in state_dict if k.startswith(skip_prefix)]
+        if skipped:
+            logger.info(
+                "跳过 %d 个 semantic_pyramid 权重（WKV 公式变更，随机初始化重训）",
+                len(skipped),
+            )
+            state_dict = {
+                k: v for k, v in state_dict.items() if not k.startswith(skip_prefix)
+            }
+            strict = False
+
         # ★ Phase2 从 Phase1 checkpoint 恢复时，discriminator 权重不存在
         if self.discriminator is not None:
             disc_keys_in_ckpt = [
@@ -409,13 +478,31 @@ class SD2RefGANSystem(LightningModule):
         result = super().load_state_dict(state_dict, strict=strict)
         missing, unexpected = result.missing_keys, result.unexpected_keys
 
-        # 只警告非 discriminator 的缺失 key
+        # 只警告非 discriminator / 非预期新增的缺失 key
         if missing:
-            non_disc = [k for k in missing if not k.startswith("discriminator.")]
+            expected_new = ("semantic_pyramid", "sr_conditioner", "sim_transfer")
+            non_disc = [
+                k
+                for k in missing
+                if not k.startswith("discriminator.")
+                and not any(p in k for p in expected_new)
+            ]
             if non_disc:
                 logger.warning("load_state_dict: %d missing keys", len(non_disc))
                 for k in non_disc[:10]:
                     logger.warning("  - %s", k)
+            expected_missing = [
+                k
+                for k in missing
+                if not k.startswith("discriminator.")
+                and any(p in k for p in expected_new)
+            ]
+            if expected_missing:
+                logger.info(
+                    "load_state_dict: %d 个预期内新增参数随机初始化 "
+                    "(semantic_pyramid 重训 / sr_conditioner / sim_transfer)",
+                    len(expected_missing),
+                )
         if unexpected:
             logger.warning("load_state_dict: %d unexpected keys", len(unexpected))
             for k in unexpected[:10]:
@@ -636,9 +723,16 @@ class SD2RefGANSystem(LightningModule):
                     )
                     noise_sr = torch.randn_like(sr_latent)
 
-                    pred_sr_pixel = self._adapter_pred_x0(
-                        lr, ref, sr_latent, t_sr, noise_sr
-                    )
+                    # ── D_tex 置信加权：取 raw cos_map scale2 ──
+                    if self.dtex_conf_weight:
+                        pred_sr_pixel, conf_dtex = self._adapter_pred_x0(
+                            lr, ref, sr_latent, t_sr, noise_sr, return_conf=True
+                        )
+                    else:
+                        pred_sr_pixel = self._adapter_pred_x0(
+                            lr, ref, sr_latent, t_sr, noise_sr
+                        )
+                        conf_dtex = None
 
                     phase2_loss = 0.0
 
@@ -674,10 +768,19 @@ class SD2RefGANSystem(LightningModule):
                                 ref=ref.float(),
                                 lambda_semantic=self.lambda_gan_semantic,
                                 lambda_texture=self.lambda_gan_texture,
+                                tex_weight=conf_dtex,
                             )
                         if not torch.isnan(gan_loss) and not torch.isinf(gan_loss):
                             phase2_loss = phase2_loss + gan_loss
                             self.log("train/G_gan", gan_loss.detach(), on_step=True)
+                            if conf_dtex is not None:
+                                # 监控可信区占比：健康区间 0.4~0.6（实测 conf 均值），
+                                # 长期 <0.2 说明大部分样本匹配失败，先查数据对齐
+                                self.log(
+                                    "train/D_tex_conf",
+                                    conf_dtex.mean().detach(),
+                                    on_step=True,
+                                )
                         else:
                             self._nan_g_count += 1
                             logger.warning(
@@ -825,6 +928,7 @@ class SD2RefGANSystem(LightningModule):
 
         # 生成 fake / real（全部 no_grad，D 不需要 G 的梯度）
 
+        conf_dtex = None
         try:
             with torch.no_grad():
                 with torch.amp.autocast(
@@ -841,7 +945,14 @@ class SD2RefGANSystem(LightningModule):
                     )
                     noise = torch.randn_like(sr_latent)
                     pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
-                    pred_sr_pixel = self._adapter_pred_x0(lr, ref, sr_latent, t, noise)
+                    if self.dtex_conf_weight:
+                        pred_sr_pixel, conf_dtex = self._adapter_pred_x0(
+                            lr, ref, sr_latent, t, noise, return_conf=True
+                        )
+                    else:
+                        pred_sr_pixel = self._adapter_pred_x0(
+                            lr, ref, sr_latent, t, noise
+                        )
                     real, fake = (
                         pred_hr_pixel.detach().float(),
                         pred_sr_pixel.detach().float(),
@@ -934,6 +1045,9 @@ class SD2RefGANSystem(LightningModule):
             and d_tex_opt is not None
         ):
             # ── 方案C：Swap Test ──
+            # 注意：conf_dtex 不随 ref_for_d 交换。conf 标记的是"fake 的
+            # 哪些区域含有 ref 借来的纹理"，这些区域正是与错误 ref 比对时
+            # 能暴露不匹配的位置，保持原样即可。
             if self.use_swap_test and bsz > 1:
                 n_swap = int(bsz * self.swap_ratio)
                 ref_for_d = ref.clone()
@@ -944,7 +1058,12 @@ class SD2RefGANSystem(LightningModule):
 
             with torch.amp.autocast(self.device.type, enabled=False):
                 loss_d_tex = self.discriminator.compute_d_loss(
-                    real, fake, ref=ref_for_d, lambda_semantic=0.0, lambda_texture=1.0
+                    real,
+                    fake,
+                    ref=ref_for_d,
+                    lambda_semantic=0.0,
+                    lambda_texture=1.0,
+                    tex_weight=conf_dtex,
                 )
 
             if not torch.isnan(loss_d_tex) and not torch.isinf(loss_d_tex):

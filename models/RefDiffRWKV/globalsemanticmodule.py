@@ -53,9 +53,6 @@ def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
     half = embed_dim // 2
     omega = 1.0 / 10000 ** (torch.arange(half // 2).float() / (half // 2))
 
-    pos = torch.arange(grid_size, dtype=torch.float32)
-    out = pos.unsqueeze(1) * omega.unsqueeze(0)  # (G, half/2)
-
     gy, gx = torch.meshgrid(
         torch.arange(grid_size).float(),
         torch.arange(grid_size).float(),
