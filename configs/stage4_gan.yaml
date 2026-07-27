@@ -1,10 +1,6 @@
 # ============================================================
-# Stage 1 — 纯扩散基线（use_semantic 临时关闭）
-# 目标：1) 验证纯 PyTorch 环境连续 4h+ 无 CUDA IMA
-#       2) 确认 UNet/LoRA/Adapter 权重无缝继承（loss 无跳变）
-# 说明：v2 后端的 WKV 公式已变更，金字塔权重反正要重训——
-#       将"重训代价"与"收益验证"都推迟到 Stage 2 单独度量，
-#       本阶段保住干净基线。通过标准达成后进入 Stage 2。
+# Stage 4 — GAN 精调（全量 loss + Swap Test + D_tex 置信加权）
+# 从 Stage3 checkpoint 继续
 # ============================================================
 
 pretrained:
@@ -21,36 +17,36 @@ model:
     embed_dim: 192
     in_channels: 3
     upsample_mode: "bilinear"
-    use_self_sim_transfer: false   # v2：关闭
+    use_self_sim_transfer: true
     self_sim_topk: 8
+    self_sim_init_alpha: 0.3
 
   sd_model_path: "sd2-community/stable-diffusion-2-1-base"
 
   use_lora: true
   lora_rank: 64
-  lora_target_modules:
-    - to_k
-    - to_q
-    - to_v
-    - to_out.0
-
+  lora_target_modules: [to_k, to_q, to_v, to_out.0]
   sd_locked: true
 
-  use_semantic: false              # ★ 本阶段关闭：隔离 pyramid 重训变量
+  use_semantic: true
   dinov2_model_name: "facebook/dinov2-base"
-  use_sr_condition: false          # v2：关闭
+  use_sr_condition: true
 
   num_train_timesteps: 1000
   beta_start: 0.00085
   beta_end: 0.012
   beta_schedule: "scaled_linear"
   prediction_type: "epsilon"
-
   t_min: 300
   t_max: 700
-
   cfg_drop_prob: 0.2
   control_scale: 1.0
+
+  use_confidence_gate: true
+  confidence_alpha: 0.4
+  use_temporal_gate: true
+  control_scale_min: 0.3
+  control_scale_max: 1.5
 
   use_sr_latent_cond: true
   sr_enabled: true
@@ -67,36 +63,43 @@ model:
     hidden_rate: 4
     ckpt_path: "/mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/refrwkv_sr/last.ckpt"
 
-  use_discriminator: false
-  gan_enabled: false
-  dtex_conf_weight: false
+  use_discriminator: true
+  use_semantic_d: true
+  use_texture_d: true
+  semantic_alpha: 0.8
+  semantic_use_freq: true
+  semantic_trainable_stages: 1
+  semantic_precision: "fp32"
+  texture_base_ch: 48
+  texture_num_scales: 4
+  texture_use_spectral: true
 
-  use_confidence_gate: false
-  confidence_alpha: 0.4
-  use_temporal_gate: false
+  gan_enabled: true
+  dtex_conf_weight: true           # ★ D_tex 只在可信区执法
+  use_swap_test: true
+  swap_ratio: 0.5
 
-  learning_rate: 0.00001
+  learning_rate: 0.000001
+  lr_D: 0.000001
+  lr_D_texture: 0.0000005
   weight_decay: 0.001
+  d_weight_decay: 0.001
+  d_betas: [0.5, 0.999]
 
-  lambda_diff_sr: 0.0
-  lambda_lpips: 0.0
-  lambda_gan: 0.0
-  lambda_gan_texture: 0.0
+  lambda_diff_sr: 0.3
+  lambda_lpips: 0.5
+  lambda_gan: 0.02
+  lambda_gan_texture: 0.05
 
   use_amp: false
   accumulate_grad_batches: 8
   g_d_ratio: 1
   max_consecutive_nan: 20
-
   grad_clip_val: 1.0
   grad_warn_threshold: 100.0
 
   sample_steps: 20
-  fr_metrics:
-    - psnr
-    - ssim
-    - lpips
-
+  fr_metrics: [psnr, ssim, lpips]
   t_start: 300
   guidance_scale: 0.0
   t_stop: 200
@@ -110,9 +113,6 @@ data:
   ref_aug_strengths: [0.15, 0.15, 0.15, 0.03]
   ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
   ref_gray_prob: 0.3
-  max_samples_train: null
-  max_samples_val: null
-  max_samples_test: null
   batch_size: 1
   val_batch_size: 1
   num_workers: 4
@@ -129,14 +129,12 @@ train:
   save_top_k: 3
   detect_anomaly: false
   seed: 42
-
-  resume_ckpt: "/mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/sd2_ref_gan_Phase1/last.ckpt"
-
+  resume_ckpt: "checkpoints/sd2_ref_gan_Stage3/last.ckpt"
   best_save:
-    metrics: ["psnr", "ssim"]
+    metrics: ["psnr", "ssim", "lpips"]
     min_improved: 2
 
 output:
   checkpoint_dir: "checkpoints"
   log_dir: "logs/sd2_ref_gan"
-  experiment_name: "sd2_ref_gan_Stage1"
+  experiment_name: "sd2_ref_gan_Stage4"
