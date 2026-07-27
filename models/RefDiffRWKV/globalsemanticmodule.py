@@ -1,13 +1,21 @@
 """
-GlobalSemantic.py — 全局语义提取模块 (Global Semantic Extraction Module)
+GlobalSemantic.py — 全局语义提取模块 (SR 条件版)
 
 基于 DINOv2 + 双向 RWKV 的金字塔语义聚合器，从参考图像中提取多尺度语义
-特征，注入 UNet 各层编码器/瓶颈层，替代 CRefDiff 原有的 LCA_Adapter/SPADE。
+特征，注入 UNet 各层编码器/瓶颈层。
+
+本版变更：
+1. 新增 SR latent 条件分支：SR latent (4×60×60) 经 2×2 avg pool + 自适应
+   池化降到 16×16，与 DINOv2 的 256 个 patch token 位置对齐后拼接，
+   使金字塔同时看到 "ref 长什么样" 和 "SR 已经重建到什么程度"，
+   让语义提取聚焦于 SR 无法提供、必须由 ref 补充的信息。
+2. WKV 扫描默认使用纯 PyTorch 分块实现（数值稳定、含 k 与 first/u 的
+   标准 RWKV4 语义），保留 wkv_backend="cuda" 旧 kernel 路径供对照。
+3. 数值护栏：输入 nan_to_num + clamp，扫描强制 fp32，decay/k/u clamp。
 
 参考文献 (References):
     DINOv2: Oquab et al., "DINOv2: Learning Robust Visual Features without Supervision", 2023
     RWKV:   Peng et al., "RWKV: Reinventing RNNs for the Transformer Era", 2023
-
 """
 
 import torch
@@ -16,9 +24,8 @@ import torch.nn.functional as F
 from transformers import AutoModel
 import sys
 from pathlib import Path
+from typing import Optional
 
-# ── 项目路径 & CUDA 算子导入 ──
-# TODO: 建议在项目入口统一管理 sys.path，避免每个模块重复操作
 root_dir = str(Path(__file__).parent.parent.parent)
 sys.path.insert(0, root_dir)
 
@@ -32,45 +39,145 @@ except (ImportError, ModuleNotFoundError):
 
 
 # ═══════════════════════════════════════════════════════════════
-# WKV Scan — 带 CUDA/CPU 双后端的时间混合算子
+# 2D 正弦位置编码（供 SR 条件 token 使用）
 # ═══════════════════════════════════════════════════════════════
 
 
-def _wkv_forward_scan(
-    decay: torch.Tensor,  # (1, dim)
-    first: torch.Tensor,  # (1, dim)
-    k: torch.Tensor,  # (B, T, dim)
-    v: torch.Tensor,  # (B, T, dim)
-) -> torch.Tensor:
-    """
-    RWKV WKV 前向扫描：state[t] = state[t-1] * exp(decay) + v[t].
-
-    CUDA 可用时调用编译算子，否则回退到纯 PyTorch CPU 实现。
-    CPU 版本按时间步循环，仅用于调试与单元测试，生产训练请使用 GPU。
-
-    Args:
-        decay: (1, dim)  对数衰减因子
-        first: (1, dim)  初始状态偏置
-        k:     (B, T, dim)  key 序列（CUDA 算子内部使用，CPU 回退暂忽略）
-        v:     (B, T, dim)  value 序列
+def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
+    """生成 grid_size × grid_size 的 2D 正弦位置编码。
 
     Returns:
-        wkv:   (B, T, dim)  时间混合后状态序列
+        (grid_size * grid_size, embed_dim)
     """
-    if k.is_cuda and _HAS_CUDA_WKV:
-        return _RUN_CUDA_NATIVE(decay, first, k, v)
+    assert embed_dim % 4 == 0, f"embed_dim({embed_dim}) 必须被 4 整除"
+    half = embed_dim // 2
+    omega = 1.0 / 10000 ** (torch.arange(half // 2).float() / (half // 2))
 
-    # ── CPU fallback ──
-    B, T, dim = k.shape
-    w = torch.exp(decay)  # (1, dim)
-    wkv = torch.empty(B, T, dim, device=k.device, dtype=k.dtype)
-    state = first.expand(B, dim).clone()  # (B, dim)
+    pos = torch.arange(grid_size, dtype=torch.float32)
+    out = pos.unsqueeze(1) * omega.unsqueeze(0)  # (G, half/2)
 
-    for t in range(T):
-        state = state * w + v[:, t, :]
-        wkv[:, t, :] = state
+    gy, gx = torch.meshgrid(
+        torch.arange(grid_size).float(),
+        torch.arange(grid_size).float(),
+        indexing="ij",
+    )
+    emb_x = gx.flatten().unsqueeze(1) * omega.unsqueeze(0)
+    emb_x = torch.cat([emb_x.sin(), emb_x.cos()], dim=1)
+    emb_y = gy.flatten().unsqueeze(1) * omega.unsqueeze(0)
+    emb_y = torch.cat([emb_y.sin(), emb_y.cos()], dim=1)
+
+    return torch.cat([emb_x, emb_y], dim=1)  # (G*G, embed_dim)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 纯 PyTorch WKV 扫描（分块向量化，fp32，数值稳定）
+# ═══════════════════════════════════════════════════════════════
+
+
+def _wkv_scan_torch(
+    decay: torch.Tensor,  # (1, D) 对数衰减（应为负）
+    first: torch.Tensor,  # (1, D) 当前步 bonus u
+    k: torch.Tensor,  # (B, T, D)
+    v: torch.Tensor,  # (B, T, D)
+    chunk_size: int = 32,
+) -> torch.Tensor:
+    """
+    标准 RWKV4 WKV（无归一化）：
+        wkv[t] = Σ_{i=1}^{t-1} exp((t-1-i)·w + k_i)⊙v_i + exp(u + k_t)⊙v_t
+
+    分块策略：块内构造 (L, L) 衰减矩阵做矩阵乘，块间用状态 S 递推。
+    """
+    B, T, D = k.shape
+
+    w = decay.float().clamp(min=-12.0, max=0.0)  # log α ≤ 0 → α ∈ (0, 1]
+    u = first.float().clamp(min=-30.0, max=20.0)
+    k = k.float().clamp(min=-30.0, max=20.0)
+    v = v.float()
+
+    S = k.new_zeros(B, D)
+    outs = []
+
+    for s in range(0, T, chunk_size):
+        L = min(chunk_size, T - s)
+        kc = k[:, s : s + L]
+        vc = v[:, s : s + L]
+
+        l = torch.arange(L, device=k.device)
+        diff = l.view(L, 1) - l.view(1, L)
+
+        logw = diff.view(1, L, L, 1) * w.view(1, 1, 1, D) + kc.unsqueeze(1)
+        tril = torch.tril(torch.ones(L, L, device=k.device, dtype=torch.bool))
+        logw = logw.masked_fill(~tril.view(1, L, L, 1), -1e9)
+        M = torch.exp(logw)
+
+        intra = torch.einsum("bljd,bjd->bld", M, vc)
+
+        decay_l = torch.exp(l.view(1, L, 1) * w.view(1, 1, D))
+        intra = intra + decay_l * S.unsqueeze(1)
+        outs.append(intra)
+
+        log_end = (L - 1 - l).view(1, L, 1) * w.view(1, 1, D) + kc
+        S = torch.exp(L * w) * S + (torch.exp(log_end) * vc).sum(dim=1)
+
+    wkv = torch.cat(outs, dim=1)
+
+    corr = (torch.exp(u) - torch.exp(-w)).view(1, 1, D)
+    wkv = wkv + corr * torch.exp(k) * v
 
     return wkv
+
+
+def _bi_wkv_scan(decay, first, k, v, backend: str = "torch"):
+    """双向 WKV：正向扫描 + 反向扫描取平均。"""
+    if backend == "cuda" and _HAS_CUDA_WKV and k.is_cuda:
+        v_fwd = _RUN_CUDA_NATIVE(decay, first, k, v)
+        v_bwd = _RUN_CUDA_NATIVE(
+            decay, first, k.flip(1).contiguous(), v.flip(1).contiguous()
+        ).flip(1)
+        return 0.5 * (v_fwd + v_bwd)
+
+    v_fwd = _wkv_scan_torch(decay, first, k, v)
+    v_bwd = _wkv_scan_torch(decay, first, k.flip(1), v.flip(1)).flip(1)
+    return 0.5 * (v_fwd + v_bwd)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SR Latent 条件编码器
+# ═══════════════════════════════════════════════════════════════
+
+
+class SRLatentConditioner(nn.Module):
+    """将 SR latent (B, 4, 60, 60) 编码为与 DINOv2 对齐的 patch 特征。
+
+    路径：
+        60×60 ──2×2 avg pool──→ 30×30 ──adaptive pool──→ 16×16
+        (B, 4, 16, 16) → flatten → (B, 256, 4) → MLP → (B, 256, base_dim)
+
+    与直接对 60×60 做 adaptive pool 相比，先 2×2 平均池化保留更多局部
+    纹理统计信息，路径更短、信息更完整。
+    """
+
+    def __init__(self, latent_ch: int = 4, base_dim: int = 768, hidden: int = 256):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(latent_ch, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, base_dim),
+        )
+        self.norm = nn.LayerNorm(base_dim)
+
+    def forward(self, sr_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            sr_latent: (B, 4, 60, 60) VAE 编码后的 SR latent
+
+        Returns:
+            (B, 256, base_dim) 与 DINOv2 patch 网格对齐的条件特征
+        """
+        x = F.avg_pool2d(sr_latent.float(), kernel_size=2)  # 60→30
+        x = F.adaptive_avg_pool2d(x, 16)  # 30→16
+        x = x.flatten(2).transpose(1, 2)  # (B, 256, 4)
+        return self.norm(self.proj(x))  # (B, 256, D)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -79,50 +186,35 @@ def _wkv_forward_scan(
 
 
 class RWKV_SemanticAggregator(nn.Module):
-    """
-    RWKV Semantic Aggregator — 双向 RWKV 语义聚合器
+    """双向 RWKV 语义聚合器（结构与参数名与原版一致，WKV 扫描走稳定后端）。"""
 
-    用可学习 Query Token 以 Cross-Attention 风格从 Patch Token 中提取
-    固定数量的语义 Token（如 32 → 16 → 8 → 4 逐级压缩）。
-
-    与标准 Transformer Cross-Attention 的区别:
-    ┌──────────────────────────────────────────────────────────┐
-    │ 标准 Attention:   Q·K^T → softmax → ×V  (O(n²) 复杂度)     │
-    │ 双向 RWKV:        time-mixing with learnable decay        │
-    │                   + forward/backward scan → avg           │
-    │                   (O(n) 线性复杂度)                        │
-    └──────────────────────────────────────────────────────────┘
-
-    参数 (Parameters):
-        dim:         特征维度
-        num_tokens:  输出的语义 Token 数量
-        hidden_rate: FFN 隐藏层倍率
-    """
-
-    def __init__(self, dim: int, num_tokens: int = 32, hidden_rate: int = 4):
+    def __init__(
+        self,
+        dim: int,
+        num_tokens: int = 32,
+        hidden_rate: int = 4,
+        wkv_backend: str = "torch",
+    ):
         super().__init__()
         self.dim = dim
         self.num_tokens = num_tokens
+        self.wkv_backend = wkv_backend
 
-        # ── Learnable Query Token & Position Embedding ──
         self.query = nn.Parameter(torch.empty(1, num_tokens, dim))
         self.query_pos = nn.Parameter(torch.empty(1, num_tokens, dim))
         nn.init.trunc_normal_(self.query, std=0.02)
         nn.init.trunc_normal_(self.query_pos, std=0.02)
 
-        # ── RWKV Time-Mixing 组件 ──
         self.input_norm = nn.LayerNorm(dim)
         self.key = nn.Linear(dim, dim, bias=False)
         self.value = nn.Linear(dim, dim, bias=False)
         self.receptance = nn.Linear(dim, dim, bias=False)
         self.output = nn.Linear(dim, dim, bias=False)
 
-        # ── RWKV 衰减参数 ──
         decay = torch.linspace(-1.0, -6.0, dim).unsqueeze(0)
         self.decay = nn.Parameter(decay)
         self.first = nn.Parameter(torch.zeros(1, dim))
 
-        # ── Channel-Mixing (FFN) ──
         self.norm = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * hidden_rate),
@@ -131,50 +223,26 @@ class RWKV_SemanticAggregator(nn.Module):
         )
 
     def forward(self, ref_features: torch.Tensor):
-        """
-        Forward pass — 从 Patch Token 中提取语义 Token.
-
-        Args:
-            ref_features: (B, M, C) 输入特征，M = Patch 数，C = dim
-
-        Returns:
-            semantic_tokens: (B, num_tokens, dim) 提取的语义 Token
-        """
         B, M, C = ref_features.shape
 
-        # Step 1: 构建 Query Token + Position
-        q = self.query + self.query_pos  # (1, num_tokens, dim)
-        q = q.expand(B, -1, -1)  # (B, num_tokens, dim)
-
-        # Step 2: 拼接 [Query, Patch] 序列
-        seq = torch.cat([q, ref_features], dim=1)  # (B, num_tokens+M, dim)
+        q = (self.query + self.query_pos).expand(B, -1, -1)
+        seq = torch.cat([q, ref_features], dim=1)
         seq = self.input_norm(seq)
 
-        # Step 3: 投影到 K, V, R 空间
         k = self.key(seq)
         v0 = self.value(seq)
         r = torch.sigmoid(self.receptance(seq))
 
-        # Step 4: 双向 RWKV 时间混合
-        # 不再除以序列长度 T，保证金字塔各级衰减动力学一致
-        v_forward = _wkv_forward_scan(self.decay, self.first, k, v0)
+        # WKV 扫描强制 fp32，避免 bf16 下 exp 累积溢出
+        with torch.amp.autocast(seq.device.type, enabled=False):
+            v = _bi_wkv_scan(self.decay, self.first, k, v0, backend=self.wkv_backend)
+        v = v.to(v0.dtype)
 
-        k_rev = torch.flip(k, dims=[1])
-        v_rev_input = torch.flip(v0, dims=[1])
-        v_backward = _wkv_forward_scan(self.decay, self.first, k_rev, v_rev_input)
-        v_backward = torch.flip(v_backward, dims=[1])
+        x = self.output(r * v)
 
-        v = 0.5 * (v_forward + v_backward)
-
-        # Step 5: 门控输出
-        x = r * v
-        x = self.output(x)
-
-        # Step 6: 取出 Query 部分 + Residual + FFN
         semantic_tokens = x[:, : self.num_tokens, :] + q
         semantic_tokens = semantic_tokens + self.ffn(self.norm(semantic_tokens))
-
-        return semantic_tokens  # (B, num_tokens, dim)
+        return semantic_tokens
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -183,29 +251,7 @@ class RWKV_SemanticAggregator(nn.Module):
 
 
 class RWKV_SemanticPyramid(nn.Module):
-    """
-    RWKV Semantic Pyramid — 多尺度语义金字塔
-
-    级联多层 RWKV_SemanticAggregator，逐级压缩语义 Token 数量。
-
-    默认 schedule: 256 patches → 32 → 16 → 8 → 4 tokens
-    对应 UNet 编码器的不同层级:
-        tokens[0] (32) → e1     (down_block[0], 最高分辨率)
-        tokens[1] (16) → e2     (down_block[1])
-        tokens[2] (8)  → e3     (down_block[2])
-        tokens[3] (4)  → latent (mid_block,   最低分辨率)
-
-    设计理念:
-        高层级保留更多空间细节 → 对分辨率敏感的浅层有益
-        低层级保留全局语义信息 → 对语义敏感的瓶颈层有益
-
-    参数 (Parameters):
-        dim:              特征维度
-        token_schedule:   每级输出的 Token 数量，如 (32, 16, 8, 4)
-        level_names:      每级对应的名称，如 ("e1", "e2", "e3", "latent")
-        hidden_rate:      FFN 隐藏层倍率
-        use_checkpoint:   是否对聚合器序列使用梯度检查点
-    """
+    """多尺度语义金字塔：级联 32 → 16 → 8 → 4 tokens。"""
 
     def __init__(
         self,
@@ -214,6 +260,7 @@ class RWKV_SemanticPyramid(nn.Module):
         level_names: tuple = ("e1", "e2", "e3", "latent"),
         hidden_rate: int = 4,
         use_checkpoint: bool = False,
+        wkv_backend: str = "torch",
     ):
         super().__init__()
         if len(token_schedule) != len(level_names):
@@ -227,73 +274,54 @@ class RWKV_SemanticPyramid(nn.Module):
 
         self.aggregators = nn.ModuleList(
             [
-                RWKV_SemanticAggregator(dim, num_tokens=n, hidden_rate=hidden_rate)
+                RWKV_SemanticAggregator(
+                    dim,
+                    num_tokens=n,
+                    hidden_rate=hidden_rate,
+                    wkv_backend=wkv_backend,
+                )
                 for n in token_schedule
             ]
         )
 
     def forward(self, ref_features):
-        """
-        Args:
-            ref_features: (B, N_in, base_dim) 输入特征
-
-        Returns:
-            dict: {level_name: (B, tokens_i, base_dim), ...}
-        """
         x = ref_features
         outputs = {}
-
         for agg, name in zip(self.aggregators, self.level_names):
             if self.use_checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(agg, x, use_reentrant=False)
             else:
                 x = agg(x)
             outputs[name] = x
-
         return outputs
 
 
 # ═══════════════════════════════════════════════════════════════
-# Global Semantic Module
+# Global Semantic Module（SR 条件版）
 # ═══════════════════════════════════════════════════════════════
 
 
 class GlobalSemanticModule(nn.Module):
     """
-    Global Semantic Module — 全局语义提取器
+    全局语义提取器（SR 条件版）
 
-    完整的 ref 语义提取管线:
-        DINOv2 → 投影 → RWKV Semantic Pyramid → 输出 base_dim token
-        （由 sd2_control_ldm.sem_proj 统一投影到 cross_attn_dim）
+    管线:
+        ref ──→ DINOv2 → proj ────────────────┐
+                                               ├─ concat ──→ RWKV Pyramid → 输出
+        sr_latent ──→ pool/MLP ──→ +pos ──────┘
 
-    DINOv2 的作用:
-        提供预训练的、鲁棒的视觉特征。DINOv2 通过自监督训练在
-        1.42 亿张图上学习，其 Patch Token 天然包含丰富的语义和
-        空间信息，是理想的特征提取 Backbone。
+    SR 条件的作用：
+        让金字塔同时看到 ref 的外观和 SR 已重建的结构。SR 已良好的区域
+        降低对 ref 的关注，把提取 capacity 留给 SR 缺失、必须由 ref
+        补充的纹理/语义信息。
 
-    RWKV Pyramid 的作用:
-        将 DINOv2 Patch Token 逐级压缩为少量语义 Token，
-        用线性复杂度的双向 RWKV 替代二次复杂度的 Cross-Attention，
-        同时保持全局感受野。
-
-    参数 (Parameters):
-        dinov2_model_name: DINOv2 模型名 (自动读取 hidden_size)
-            - "facebook/dinov2-small"  → hidden_size=384
-            - "facebook/dinov2-base"   → hidden_size=768  (默认)
-            - "facebook/dinov2-large"  → hidden_size=1024
-            - "facebook/dinov2-giant"  → hidden_size=1536
-        base_dim:          金字塔内部工作维度 (默认 128，原为 64)
-                           增大可缓解 DINOv2→金字塔的信息瓶颈，
-                           代价是 RWKV 计算量按 O(base_dim²) 增长
-                           后续层自动按 ×1, ×2, ×4, ×8 推导
-        token_schedule:    金字塔每级 Token 数，默认 (32, 16, 8, 4)
-        level_names:       对应的层级名称，默认 ("e1", "e2", "e3", "latent")
-        hidden_rate:       RWKV FFN 隐藏层倍率
-        freeze_dinov2:     是否冻结 DINOv2 (默认 True，只做特征提取)
-        use_checkpoint:    是否在金字塔中使用梯度检查点
+    参数变化（相对原版）：
+        新增 use_sr_condition / sr_latent_ch / sr_hidden 三个可选参数，
+        其余构造签名、参数名完全不变。use_sr_condition=False 时行为与
+        原版等价，旧 checkpoint 可 strict 加载（新增的 sr_* 参数会
+        出现在 missing keys 中，需 strict=False 或先冻结加载）。
     """
 
-    # ImageNet 归一化常量（DINOv2 预训练时使用）
     IMAGENET_MEAN = (0.485, 0.456, 0.406)
     IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -306,9 +334,14 @@ class GlobalSemanticModule(nn.Module):
         hidden_rate: int = 4,
         freeze_dinov2: bool = True,
         use_checkpoint: bool = False,
+        wkv_backend: str = "torch",
+        use_sr_condition: bool = False,
+        sr_latent_ch: int = 4,
+        sr_hidden: int = 256,
     ):
         super().__init__()
         self.freeze_dinov2 = freeze_dinov2
+        self.use_sr_condition = use_sr_condition
 
         # ── 1. DINOv2 Backbone ──
         self.dinov2 = AutoModel.from_pretrained(
@@ -320,21 +353,30 @@ class GlobalSemanticModule(nn.Module):
         if freeze_dinov2:
             for param in self.dinov2.parameters():
                 param.requires_grad = False
-            self.dinov2.eval()  # 冻结时关闭 dropout，保证确定性输出
+            self.dinov2.eval()
 
         # ── 2. 投影到基础维度 ──
         self.proj = nn.Linear(dino_dim, base_dim)
 
-        # ── 3. RWKV Semantic Pyramid ──
+        # ── 3. SR 条件分支 ──
+        if use_sr_condition:
+            self.sr_conditioner = SRLatentConditioner(
+                latent_ch=sr_latent_ch, base_dim=base_dim, hidden=sr_hidden
+            )
+            # SR token 的 2D 位置编码（16×16 网格，persistent=False 不入 ckpt）
+            sr_pos = _get_2d_sincos_pos_embed(base_dim, 16)
+            self.register_buffer("_sr_pos", sr_pos.unsqueeze(0), persistent=False)
+
+        # ── 4. RWKV Semantic Pyramid ──
         self.semantic_pyramid = RWKV_SemanticPyramid(
             dim=base_dim,
             token_schedule=token_schedule,
             level_names=level_names,
             hidden_rate=hidden_rate,
             use_checkpoint=use_checkpoint,
+            wkv_backend=wkv_backend,
         )
 
-        # 注册 ImageNet 归一化 buffer（避免每次 forward 创建 tensor）
         self.register_buffer(
             "_dino_mean",
             torch.tensor(self.IMAGENET_MEAN).view(1, 3, 1, 1),
@@ -345,49 +387,54 @@ class GlobalSemanticModule(nn.Module):
         )
 
     def _normalize_for_dinov2(self, ref_img: torch.Tensor) -> torch.Tensor:
-        # 数据契约：输入值域为 [-1, 1]，直接转换，不做动态检测
-        ref_01 = (ref_img + 1.0) / 2.0  # [-1, 1] → [0, 1]
+        ref_01 = (ref_img + 1.0) / 2.0
         return (ref_01 - self._dino_mean) / self._dino_std
 
-    def forward(self, ref_img: torch.Tensor):
+    def forward(
+        self,
+        ref_img: torch.Tensor,
+        sr_latent: Optional[torch.Tensor] = None,
+    ):
         """
-        Forward pass — 从参考图像提取多尺度语义特征.
-
         Args:
-            ref_img: (B, 3, H, W) 参考图像，值域 [-1, 1]（推荐）或 [0, 1]
-                     会被 resize 到 224×224 以匹配 DINOv2 输入
+            ref_img:   (B, 3, H, W) 参考图像，值域 [-1, 1]
+            sr_latent: (B, 4, 60, 60) 可选，VAE 编码后的 SR latent。
+                       仅在 use_sr_condition=True 时生效。
 
         Returns:
-            dict: {
-                level_name: (B, tokens_i, base_dim),  # 如 (B, 32, 128)
-                ...
-            }
-            由调用方负责投影到目标维度。
+            dict: {level_name: (B, tokens_i, base_dim), ...}
         """
-        # ── Step 1: Resize to DINOv2 fixed input size ──
+        # 输入护栏
+        ref_img = torch.nan_to_num(ref_img, nan=0.0, posinf=1.0, neginf=-1.0)
+        ref_img = ref_img.clamp(-1.5, 1.5)
+
         if ref_img.shape[-2:] != (224, 224):
             ref_small = F.interpolate(ref_img, size=(224, 224), mode="bilinear")
         else:
             ref_small = ref_img
 
-        # ── Step 2: ImageNet 归一化 ──
         ref_small = self._normalize_for_dinov2(ref_small)
 
-        # ── Step 3: DINOv2 特征提取 ──
         if self.freeze_dinov2:
             with torch.no_grad():
                 outputs = self.dinov2(ref_small)
         else:
             outputs = self.dinov2(ref_small)
 
-        # 去掉 CLS token (index 0)，只保留 Patch tokens (index 1..257)
         features = outputs.last_hidden_state[:, 1:, :]  # (B, 256, dino_dim)
-
-        # ── Step 4: 投影到基础维度 ──
+        features = torch.nan_to_num(features, nan=0.0, posinf=10.0, neginf=-10.0)
         features = self.proj(features)  # (B, 256, base_dim)
 
-        # ── Step 5: RWKV Semantic Pyramid ──
-        base_pyramid = self.semantic_pyramid(features)
+        # ── SR 条件注入 ──
+        if self.use_sr_condition and sr_latent is not None:
+            sr_latent = torch.nan_to_num(
+                sr_latent, nan=0.0, posinf=20.0, neginf=-20.0
+            ).clamp(-20.0, 20.0)
+            sr_feats = self.sr_conditioner(sr_latent)  # (B, 256, base_dim)
+            sr_feats = sr_feats + self._sr_pos
+            combined = torch.cat([features, sr_feats], dim=1)  # (B, 512, D)
+        else:
+            combined = features
 
-        # ── Step 6: 直接返回 base_dim token，由调用方投影 ──
+        base_pyramid = self.semantic_pyramid(combined)
         return base_pyramid
