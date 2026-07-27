@@ -108,7 +108,7 @@ train:
   save_top_k: 3
   detect_anomaly: false
   seed: 42
-  resume_ckpt: "/mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/sd2_ref_gan_Phase1/last.ckpt"
+  resume_ckpt: null
   best_save:
     metrics: ["psnr", "ssim"]
     min_improved: 2
