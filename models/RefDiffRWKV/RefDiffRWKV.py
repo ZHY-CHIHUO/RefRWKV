@@ -109,8 +109,8 @@ class VRWKV_SpatialMix(nn.Module):
                 v = RUN_CUDA(
                     self.spatial_decay[j] / s,
                     self.spatial_first[j] / s,
-                    k,
-                    v,
+                    k.contiguous(),
+                    v.contiguous(),
                 )
             else:
                 h, w = resolution
@@ -119,8 +119,8 @@ class VRWKV_SpatialMix(nn.Module):
                 v_t = RUN_CUDA(
                     self.spatial_decay[j] / s,
                     self.spatial_first[j] / s,
-                    k_t,
-                    v_t,
+                    k_t.contiguous(),
+                    v_t.contiguous(),
                 )
                 v = rearrange(v_t, "b (w h) c -> b (h w) c", h=h, w=w)
 
