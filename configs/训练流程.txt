@@ -1,0 +1,346 @@
+# RefRWKV v2 四阶段训练方案与操作手册
+
+## **第一部分：背景与设计逻辑**
+
+### **为什么需要重新分阶段**
+
+v2 版本相对崩溃前的旧训练，引入了四组相互独立的变更：
+
+| 变更 | 内容 | 风险 |
+|---|---|---|
+| WKV 后端重写 | 自定义 CUDA kernel → 纯 PyTorch 分块扫描（解决 IMA 崩溃） | 公式从简化版升级为标准 RWKV4，金字塔权重语义不兼容，**必须重训** |
+| SR 条件分支 | 语义金字塔同时看 ref 和 SR latent | 新增随机初始化参数，训练初期有扰动 |
+| SelfSimTransfer | SR 自相似纹理迁移 + 决策链闭环（局部拒绝/非局部借/先验脑补） | 新增 1.77M 参数，传播强度需训练校准 |
+| D_tex 置信加权 | 纹理判别器只在可信区执法 | 仅 Phase GAN 阶段生效 |
+
+如果像旧方案那样三个阶段、新特性一次性全开，任何一个指标异常都无法归因到具体变量。四阶段设计的核心原则是**每阶段只引入一组新变量，每组变量都有明确的验收标准，通过了才进入下一阶段**。这样每个特性的增益可以单独量化——这些数字本身就是论文消融表的数据来源。
+
+### **四阶段总览**
+
+| 阶段 | 新引入变量 | 目的 | 预计时间 | 验收标准 |
+|---|---|---|---|---|
+| **Stage 1** 基线 | 无（连语义模块都关闭） | 验证 IMA 修复 + 权重无缝继承 | 半天（达标即走） | 连续 4h+ 无 CUDA 错误，loss 无跳变 |
+| **Stage 2** 语义 | `use_semantic` + `use_sr_condition` | 金字塔新公式重训 + SR 条件验证 | 1~1.5 天 | loss 尖峰回落，PSNR 追平基线 |
+| **Stage 3** 纹理 | `use_self_sim_transfer` + 双门控 + diff/lpips | 纹理迁移完整链路 | 1 天 | LPIPS 下降，纹理区视觉改善 |
+| **Stage 4** GAN | GAN + swap test + `dtex_conf_weight` | 感知质量精调 | 1~2 天 | LPIPS 进一步降，`D_tex_conf` 稳定 |
+
+一个反直觉的设计需要特别说明：**Stage 1 把 `use_semantic` 也关了**。原因是金字塔权重反正要重训（公式变了），与其让它在基线阶段随机初始化污染训练，不如先关掉语义路径，验证纯扩散基线——UNet/LoRA/Adapter 权重是完整继承的，loss 曲线应该无缝衔接。语义模块的重训和收益放到 Stage 2 单独度量，一分耕耘一分数据。
+
+---
+
+## **第二部分：各阶段详解**
+
+### **Stage 1：纯扩散基线（`sd2_ref_gan_stage1_baseline.yaml`）**
+
+**目标**：回答两个问题——IMA 还会不会崩？旧权重能不能无缝用？
+
+这一阶段所有 v2 开关关闭，语义模块临时禁用。训练内容等价于旧版 Phase1 去掉语义路径：纯 ε-prediction 扩散损失。如果 loss 从 resume 点平滑衔接、且连续运行超过历史最长存活时间（2.5 小时）的近两倍仍无 CUDA 错误，则证明两件事：后端环境是干净的，UNet/LoRA/Adapter 的已有训练成果完整保留。
+
+```yaml
+# 关键配置（其余与旧 Phase1 相同）
+model:
+  use_semantic: false              # ★ 本阶段关闭
+  use_sr_condition: false
+  use_confidence_gate: false
+  use_temporal_gate: false
+  dtex_conf_weight: false
+  rwkv_cfg:
+    use_self_sim_transfer: false
+    self_sim_topk: 8
+  lambda_diff_sr: 0.0
+  lambda_lpips: 0.0
+  use_discriminator: false
+  gan_enabled: false
+
+train:
+  resume_ckpt: "/mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/sd2_ref_gan_Phase1/last.ckpt"
+
+output:
+  experiment_name: "sd2_ref_gan_Stage1"
+```
+
+**验收标准**（全部满足才可进入 Stage 2）：
+
+1. 启动日志出现 `v2 开关: use_sr_condition=False, use_confidence_gate=False, self_sim_transfer=False (topk=8), dtex_conf_weight=False`
+2. 日志出现 `跳过 N 个 semantic_pyramid 权重`（本阶段语义关闭，这条可能不出现或被跳过，属正常）
+3. `train/G_diff_hr` 从 resume 点（约 0.05~0.10）平滑衔接，**无尖峰**
+4. **连续 4 小时以上无任何 CUDA 错误**——这是核心验收项
+
+### **Stage 2：语义金字塔重训 + SR 条件（`sd2_ref_gan_stage2_semantic.yaml`）**
+
+**目标**：语义路径在新 WKV 公式下重训收敛，并验证 SR 条件分支的增益。
+
+开启 `use_semantic: true` 和 `use_sr_condition: true`。金字塔和 `sr_conditioner` 全部随机初始化，训练初期 `train/G_diff_hr` 会出现尖峰——这是预期行为，不是异常。金字塔只有四级聚合器、参数量不大，几百到一千五百步内 loss 应回落至基线区间。收敛后与 Stage 1 基线对比 val/psnr，差值就是"新公式语义路径 + SR 条件"的净收益，这是消融表的第一行数据。
+
+```yaml
+# 相对 Stage1 的增量
+model:
+  use_semantic: true               # ★ 开启
+  use_sr_condition: true           # ★ 开启
+  # 其余与 Stage1 完全相同
+
+train:
+  resume_ckpt: "checkpoints/sd2_ref_gan_Stage1/last.ckpt"
+
+output:
+  experiment_name: "sd2_ref_gan_Stage2"
+```
+
+**验收标准**：
+
+1. resume 日志显示预期内新增参数随机初始化（`semantic_pyramid` + `sr_conditioner`）
+2. `train/G_diff_hr` 尖峰在 500~1500 步内回落至 0.05~0.12 区间
+3. 收敛后 val/psnr 追平或超过 Stage 1 基线（22.05 附近）
+4. 全程无 CUDA 错误（继续累积 IMA 已解决的证据）
+
+### **Stage 3：纹理迁移完整链路（`sd2_ref_gan_stage3_texture.yaml`）**
+
+**目标**：决策链三环节全部上线——局部拒绝、非局部借、先验脑补，配合像素与感知损失。
+
+这是 v2 的核心阶段，一次开启四个相互配合的开关：`use_self_sim_transfer`（自相似迁移）、`use_confidence_gate`（置信门控，取 scale2 传播后置信）、`use_temporal_gate`（时序门控）、`lambda_diff_sr + lambda_lpips`（像素与感知损失）。它们是一组而非四个独立变量的原因：SelfSimTransfer 的 conf 加权依赖 cos_map 的存在（`use_confidence_gate` 触发其计算），时序门控控制注入强度随扩散步的变化，像素/LPIPS 损失则是纹理质量的直接监督——拆掉任何一个，其余的效果都会打折扣。
+
+`confidence_alpha` 从旧版的 0.2 提到 0.4：adapter 内部的 SelfSimTransfer 已经做了一次 conf 加权，残差级门控是第二道，提高 alpha 减弱二次压制。
+
+```yaml
+# 相对 Stage2 的增量
+model:
+  use_confidence_gate: true        # ★ 方案A
+  confidence_alpha: 0.4            # ★ 0.4 而非旧版 0.2
+  use_temporal_gate: true          # ★ 方案B
+  control_scale_min: 0.3
+  control_scale_max: 1.5
+  lambda_diff_sr: 0.3              # ★ 像素损失
+  lambda_lpips: 0.5                # ★ 感知损失
+  learning_rate: 0.000005          # ★ 学习率减半
+  rwkv_cfg:
+    use_self_sim_transfer: true    # ★ 自相似迁移
+    self_sim_topk: 8
+    self_sim_init_alpha: 0.3
+
+train:
+  resume_ckpt: "checkpoints/sd2_ref_gan_Stage2/last.ckpt"
+  val_check_interval: 0.25         # 验证频率降低（Phase2 惯例）
+
+output:
+  experiment_name: "sd2_ref_gan_Stage3"
+```
+
+**验收标准**：
+
+1. resume 后 missing keys 只有 `sim_transfer2` / `sim_transfer3_lca` / `sim_transfer3_mask` 三组
+2. `train/G_diff_hr` 前 200 步轻微扰动后回落（sim_transfer 随机初始化的正常代价）
+3. val/lpips 相对 Stage 2 **可见下降**
+4. 可视化检查：重复纹理区域（农田、成排建筑）的纹理一致性改善，且无"贴上去的"错误纹理
+
+### **Stage 4：GAN 精调 + D_tex 置信加权（`sd2_ref_gan_stage4_gan.yaml`）**
+
+**目标**：在 Stage 3 的纹理基础上做感知精调，判别器与生成器决策链对齐。
+
+开启 GAN 全家桶：`gan_enabled`、判别器（语义 D + 纹理 D）、swap test、以及 v2 专属的 `dtex_conf_weight`——D_tex 只在 raw cos_map 高置信的局部匹配区域执法，借来的纹理区和脑补区交给 D_sem 的全局真实感判断。这样四个角色各管各的：生成器在可信区注入局部纹理，D_tex 在同一批区域强制纹理一致，脑补区由扩散先验生成、D_sem 保证像真图。
+
+```yaml
+# 相对 Stage3 的增量
+model:
+  use_discriminator: true
+  use_semantic_d: true
+  use_texture_d: true
+  gan_enabled: true
+  dtex_conf_weight: true           # ★ D_tex 置信加权
+  use_swap_test: true
+  swap_ratio: 0.5
+  learning_rate: 0.000001          # ★ 再降一个量级
+  lr_D: 0.000001
+  lr_D_texture: 0.0000005
+  lambda_gan: 0.02                 # ★ 语义 GAN
+  lambda_gan_texture: 0.05         # ★ 纹理 GAN
+
+train:
+  resume_ckpt: "checkpoints/sd2_ref_gan_Stage3/last.ckpt"
+
+output:
+  experiment_name: "sd2_ref_gan_Stage4"
+```
+
+**验收标准**：
+
+1. `train/D_tex_conf` 稳定在 **0.4~0.6** 区间（可信区占比的健康范围）
+2. val/lpips 相对 Stage 3 进一步下降
+3. G/D loss 无持续发散（D_tex 的 hinge loss 在 0~2 区间波动为正常）
+
+---
+
+## **第三部分：操作流程**
+
+### **步骤 0：前置检查（10 分钟，只做一次）**
+
+在启动 Stage 1 之前，逐项确认六个文件的状态：
+
+```bash
+cd ~/projects/RefRWKV
+
+# 1. 语义模块：确认纯 PyTorch WKV 后端和 SR 条件分支存在
+grep -n "_wkv_scan_torch\|use_sr_condition" models/RefDiffRWKV/globalsemanticmodule.py | head -5
+
+# 2. Adapter：确认 SelfSimTransfer 存在且 rwkv_cfg 透传已修
+grep -n "sim_transfer2\|use_self_sim_transfer" models/RefDiffRWKV/sd2_ref_adapter.py
+grep -n "class SelfSimTransfer" models/RefDiffRWKV/RefDiffRWKV.py
+
+# 3. 判别器：确认 tex_weight 入口
+grep -n "tex_weight" models/RefDiffRWKV/sd2_ref_discriminator.py | head -3
+
+# 4. Generator：确认 use_sr_condition 透传和 scale2 门控
+grep -n "use_sr_condition\|cos_maps\[1\]" models/RefDiffRWKV/sd2_ref_generator.py
+
+# 5. GAN system：确认 pyramid 过滤和 dtex_conf_weight
+grep -n "semantic_pyramid\|dtex_conf_weight" models/RefDiffRWKV/sd2_ref_gan_system.py | head -5
+
+# 6. 训练脚本：确认 v2 开关日志和透传
+grep -n "v2 开关\|use_sr_condition\|dtex_conf_weight" scripts/train_sd2_gan.py
+```
+
+每一项都应该有输出。任何一项为空，说明对应文件的修改没有保存，回到对应章节补上。
+
+### **步骤 1：准备四份配置文件**
+
+把四个 yaml 放入 `configs/` 目录：
+
+```bash
+configs/sd2_ref_gan_stage1_baseline.yaml
+configs/sd2_ref_gan_stage2_semantic.yaml
+configs/sd2_ref_gan_stage3_texture.yaml
+configs/sd2_ref_gan_stage4_gan.yaml
+```
+
+检查两个路径在你的机器上存在：
+
+```bash
+ls /mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/refrwkv_sr/last.ckpt
+ls /mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/sd2_ref_gan_Phase1/last.ckpt
+```
+
+### **步骤 2：Stage 1 基线（半天）**
+
+```bash
+nohup python scripts/train_sd2_gan.py \
+  --config configs/sd2_ref_gan_stage1_baseline.yaml \
+  > logs/stage1.log 2>&1 &
+```
+
+**启动后 5 分钟内**检查：
+
+```bash
+# 确认开关全关
+grep "v2 开关" logs/stage1.log
+
+# 确认 resume 成功
+grep "Restored all states" logs/stage1.log
+```
+
+**之后每小时**检查：
+
+```bash
+# loss 曲线是否平滑（无尖峰）
+grep "train/G_diff_hr" logs/stage1.log | tail -20
+
+# 有无 CUDA 错误（无输出 = 健康）
+grep -i "illegal memory\|CUDA error" logs/stage1.log
+```
+
+**达标判定**：跑满 4 小时无 CUDA 错误且 loss 平滑，即可手动停止进入 Stage 2。Stage 1 不需要跑满 epoch——它的使命是验证，不是收敛。
+
+### **步骤 3：Stage 2 语义重训（1~1.5 天）**
+
+```bash
+nohup python scripts/train_sd2_gan.py \
+  --config configs/sd2_ref_gan_stage2_semantic.yaml \
+  > logs/stage2.log 2>&1 &
+```
+
+**关键观察点**：
+
+```bash
+# 确认新增参数随机初始化的日志
+grep "预期内新增参数" logs/stage2.log
+
+# 观察 loss 尖峰回落过程（前 1500 步最关键）
+grep "train/G_diff_hr" logs/stage2.log | head -50
+```
+
+loss 曲线应该是：resume 瞬间跳高（金字塔是随机的）→ 几百步内快速下降 → 1500 步内回到 0.05~0.12 区间。**如果 3000 步后仍高于 0.15**，停下来检查——可能 `sr_conditioner` 的位置编码或拼接有问题。
+
+**达标判定**：val/psnr 追平 Stage 1 记录的最佳值（约 22.05），跑 2~3 个完整 epoch 确认稳定。
+
+### **步骤 4：Stage 3 纹理链路（1 天）**
+
+```bash
+nohup python scripts/train_sd2_gan.py \
+  --config configs/sd2_ref_gan_stage3_texture.yaml \
+  > logs/stage3.log 2>&1 &
+```
+
+**启动后 5 分钟内**检查 missing keys 是否干净：
+
+```bash
+# 应该只有 sim_transfer 相关
+grep -A 10 "missing keys\|预期内新增" logs/stage3.log | head -15
+```
+
+**训练中关注三个信号**：
+
+```bash
+# 1. 前 200 步的扰动与回落
+grep "train/G_diff_hr" logs/stage3.log | head -30
+
+# 2. LPIPS 趋势（核心指标，应该下降）
+grep "train/G_lpips" logs/stage3.log | tail -20
+
+# 3. 每个 epoch 的 val/lpips
+grep "val/lpips" logs/stage3.log
+```
+
+**可视化检查（每 2 个 epoch 做一次）**：打开 TensorBoard 里的 `validation_tmp` 拼图，重点看两类区域——重复纹理区（农田、建筑群）的纹理是否比 Stage 2 更连贯；以及变化区域（如果数据里有）是否出现"贴上去的错误纹理"。前者改善、后者不出现，说明决策链在正确工作。
+
+### **步骤 5：Stage 4 GAN 精调（1~2 天）**
+
+```bash
+nohup python scripts/train_sd2_gan.py \
+  --config configs/sd2_ref_gan_stage4_gan.yaml \
+  > logs/stage4.log 2>&1 &
+```
+
+**新增监控项**：
+
+```bash
+# D_tex 置信占比：健康区间 0.4~0.6
+grep "train/D_tex_conf" logs/stage4.log | tail -20
+```
+
+`D_tex_conf` 的三个警示区间：**长期低于 0.2** 说明大部分样本 LCA 匹配失败（查数据对齐或 ref 增强强度）；**长期高于 0.8** 说明置信图无区分度（检查是否误用了 scale1 的 cos_map）；**剧烈波动** 说明 swap test 与加权可能在打架（把 swap_ratio 降到 0.3 试试）。
+
+### **步骤 6：数据归档（论文素材）**
+
+每个 Stage 结束后立即记录，不要等全部跑完：
+
+| 记录项 | 来源 | 用途 |
+|---|---|---|
+| 各 Stage 最佳 val/psnr、val/ssim、val/lpips | TensorBoard | 消融主表 |
+| Stage 2 vs Stage 1 的指标差 | 对比 | "SR 条件 + 新语义路径"的贡献 |
+| Stage 3 vs Stage 2 的指标差 | 对比 | "自相似迁移 + 门控"的贡献 |
+| Stage 4 vs Stage 3 的指标差 | 对比 | GAN + D_tex 加权的贡献 |
+| 传播前后 cos_map 可视化 | 单独跑 test 脚本 | 论文分析图 |
+| 重复纹理区的 Stage 2/3 对比图 | validation_tmp | 定性对比图 |
+
+---
+
+## **第四部分：故障速查**
+
+| 症状 | 最可能原因 | 处理 |
+|---|---|---|
+| Stage 1 又出现 CUDA IMA | 后端重写未生效或问题不在语义模块 | 检查 `globalsemanticmodule.py` 是否真是纯 PyTorch 版；若确认，IMA 来源在 adapter 的 `RUN_CUDA`，需要进一步排查 |
+| Stage 2 loss 尖峰后 3000 步不回落 | `sr_conditioner` 输出尺度异常 | 临时改 `use_sr_condition: false` 跑 500 步对比；若回落正常，检查 SR latent 的数值范围 |
+| Stage 3 resume 后 missing keys 超出 sim_transfer | 配置传递链断裂 | 检查 `rwkv_cfg` 在 yaml 里的缩进层级，以及 adapter 的 `cfg.get` 透传 |
+| Stage 3 LPIPS 上升而非下降 | 传播过强，纹理被"抹匀" | `self_sim_init_alpha` 降到 0.15 重启 Stage 3 |
+| Stage 4 `D_tex_conf` 长期 < 0.2 | 数据对齐或 ref 增强过强 | 先用 `ref_aug_probs` 全 0 跑 100 步看 conf 是否回升 |
+| 任何阶段 OOM | sim_transfer 的亲和矩阵显存（~156MB） | 确认没有误开 scale1 传播；`expandable_segments` 保持注释状态 |
+
+整套流程走下来，你会得到一条每个特性增益都可量化、每张消融图都有出处的完整实验链——从 IMA 崩溃的调试记录，到四阶段的递进式验证，这条链本身就是论文 rebuttal 里回应"方法有效性"质疑的最硬材料。
