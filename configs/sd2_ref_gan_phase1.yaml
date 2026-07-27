@@ -1,0 +1,142 @@
+# ============================================================
+# Stage 1 — 纯扩散基线（use_semantic 临时关闭）
+# 目标：1) 验证纯 PyTorch 环境连续 4h+ 无 CUDA IMA
+#       2) 确认 UNet/LoRA/Adapter 权重无缝继承（loss 无跳变）
+# 说明：v2 后端的 WKV 公式已变更，金字塔权重反正要重训——
+#       将"重训代价"与"收益验证"都推迟到 Stage 2 单独度量，
+#       本阶段保住干净基线。通过标准达成后进入 Stage 2。
+# ============================================================
+
+pretrained:
+  sd2_control_ckpt: null
+
+model:
+  lr_key: "lr"
+  ref_key: "ref"
+  hr_key: "hr"
+
+  strategy: "rwkv"
+  rwkv_cfg:
+    patch_size: 4
+    embed_dim: 192
+    in_channels: 3
+    upsample_mode: "bilinear"
+    use_self_sim_transfer: false   # v2：关闭
+    self_sim_topk: 8
+
+  sd_model_path: "sd2-community/stable-diffusion-2-1-base"
+
+  use_lora: true
+  lora_rank: 64
+  lora_target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0
+
+  sd_locked: true
+
+  use_semantic: false              # ★ 本阶段关闭：隔离 pyramid 重训变量
+  dinov2_model_name: "facebook/dinov2-base"
+  use_sr_condition: false          # v2：关闭
+
+  num_train_timesteps: 1000
+  beta_start: 0.00085
+  beta_end: 0.012
+  beta_schedule: "scaled_linear"
+  prediction_type: "epsilon"
+
+  t_min: 300
+  t_max: 700
+
+  cfg_drop_prob: 0.2
+  control_scale: 1.0
+
+  use_sr_latent_cond: true
+  sr_enabled: true
+  sr_fixed: true
+  sr_lr: 1.0e-5
+  sr:
+    inp_channels: 3
+    out_channels: 3
+    dim: 48
+    num_blocks: [4, 6, 6, 8]
+    num_refinement_blocks: 4
+    scale: 10
+    drop_path_rate: 0.1
+    hidden_rate: 4
+    ckpt_path: "/mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/refrwkv_sr/last.ckpt"
+
+  use_discriminator: false
+  gan_enabled: false
+  dtex_conf_weight: false
+
+  use_confidence_gate: false
+  confidence_alpha: 0.4
+  use_temporal_gate: false
+
+  learning_rate: 0.00001
+  weight_decay: 0.001
+
+  lambda_diff_sr: 0.0
+  lambda_lpips: 0.0
+  lambda_gan: 0.0
+  lambda_gan_texture: 0.0
+
+  use_amp: false
+  accumulate_grad_batches: 8
+  g_d_ratio: 1
+  max_consecutive_nan: 20
+
+  grad_clip_val: 1.0
+  grad_warn_threshold: 100.0
+
+  sample_steps: 20
+  fr_metrics:
+    - psnr
+    - ssim
+    - lpips
+
+  t_start: 300
+  guidance_scale: 0.0
+  t_stop: 200
+
+data:
+  root: "/mnt/sda/home/zhangheyi/projects/RefRWKV/RefSR_data/ALL_2"
+  patch_size: 480
+  scale: 10
+  augment: true
+  augment_ref: true
+  ref_aug_strengths: [0.15, 0.15, 0.15, 0.03]
+  ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
+  ref_gray_prob: 0.3
+  max_samples_train: null
+  max_samples_val: null
+  max_samples_test: null
+  batch_size: 1
+  val_batch_size: 1
+  num_workers: 4
+  val_num_workers: 2
+  prefetch_factor: 2
+
+train:
+  devices: 1
+  precision: "32"
+  max_epochs: 100
+  val_check_interval: 0.1
+  log_every_n_steps: 20
+  early_stopping_patience: 50
+  save_top_k: 3
+  detect_anomaly: false
+  seed: 42
+
+  resume_ckpt: "/mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/sd2_ref_gan_Phase1/last.ckpt"
+
+  best_save:
+    metrics: ["psnr", "ssim"]
+    min_improved: 2
+
+output:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs/sd2_ref_gan"
+  experiment_name: "sd2_ref_gan_Stage1"
