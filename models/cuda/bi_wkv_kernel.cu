@@ -5,7 +5,7 @@
 
 #include <torch/extension.h>
 #include <cuda.h>
-#include <THC/THCAtomics.cuh>
+#include <ATen/cuda/Atomic.cuh>
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -394,7 +394,7 @@ torch::Tensor bi_wkv_cuda_forward(
     assert(batch_size * num_channels % threads.y == 0);
     const dim3 blocks(batch_size * num_channels / threads.y);
 
-    AT_DISPATCH_FLOATING_TYPES(k.type(), "bi_wkv_forward_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(k.scalar_type(), "bi_wkv_forward_cuda", ([&] {
         bi_wkv_cuda_forward_kernel<scalar_t><<<blocks, threads>>>(
             batch_size,
             num_tokens,
@@ -431,7 +431,7 @@ std::vector<torch::Tensor> bi_wkv_cuda_backward(
     assert(batch_size * num_channels % threads.y == 0);
     const dim3 blocks(batch_size * num_channels / threads.y);
 
-    AT_DISPATCH_FLOATING_TYPES(k.type(), "bi_wkv_backward_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(k.scalar_type(), "bi_wkv_backward_cuda", ([&] {
         bi_wkv_cuda_backward_kernel<scalar_t><<<blocks, threads>>>(
             batch_size,
             num_tokens,
