@@ -23,7 +23,7 @@ data:
   ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
   ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
   ref_gray_prob: 0.2
-  batch_size: 4
+  batch_size: 6
   val_batch_size: 1
   num_workers: 4
   val_num_workers: 2
