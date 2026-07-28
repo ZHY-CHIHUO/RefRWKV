@@ -25,9 +25,9 @@ data:
   ref_gray_prob: 0.2
   batch_size: 6
   val_batch_size: 1
-  num_workers: 4
+  num_workers: 8
   val_num_workers: 2
-  prefetch_factor: 4
+  prefetch_factor: 6
 
 train:
   devices: 1
