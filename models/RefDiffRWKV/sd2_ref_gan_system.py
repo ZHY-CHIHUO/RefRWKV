@@ -446,10 +446,7 @@ class SD2RefGANSystem(LightningModule):
         self._g_steps_since_d = 0
 
     def load_state_dict(self, state_dict, strict=True):
-        # ★ WKV 公式变更：WKV 扫描从简化版（忽略 k）升级为标准 RWKV4
-        # （含 k 加权与 first/u bonus），旧金字塔权重语义不兼容，
-        # 跳过让其随机初始化重训。UNet/LoRA/Adapter/sem_proj/proj
-        # 均不受影响，正常继承。
+        # ★ WKV 公式变更：跳过 semantic_pyramid 权重（如果 checkpoint 中有的话）
         skip_prefix = "generator.global_semantic.semantic_pyramid."
         skipped = [k for k in state_dict if k.startswith(skip_prefix)]
         if skipped:
@@ -461,6 +458,20 @@ class SD2RefGANSystem(LightningModule):
                 k: v for k, v in state_dict.items() if not k.startswith(skip_prefix)
             }
             strict = False
+
+        # ★ Stage1(use_semantic=False) → Stage2(use_semantic=True) 过渡：
+        # checkpoint 中完全没有 global_semantic / sem_proj 权重，
+        # DINOv2 从预训练加载，pyramid/proj/sr_conditioner 随机初始化
+        if self.generator.global_semantic is not None:
+            has_semantic_in_ckpt = any(
+                k.startswith("generator.global_semantic.") for k in state_dict
+            )
+            if not has_semantic_in_ckpt:
+                logger.info(
+                    "Checkpoint 无 global_semantic 权重（Stage1→2 过渡），"
+                    "DINOv2 从预训练加载，pyramid/proj 随机初始化"
+                )
+                strict = False
 
         # ★ Phase2 从 Phase1 checkpoint 恢复时，discriminator 权重不存在
         if self.discriminator is not None:
@@ -478,9 +489,14 @@ class SD2RefGANSystem(LightningModule):
         result = super().load_state_dict(state_dict, strict=strict)
         missing, unexpected = result.missing_keys, result.unexpected_keys
 
-        # 只警告非 discriminator / 非预期新增的缺失 key
         if missing:
-            expected_new = ("semantic_pyramid", "sr_conditioner", "sim_transfer")
+            expected_new = (
+                "semantic_pyramid",
+                "sr_conditioner",
+                "sim_transfer",
+                "global_semantic",
+                "sem_proj",
+            )
             non_disc = [
                 k
                 for k in missing
@@ -500,7 +516,7 @@ class SD2RefGANSystem(LightningModule):
             if expected_missing:
                 logger.info(
                     "load_state_dict: %d 个预期内新增参数随机初始化 "
-                    "(semantic_pyramid 重训 / sr_conditioner / sim_transfer)",
+                    "(global_semantic / sem_proj / pyramid / sr_conditioner)",
                     len(expected_missing),
                 )
         if unexpected:
