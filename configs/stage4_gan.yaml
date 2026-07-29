@@ -61,7 +61,7 @@ model:
     scale: 10
     drop_path_rate: 0.1
     hidden_rate: 4
-    ckpt_path: "/mnt/sda/home/zhangheyi/projects/RefRWKV/checkpoints/refrwkv_sr/last.ckpt"
+    ckpt_path: "checkpoints/refrwkv_sr/last.ckpt"
 
   use_discriminator: true
   use_semantic_d: true
@@ -105,7 +105,7 @@ model:
   t_stop: 200
 
 data:
-  root: "/mnt/sda/home/zhangheyi/projects/RefRWKV/RefSR_data/ALL_2"
+  root: "RefSR_data/ALL_2"
   patch_size: 480
   scale: 10
   augment: true
