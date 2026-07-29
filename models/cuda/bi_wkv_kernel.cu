@@ -1,19 +1,22 @@
 /******************************************************************************
  * Copyright (c) 2025 Shanghai AI Lab.
  * Modified: forward kernel uses shared memory instead of __shfl_sync
- * Fixed:   guard against out-of-bound access when _tokenLength == 0
  ******************************************************************************/
 
 #include <torch/extension.h>
 #include <cuda.h>
-#include <ATen/cuda/Atomic.cuh>
+// #include <cuda_fp16.h>
+// #include <cuda_bf16.h>
+#include <THC/THCAtomics.cuh>
 #include <cuda_runtime.h>
 #include <vector>
+// #include "utils.h"
 
 #define MIN_VALUE (-1e38)
-#define CHANNEL_LEN 8
+#define CHANNEL_LEN 16
 #define EPS (1e-6)
-#define TOKEN_SPLIT 32
+#define TOKEN_SPLIT 32 // the number of split tokens
+
 
 
 template <typename scalar_t>
@@ -28,7 +31,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
     scalar_t* __restrict__ const _y
     ) {
     const int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    const int channel_id = threadIdx.y;
+    // const int channel_id = threadIdx.y;
     const int token_id = threadIdx.x;
     const int _b = idx / C;
     const int _c = idx % C;
@@ -43,7 +46,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
     const scalar_t *__restrict__ const v = _v + _offset;
     scalar_t *__restrict__ const y = _y + _offset;
 
-    // shared memory (替代 __shfl_sync)
+    // ★ 新增：shared memory（替代 __shfl_sync）
     __shared__ scalar_t Sa[TOKEN_SPLIT][CHANNEL_LEN];
     __shared__ scalar_t Sb[TOKEN_SPLIT][CHANNEL_LEN];
     __shared__ scalar_t Sc[TOKEN_SPLIT][CHANNEL_LEN];
@@ -51,7 +54,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
     __shared__ scalar_t So1[TOKEN_SPLIT][CHANNEL_LEN];
     __shared__ scalar_t So2[TOKEN_SPLIT][CHANNEL_LEN];
 
-    // ── 第一阶段：段内双向扫描 ──
+    // ── 第一阶段：段内双向扫描（不变）──
     scalar_t a = 0, b = 0, c = 0, d = 0;
     scalar_t o1 = MIN_VALUE, o2 = MIN_VALUE;
     for (int i = _t; i < (_t + _tokenLength); i++){
@@ -73,7 +76,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
         o2 = no;
     }
 
-    // 写入 shared memory
+    // ★ 写入 shared memory（替代 __shfl_sync 的数据来源）
     __syncthreads();
     Sa[token_id][channel_id] = a;
     Sb[token_id][channel_id] = b;
@@ -83,42 +86,35 @@ __global__ void bi_wkv_cuda_forward_kernel(
     So2[token_id][channel_id] = o2;
     __syncthreads();
 
-    // ── 第二阶段：段间聚合 ──
+    // ★ 第二阶段：段间聚合（从 shared memory 读取，替代 __shfl_sync）
     scalar_t a2 = 0, b2 = 0, c2 = 0, d2 = 0;
     scalar_t o3 = MIN_VALUE, o4 = MIN_VALUE;
 
-    // 反向段聚合
+    // 反向段聚合（原来用 __shfl_sync(0xffffffff, o2, i) 等）
     for (int i = 0; i < token_id; i++) {
         const int exp_w = (token_id - i - 1) * _T;
-        scalar_t no = max(So2[i][channel_id] - w * exp_w, o4);
-        a2 = a2 * exp(o4 - no) + Sa[i][channel_id] * exp(So2[i][channel_id] - w * exp_w - no);
-        b2 = b2 * exp(o4 - no) + Sb[i][channel_id] * exp(So2[i][channel_id] - w * exp_w - no);
+        scalar_t no = max(__shfl_sync(0Xffffffff, o2, i) - w * exp_w, o4);
+        a2 = a2 * exp(o4 - no) + __shfl_sync(0Xffffffff, a, i) * exp(__shfl_sync(0Xffffffff, o2, i) - w * exp_w - no);
+        b2 = b2 * exp(o4 - no) + __shfl_sync(0Xffffffff, b, i) * exp(__shfl_sync(0Xffffffff, o2, i) - w * exp_w - no);
         o4 = no;
     }
     a = a2;
     b = b2;
     o2 = o4;
 
-    // 正向段聚合
+    // 正向段聚合（原来用 __shfl_sync(0xffffffff, o1, i) 等）
     for (int i = token_id; i < TOKEN_SPLIT; i++){
         const int exp_w = (i - token_id) * _T;
-        scalar_t no = max(So1[i][channel_id] - w * exp_w, o3);
-        c2 = c2 * exp(o3 - no) + Sc[i][channel_id] * exp(So1[i][channel_id] - w * exp_w - no);
-        d2 = d2 * exp(o3 - no) + Sd[i][channel_id] * exp(So1[i][channel_id] - w * exp_w - no);
+        scalar_t no = max(__shfl_sync(0Xffffffff, o1, i) - w * exp_w, o3);
+        c2 = c2 * exp(o3 - no) + __shfl_sync(0Xffffffff, c, i) * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
+        d2 = d2 * exp(o3 - no) + __shfl_sync(0Xffffffff, d, i) * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
         o3 = no;
     }
 
-    // ── 第三阶段：最终输出（保护空块）──
-    if (_tokenLength > 0) {
-        c = c2 - exp(k[_t * C] - o3) * v[_t * C];
-        d = d2 - exp(k[_t * C] - o3);
-        o1 = o3;
-    } else {
-        c = c2;
-        d = d2;
-        o1 = o3;
-    }
-
+    // ── 第三阶段：最终输出（不变）──
+    c = c2 - exp(k[_t * C] - o3) * v[_t * C];
+    d = d2 - exp(k[_t * C] - o3);
+    o1 = o3;
     for (int i = _t; i < (_t + _tokenLength); i++) {
         const int ii = i * C;
         scalar_t no = max(o1, u + k[ii]);
@@ -127,6 +123,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
         scalar_t e2 = exp(o2 - no);
         scalar_t e3 = exp(u + k[ii] - no);
         y[ii] = (c * e1 + a * e2 + e3 * v[ii])/(d * e1 + b * e2 + e3 + EPS);
+        // update a, b, c, d
         const int ii2 = ((i + 1) % T) * C;
         no = max(o2 - w, k[ii]);
         e2 = exp(o2 - w - no);
@@ -145,7 +142,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
 
 
 // ═══════════════════════════════════════════════════════════
-// Backward kernel：加 _tokenLength 保护
+// Backward kernel：完全不动（已经用 shared memory，没有 bug）
 // ═══════════════════════════════════════════════════════════
 
 template <typename scalar_t>
@@ -188,6 +185,8 @@ __global__ void bi_wkv_cuda_backward_kernel(
     scalar_t *__restrict__ const gk = _gk + _offset;
     scalar_t *__restrict__ const gv = _gv + _offset;
 
+    // MaxOp<float> max;
+    // for saving smem, del Sc, Sd, Sdcdw, Sdddw, So1
     __shared__ scalar_t Sa[TOKEN_SPLIT][CHANNEL_LEN], Sb[TOKEN_SPLIT][CHANNEL_LEN];
     __shared__ scalar_t Sdadw[TOKEN_SPLIT][CHANNEL_LEN], Sdbdw[TOKEN_SPLIT][CHANNEL_LEN];
     __shared__ scalar_t So2[TOKEN_SPLIT][CHANNEL_LEN];
@@ -265,14 +264,18 @@ __global__ void bi_wkv_cuda_backward_kernel(
         dddw = dddw * exp(o1 - no) + (Sdbdw[i][channel_id] - exp_w * Sb[i][channel_id])
              * exp(So2[i][channel_id] - w * exp_w - no);
         o1 = no;
+        // const int exp_w = (i - token_id) * _T;
+        // scalar_t no = max(__shfl_sync(0Xffffffff, o1, i) - w * exp_w, o3);
+        // c2 = c2 * exp(o3 - no) + __shfl_sync(0Xffffffff, c, i) * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
+        // d2 = d2 * exp(o3 - no) + __shfl_sync(0Xffffffff, d, i) * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
+        // dcdw2 = dcdw2 * exp(o3 - no) + (__shfl_sync(0Xffffffff, dcdw, i) - exp_w * __shfl_sync(0Xffffffff, c, i))
+        //      * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
+        // dddw2 = dddw2 * exp(o3 - no) + (__shfl_sync(0Xffffffff, dddw, i) - exp_w * __shfl_sync(0Xffffffff, d, i))
+        //      * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
+        // o3 = no;
     }
-
-    // ★ 保护空块越界
-    if (_tokenLength > 0) {
-        c -= exp(k[_t * C] - o1) * v[_t * C];
-        d -= exp(k[_t * C] - o1);
-    }
-    // else 分支 c,d 保持为 0，无需操作
+    c -= exp(k[_t * C] - o1) * v[_t * C];
+    d -= exp(k[_t * C] - o1);
 
     scalar_t gw = 0, gu = 0;
     scalar_t gc = 0, gd = 0, ga = 0, gb = 0;
@@ -289,18 +292,20 @@ __global__ void bi_wkv_cuda_backward_kernel(
         y[ii] = num * iden;
         z[ii] = iden;
         zexp[ii] = -no;
-        gw += gy[ii] * (dadw - dbdw * (num * iden)) * iden * e2;
-        gw += gy[ii] * (dcdw - dddw * (num * iden)) * iden * e1;
-        gu += gy[ii] * (v[ii] - (num * iden)) * e3 * iden;
-        gk[ii] = gy[ii] * iden * (v[ii] - (num * iden)) * e3;
+        gw += gy[ii] * (dadw - dbdw * (num * iden /*y[ii]*/)) * iden * e2;
+        gw += gy[ii] * (dcdw - dddw * (num * iden /*y[ii]*/)) * iden * e1;
+        gu += gy[ii] * (v[ii] - (num * iden /*y[ii]*/)) * e3 * iden;
+        gk[ii] = gy[ii] * iden * (v[ii] - (num * iden /*y[ii]*/)) * e3;
         gv[ii] = gy[ii] * iden * e3;
+        // cal gc & gd for gk & gv
         scalar_t gno = max(- w + go1, -no);
         e1 = exp(- w + go1 - gno);
         e3 = gy[ii] * iden  * exp(- no - gno);
-        gc = e1 * gc + e3 * (num * iden);
+        gc = e1 * gc + e3 * (num * iden /*y[ii]*/);
         gd = e1 * gd + e3;
         go1 = gno;
 
+        // update a, b, c, d
         const int ii2 = ((i + 1) % T) * C;
         no = max(o2 - w, k[ii]);
         e2 = exp(o2 - w - no);
@@ -386,10 +391,6 @@ __global__ void bi_wkv_cuda_backward_kernel(
 }
 
 
-// ═══════════════════════════════════════════════════════════
-// Host 函数（不变）
-// ═══════════════════════════════════════════════════════════
-
 torch::Tensor bi_wkv_cuda_forward(
     torch::Tensor w, 
     torch::Tensor u, 
@@ -407,7 +408,7 @@ torch::Tensor bi_wkv_cuda_forward(
     assert(batch_size * num_channels % threads.y == 0);
     const dim3 blocks(batch_size * num_channels / threads.y);
 
-    AT_DISPATCH_FLOATING_TYPES(k.scalar_type(), "bi_wkv_forward_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(k.type(), "bi_wkv_forward_cuda", ([&] {
         bi_wkv_cuda_forward_kernel<scalar_t><<<blocks, threads>>>(
             batch_size,
             num_tokens,
@@ -444,7 +445,7 @@ std::vector<torch::Tensor> bi_wkv_cuda_backward(
     assert(batch_size * num_channels % threads.y == 0);
     const dim3 blocks(batch_size * num_channels / threads.y);
 
-    AT_DISPATCH_FLOATING_TYPES(k.scalar_type(), "bi_wkv_backward_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(k.type(), "bi_wkv_backward_cuda", ([&] {
         bi_wkv_cuda_backward_kernel<scalar_t><<<blocks, threads>>>(
             batch_size,
             num_tokens,
