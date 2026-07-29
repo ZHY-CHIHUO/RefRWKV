@@ -15,7 +15,7 @@ model:
   warmup_steps: 500
 
 data:
-  root: "/mnt/sda/home/zhangheyi/projects/RefRWKV/RefSR_data/ALL_2"
+  root: "/home/zhy/PROJECT/RefRWKV/RefSR_data/ALL_2"
   patch_size: 480
   scale: 10
   augment: true
