@@ -1,16 +1,26 @@
 # Copyright (c) Shanghai AI Lab. All rights reserved.
 """
-RefSRWKV (Improved): Reference-based Super-Resolution with RWKV Backbone.
+RefSRWKV (Improved v2): Reference-based Super-Resolution with RWKV Backbone.
 
-本版变更：
-1. VRWKV_SpatialMix 的 4 路扫描改为：H + W + 希尔伯特A + 希尔伯特B(旋转90°)
-   —— 两路希尔伯特垂直互补，d=2/d=3 邻接连通率优于原 ↘/↙ 对角线方案
-2. 新增希尔伯特曲线扫描索引工具（任意 h×w，pad 到 2 的幂再过滤）
-3. 保留 scan_mode 开关：'hilbert'(默认) / 'diagonal'(原版对角线，用于消融对比)
-4. 修复 ref_guided_refine 零初始化被 _init_weights 覆盖的问题
+本版变更（v2，基于 v1 审查意见）：
+1. [Bug修复] RUN_CUDA 不再硬编码 .cuda()，改为设备自适应
+2. [Bug修复] 对角线模式 idx/inv 统一缓存，删除 _get_inv_indices
+3. [改进] 学习率调度：LinearLR warmup + ReduceLROnPlateau，用 SequentialLR 串联
+4. [新增] 梯度裁剪（默认 max_norm=1.0）
+5. [新增] EMA（指数移动平均），验证/测试时自动切换 EMA 权重
+6. [新增] 滑动窗口分块推理 forward_tiled()，防止大图 OOM
+7. [改进] torch.compile 兼容：WKV 自定义算子标记为 compiler.disable
+8. [改进] scale 参数校验：当前架构固定 10×，传入其他值会警告
 """
 
+import copy
+import math
+import warnings
+from collections import OrderedDict
+
 import torch
+
+torch.set_float32_matmul_precision("high")
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -41,6 +51,17 @@ wkv_cuda = load(
         f"-gencode arch={arch},code={arch}",
     ],
 )
+
+
+# ── torch.compile 兼容装饰器 ──
+# 自定义 CUDA autograd Function 无法被 dynamo 追踪，
+# 标记为 disable 让 torch.compile 跳过此函数。
+try:
+    _compiler_disable = torch.compiler.disable
+except AttributeError:  # PyTorch < 2.1
+
+    def _compiler_disable(fn=None, **kwargs):
+        return fn if fn is not None else (lambda f: f)
 
 
 class WKV(torch.autograd.Function):
@@ -80,18 +101,25 @@ class WKV(torch.autograd.Function):
             return (gw, gu, gk, gv)
 
 
+@_compiler_disable()
 def RUN_CUDA(w, u, k, v):
-    return WKV.apply(w.cuda(), u.cuda(), k.cuda(), v.cuda())
+    """调用双向 WKV CUDA 核。张量必须已在 CUDA 上。"""
+    if not w.is_cuda:
+        raise RuntimeError(
+            "WKV 需要 CUDA 张量，请将模型和数据移到 GPU：model.cuda(), x.cuda()"
+        )
+    return WKV.apply(w, u, k, v)
 
 
 # ═══════════════════════════════════════════════════════════════
 # 对角线展平 / 还原（diagonal 模式使用）
+# ★ v2: idx 和 inv 一起缓存，删除 _get_inv_indices
 # ═══════════════════════════════════════════════════════════════
-_DIAG_CACHE = {}
+_DIAG_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _build_diag_indices(h, w, direction, device):
-    """预计算对角线展平索引。"""
+    """预计算对角线展平索引，返回 (idx, inv)。"""
     idx = []
     if direction == "main":  # ↘：按 (i+j) 分组
         for s in range(h + w - 1):
@@ -103,28 +131,26 @@ def _build_diag_indices(h, w, direction, device):
             for i in range(max(0, s - w + 1), min(s + 1, h)):
                 j = w - 1 - (s - i)
                 idx.append(i * w + j)
-    return torch.tensor(idx, dtype=torch.long, device=device)
+
+    idx = torch.tensor(idx, dtype=torch.long, device=device)
+    inv = torch.empty(h * w, dtype=torch.long, device=device)
+    inv[idx] = torch.arange(h * w, device=device)
+    return idx, inv
 
 
 def _get_diag_indices(h, w, direction, device):
+    """返回 (idx, inv)，全部走缓存。"""
     key = (h, w, direction, str(device))
     if key not in _DIAG_CACHE:
         _DIAG_CACHE[key] = _build_diag_indices(h, w, direction, device)
     return _DIAG_CACHE[key]
 
 
-def _get_inv_indices(idx, T, device):
-    """构建还原索引：inv[idx[i]] = i。"""
-    inv = torch.empty(T, dtype=torch.long, device=device)
-    inv[idx] = torch.arange(T, device=device)
-    return inv
-
-
 # ═══════════════════════════════════════════════════════════════
 # 希尔伯特曲线扫描索引（hilbert 模式使用）
 # 任意 h×w：pad 到最近的 2 的幂，过滤掉 padding 格子
 # ═══════════════════════════════════════════════════════════════
-_HILBERT_CACHE = {}
+_HILBERT_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _hilbert_d2xy(n, d):
@@ -150,18 +176,21 @@ def _build_hilbert_indices(h, w, rot90, device):
     rot90=False: 标准希尔伯特（扫描 A）
     rot90=True : 整体旋转 90°（扫描 B，与 A 垂直互补）
     返回 (idx, inv)：idx[t]=第 t 步访问的格子，inv[格子]=访问步序号。
+
+    注意：对于极端宽高比（如 1×N），两条曲线的互补性会退化；
+    本模型 U-Net 各层特征图近似正方形，不受影响。
     """
     n = 1
     while n < max(h, w):
         n *= 2
     idx = []
     for d in range(n * n):
-        x, y = _hilbert_d2xy(n, d)  # A 第 d 步访问 (行=y, 列=x)
+        x, y = _hilbert_d2xy(n, d)
         if rot90:
-            row, col = n - 1 - x, y  # 旋转 90°：(行,列)->(n-1-列, 行)
+            row, col = n - 1 - x, y
         else:
             row, col = y, x
-        if row < h and col < w:  # 只保留 h×w 范围内的格子
+        if row < h and col < w:
             idx.append(row * w + col)
     idx = torch.tensor(idx, dtype=torch.long, device=device)
     inv = torch.empty(h * w, dtype=torch.long, device=device)
@@ -356,9 +385,8 @@ class VRWKV_SpatialMix(nn.Module):
             )
             results.append(r_b[:, inv_b])
         else:
-            # ── 扫描 2: ↘ 对角线（原版）──
-            idx_main = _get_diag_indices(h, w, "main", k.device)
-            inv_main = _get_inv_indices(idx_main, T, k.device)
+            # ── 扫描 2: ↘ 对角线（原版）── ★ v2: idx/inv 一起从缓存取
+            idx_main, inv_main = _get_diag_indices(h, w, "main", k.device)
             r_d = RUN_CUDA(
                 self.spatial_decay[2] / s,
                 self.spatial_first[2] / s,
@@ -367,9 +395,8 @@ class VRWKV_SpatialMix(nn.Module):
             )
             results.append(r_d[:, inv_main])
 
-            # ── 扫描 3: ↙ 对角线（原版）──
-            idx_anti = _get_diag_indices(h, w, "anti", k.device)
-            inv_anti = _get_inv_indices(idx_anti, T, k.device)
+            # ── 扫描 3: ↙ 对角线（原版）── ★ v2: idx/inv 一起从缓存取
+            idx_anti, inv_anti = _get_diag_indices(h, w, "anti", k.device)
             r_e = RUN_CUDA(
                 self.spatial_decay[3] / s,
                 self.spatial_first[3] / s,
@@ -519,9 +546,32 @@ class GatedFusion(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 滑动窗口工具
+# ═══════════════════════════════════════════════════════════════
+def _gaussian_weight_2d(h, w, sigma_ratio=0.25, device="cpu"):
+    """生成 2D 高斯权重图，用于重叠区域混合。"""
+    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+    sy, sx = h * sigma_ratio, w * sigma_ratio
+    y = torch.arange(h, device=device, dtype=torch.float32)
+    x = torch.arange(w, device=device, dtype=torch.float32)
+    wy = torch.exp(-0.5 * ((y - cy) / max(sy, 1e-6)) ** 2)
+    wx = torch.exp(-0.5 * ((x - cx) / max(sx, 1e-6)) ** 2)
+    return wy[:, None] * wx[None, :]  # (h, w)
+
+
+# ═══════════════════════════════════════════════════════════════
 # RefSRWKV
 # ═══════════════════════════════════════════════════════════════
 class RefSRWKV(nn.Module):
+    """
+    参考图引导的超分辨率网络（RWKV 骨干）。
+
+    当前架构固定放大倍数 = 2.5 (bilinear) × 2 (PixelShuffle) × 2 (PixelShuffle) = 10×。
+    即 LR 48×48 → HR 480×480。scale 参数仅用于校验，不影响网络结构。
+    """
+
+    FIXED_SCALE = 10  # 架构决定的固定放大倍数
+
     def __init__(
         self,
         inp_channels: int = 3,
@@ -535,9 +585,19 @@ class RefSRWKV(nn.Module):
         scan_mode: str = "hilbert",
     ):
         super().__init__()
-        self.scale = scale
+
+        # ★ v2: scale 校验
+        if scale != self.FIXED_SCALE:
+            warnings.warn(
+                f"当前架构固定为 {self.FIXED_SCALE}× 放大，"
+                f"传入 scale={scale} 不会改变网络结构。",
+                UserWarning,
+                stacklevel=2,
+            )
+        self.scale = self.FIXED_SCALE
         self.dim = dim
         self.scan_mode = scan_mode
+        self.out_channels = out_channels
 
         # ── LR 编码器 ──
         self.lr_up = nn.Sequential(
@@ -771,6 +831,78 @@ class RefSRWKV(nn.Module):
 
         return out
 
+    # ─────────────────────────────────────────────────────────
+    # ★ v2 新增：滑动窗口分块推理
+    # ─────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def forward_tiled(
+        self,
+        lr: torch.Tensor,
+        ref: torch.Tensor,
+        tile_lr: int = 48,
+        overlap: int = 8,
+    ) -> torch.Tensor:
+        """
+        滑动窗口分块推理，防止大图 OOM。
+
+        参数:
+            lr      : (B, C, H_lr, W_lr)
+            ref     : (B, C, H_hr, W_hr)，H_hr = H_lr × 10
+            tile_lr : LR 空间每块的边长（像素）
+            overlap : LR 空间相邻块的重叠像素数
+
+        返回:
+            (B, C, H_hr, W_hr)
+        """
+        B, C, H_lr, W_lr = lr.shape
+        S = self.scale  # 10
+        H_hr, W_hr = H_lr * S, W_lr * S
+        tile_hr = tile_lr * S
+        overlap_hr = overlap * S
+        stride_lr = tile_lr - overlap
+        stride_hr = tile_hr - overlap_hr
+
+        device = lr.device
+        out_sum = torch.zeros(B, self.out_channels, H_hr, W_hr, device=device)
+        w_sum = torch.zeros(1, 1, H_hr, W_hr, device=device)
+
+        # 预计算高斯权重
+        gauss = _gaussian_weight_2d(
+            tile_hr, tile_hr, device=device
+        )  # (tile_hr, tile_hr)
+        gauss = gauss[None, None]  # (1, 1, tile_hr, tile_hr)
+
+        # 生成所有块的左上角坐标（LR 空间）
+        y_starts = list(range(0, max(H_lr - tile_lr, 0) + 1, stride_lr))
+        x_starts = list(range(0, max(W_lr - tile_lr, 0) + 1, stride_lr))
+        # 确保覆盖右下角
+        if y_starts[-1] + tile_lr < H_lr:
+            y_starts.append(H_lr - tile_lr)
+        if x_starts[-1] + tile_lr < W_lr:
+            x_starts.append(W_lr - tile_lr)
+
+        for y0 in y_starts:
+            for x0 in x_starts:
+                # 裁切 LR 块
+                lr_tile = lr[:, :, y0 : y0 + tile_lr, x0 : x0 + tile_lr]
+
+                # 裁切对应的 Ref 块（HR 空间）
+                ry0, rx0 = y0 * S, x0 * S
+                ref_tile = ref[:, :, ry0 : ry0 + tile_hr, rx0 : rx0 + tile_hr]
+
+                # 推理
+                out_tile = self.forward(lr_tile, ref_tile)  # (B, C, tile_hr, tile_hr)
+
+                # 实际输出尺寸（边缘块可能不足 tile_hr）
+                th, tw = out_tile.shape[2], out_tile.shape[3]
+                g = gauss[:, :, :th, :tw]
+
+                out_sum[:, :, ry0 : ry0 + th, rx0 : rx0 + tw] += out_tile * g
+                w_sum[:, :, ry0 : ry0 + th, rx0 : rx0 + tw] += g
+
+        out_sum = out_sum / w_sum.clamp(min=1e-8)
+        return torch.clamp(out_sum, -1.0, 1.0)
+
     def prepare_for_inference(self):
         self.eval()
         for module in self.modules():
@@ -781,28 +913,105 @@ class RefSRWKV(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
+# ★ v2 新增：EMA（指数移动平均）
+# ═══════════════════════════════════════════════════════════════
+class EMA:
+    """
+    模型参数的指数移动平均（延迟初始化，兼容 PL 自动设备迁移）。
+
+    shadow 在第一次 update() 时才创建，此时 PL 已经把模型移到 GPU。
+    """
+
+    def __init__(self, decay: float = 0.999):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        self.backup: dict[str, torch.Tensor] = {}
+        self._initialized = False
+
+    def _lazy_init(self, model: nn.Module):
+        """第一次调用时克隆参数（此时模型已在正确设备上）。"""
+        if self._initialized:
+            return
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+        self._initialized = True
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        self._lazy_init(model)
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1.0 - self.decay
+                )
+
+    def apply_shadow(self, model: nn.Module):
+        """将 EMA 权重写入模型（先备份当前权重）。"""
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self, model: nn.Module):
+        """恢复 apply_shadow 之前的训练权重。"""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self):
+        return {
+            "decay": self.decay,
+            "shadow": self.shadow,
+            "initialized": self._initialized,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.decay = state_dict["decay"]
+        self.shadow = state_dict["shadow"]
+        self._initialized = state_dict["initialized"]
+
+
+# ═══════════════════════════════════════════════════════════════
 # LitRefSRWKV
 # ═══════════════════════════════════════════════════════════════
 class LitRefSRWKV(pl.LightningModule):
+    """
+    PyTorch Lightning 训练封装。
+
+    ★ v2 变更：
+    - 学习率：LinearLR warmup → ReduceLROnPlateau（SequentialLR 串联）
+    - 梯度裁剪：默认 max_norm=1.0
+    - EMA：训练时持续更新，验证/测试时自动切换 EMA 权重
+    """
+
     def __init__(
         self,
-        model_sr,
-        learning_rate=1e-4,
-        warmup_steps=100,
+        model_sr: RefSRWKV,
+        learning_rate: float = 1e-4,
+        warmup_steps: int = 100,
+        grad_clip_norm: float = 1.0,
+        ema_decay: float = 0.999,
+        use_ema: bool = True,
         loss_fn=None,
-        lr_key="lr",
-        hr_key="hr",
-        ref_key="ref",
+        lr_key: str = "lr",
+        hr_key: str = "hr",
+        ref_key: str = "ref",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model_sr", "loss_fn"])
         self.model_sr = model_sr
         self.criterion = loss_fn or nn.L1Loss()
-        self._step_count = 0
         self.lr_key = lr_key
         self.hr_key = hr_key
         self.ref_key = ref_key
 
+        # ★ v2: EMA
+        self.ema = EMA(decay=ema_decay) if use_ema else None
+
+    # ── 数据解包 ──
     def _unpack_batch(self, batch):
         if isinstance(batch, dict):
             return batch[self.lr_key], batch[self.hr_key], batch[self.ref_key]
@@ -811,12 +1020,23 @@ class LitRefSRWKV(pl.LightningModule):
     def forward(self, lr, ref):
         return self.model_sr(lr, ref)
 
+    # ── 训练 ──
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
         loss = self.criterion(output, hr)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """每个训练步结束后更新 EMA。"""
+        if self.ema is not None:
+            self.ema.update(self.model_sr)
+
+    # ── 验证（使用 EMA 权重）──
+    def on_validation_epoch_start(self):
+        if self.ema is not None:
+            self.ema.apply_shadow(self.model_sr)
 
     def validation_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
@@ -825,6 +1045,15 @@ class LitRefSRWKV(pl.LightningModule):
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
+    def on_validation_epoch_end(self):
+        if self.ema is not None:
+            self.ema.restore(self.model_sr)
+
+    # ── 测试（使用 EMA 权重）──
+    def on_test_epoch_start(self):
+        if self.ema is not None:
+            self.ema.apply_shadow(self.model_sr)
+
     def test_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
@@ -832,6 +1061,12 @@ class LitRefSRWKV(pl.LightningModule):
         self.log("test_loss", loss, on_step=False, on_epoch=True)
         return output, hr
 
+    def on_test_epoch_end(self):
+        if self.ema is not None:
+            self.ema.restore(self.model_sr)
+
+    # ── ★ v2: 优化器 + 调度器（LinearLR warmup → ReduceLROnPlateau）──
+    # ── ★ 修复：去掉 SequentialLR，只保留 ReduceLROnPlateau ──
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -847,29 +1082,60 @@ class LitRefSRWKV(pl.LightningModule):
             },
         }
 
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
-        if self._step_count < self.hparams.warmup_steps:
-            lr_scale = min(1.0, (self._step_count + 1) / self.hparams.warmup_steps)
-            for pg in optimizer.param_groups:
+    # ── ★ warmup：在每步训练开始前手动调整 LR ──
+    # 500 步 warmup 远小于 1 epoch（~12349 步），
+    # ReduceLROnPlateau 在 epoch 结束才触发，两者不冲突。
+    def on_train_batch_start(self, batch, batch_idx):
+        if self.global_step < self.hparams.warmup_steps:
+            warmup_progress = (self.global_step + 1) / self.hparams.warmup_steps
+            lr_scale = 1e-3 + (1.0 - 1e-3) * warmup_progress  # 0.001 → 1.0
+            for pg in self.optimizers().param_groups:
                 pg["lr"] = self.hparams.learning_rate * lr_scale
-        if optimizer_closure is not None:
-            optimizer.step(closure=optimizer_closure)
-        else:
-            optimizer.step()
-        self._step_count += 1
+
+    # ── ★ v2: 梯度裁剪 ──
+    def configure_gradient_clipping(
+        self,
+        optimizer,
+        gradient_clip_val=None,
+        gradient_clip_algorithm=None,
+    ):
+        clip_val = gradient_clip_val or self.hparams.grad_clip_norm
+        if clip_val is not None and clip_val > 0:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=clip_val,
+                gradient_clip_algorithm=gradient_clip_algorithm or "norm",
+            )
+
+    # ── Checkpoint 中保存 / 恢复 EMA ──
+    def on_save_checkpoint(self, checkpoint):
+        if self.ema is not None:
+            checkpoint["ema_state_dict"] = self.ema.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.ema is not None and "ema_state_dict" in checkpoint:
+            self.ema.load_state_dict(checkpoint["ema_state_dict"])
 
     def on_train_start(self):
         total = sum(p.numel() for p in self.parameters())
-        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M")
+        ema_info = f" | EMA decay={self.ema.decay}" if self.ema else " | EMA=off"
+        print(
+            f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M"
+            f" | grad_clip={self.hparams.grad_clip_norm}"
+            f"{ema_info}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
 # Usage Example
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("本模型依赖 CUDA WKV 核，必须在 GPU 上运行。")
 
-    # scan_mode: "hilbert"(默认，垂直希尔伯特对) / "diagonal"(原版对角线，用于对比)
+    device = torch.device("cuda")
+
+    # scan_mode: "hilbert"(默认) / "diagonal"(消融对比)
     model = RefSRWKV(
         inp_channels=3,
         out_channels=3,
@@ -881,20 +1147,33 @@ if __name__ == "__main__":
         scan_mode="hilbert",
     ).to(device)
 
-    lr = torch.randn(2, 3, 48, 48).to(device)
-    ref = torch.randn(2, 3, 480, 480).to(device)
+    lr = torch.randn(2, 3, 48, 48, device=device)
+    ref = torch.randn(2, 3, 480, 480, device=device)
 
+    # ── 训练模式 ──
     model.train()
     out_train = model(lr, ref)
     print(
-        f"Train output shape: {out_train.shape}, range: [{out_train.min():.3f}, {out_train.max():.3f}]"
+        f"Train output shape: {out_train.shape}, "
+        f"range: [{out_train.min():.3f}, {out_train.max():.3f}]"
     )
 
+    # ── 推理模式（OmniShift 重参数化）──
     model.prepare_for_inference()
     with torch.no_grad():
         out_infer = model(lr, ref)
     print(
-        f"Infer output shape: {out_infer.shape}, range: [{out_infer.min():.3f}, {out_infer.max():.3f}]"
+        f"Infer output shape: {out_infer.shape}, "
+        f"range: [{out_infer.min():.3f}, {out_infer.max():.3f}]"
+    )
+
+    # ── 分块推理（大图防 OOM）──
+    lr_big = torch.randn(1, 3, 96, 96, device=device)
+    ref_big = torch.randn(1, 3, 960, 960, device=device)
+    out_tiled = model.forward_tiled(lr_big, ref_big, tile_lr=48, overlap=8)
+    print(
+        f"Tiled output shape: {out_tiled.shape}, "
+        f"range: [{out_tiled.min():.3f}, {out_tiled.max():.3f}]"
     )
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6

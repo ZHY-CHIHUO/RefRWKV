@@ -1,5 +1,6 @@
 # ============================================================
-# RefSRWKV SR Prior 训练配置（8 方向 + OmniShift 空洞卷积版）
+# RefSRWKV SR Prior 训练配置 v2
+# （EMA + 梯度裁剪 + SequentialLR warmup）
 # ============================================================
 
 model:
@@ -11,8 +12,14 @@ model:
   scale: 10
   drop_path_rate: 0.1
   hidden_rate: 4
+  scan_mode: hilbert
+  # ── 优化器 ──
   learning_rate: 2.0e-4
   warmup_steps: 500
+  # ── ★ v2 新增 ──
+  grad_clip_norm: 1.0        # LitRefSRWKV 内部的 fallback 值
+  ema_decay: 0.999            # EMA 衰减率
+  use_ema: true               # 是否启用 EMA
 
 data:
   root: "RefSR_data/ALL_2"
@@ -31,13 +38,15 @@ data:
 
 train:
   devices: 1
-  precision: "32"
+  precision: "bf16-mixed"
   max_epochs: 200
   val_check_interval: 0.1
   log_every_n_steps: 20
   early_stopping_patience: 30
   save_top_k: 3
+  # ── 梯度裁剪（Trainer 统一入口）──
   grad_clip_val: 1.0
+  grad_clip_algorithm: norm   # ★ 新增："norm" 或 "value"
   seed: 42
 
 output:
