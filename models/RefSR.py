@@ -3,9 +3,11 @@
 RefSRWKV (Improved): Reference-based Super-Resolution with RWKV Backbone.
 
 本版变更：
-1. VRWKV_SpatialMix 扩展为 8 方向扫描（H + W + ↘ + ↙，每个方向 bi_wkv 内部双向）
-2. 新增对角线展平/还原工具
-3. 修复 ref_guided_refine 零初始化被 _init_weights 覆盖的问题
+1. VRWKV_SpatialMix 的 4 路扫描改为：H + W + 希尔伯特A + 希尔伯特B(旋转90°)
+   —— 两路希尔伯特垂直互补，d=2/d=3 邻接连通率优于原 ↘/↙ 对角线方案
+2. 新增希尔伯特曲线扫描索引工具（任意 h×w，pad 到 2 的幂再过滤）
+3. 保留 scan_mode 开关：'hilbert'(默认) / 'diagonal'(原版对角线，用于消融对比)
+4. 修复 ref_guided_refine 零初始化被 _init_weights 覆盖的问题
 """
 
 import torch
@@ -83,9 +85,8 @@ def RUN_CUDA(w, u, k, v):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 对角线展平 / 还原
+# 对角线展平 / 还原（diagonal 模式使用）
 # ═══════════════════════════════════════════════════════════════
-
 _DIAG_CACHE = {}
 
 
@@ -120,6 +121,62 @@ def _get_inv_indices(idx, T, device):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 希尔伯特曲线扫描索引（hilbert 模式使用）
+# 任意 h×w：pad 到最近的 2 的幂，过滤掉 padding 格子
+# ═══════════════════════════════════════════════════════════════
+_HILBERT_CACHE = {}
+
+
+def _hilbert_d2xy(n, d):
+    """n×n 希尔伯特曲线：序号 d -> (x=列, y=行)，n 为 2 的幂。"""
+    x = y = 0
+    t, s = d, 1
+    while s < n:
+        rx = 1 & (t // 2)
+        ry = 1 & (t ^ rx)
+        if ry == 0:
+            if rx == 1:
+                x, y = s - 1 - x, s - 1 - y
+            x, y = y, x
+        x += s * rx
+        y += s * ry
+        t //= 4
+        s *= 2
+    return x, y
+
+
+def _build_hilbert_indices(h, w, rot90, device):
+    """构建 h×w 网格的希尔伯特扫描顺序。
+    rot90=False: 标准希尔伯特（扫描 A）
+    rot90=True : 整体旋转 90°（扫描 B，与 A 垂直互补）
+    返回 (idx, inv)：idx[t]=第 t 步访问的格子，inv[格子]=访问步序号。
+    """
+    n = 1
+    while n < max(h, w):
+        n *= 2
+    idx = []
+    for d in range(n * n):
+        x, y = _hilbert_d2xy(n, d)  # A 第 d 步访问 (行=y, 列=x)
+        if rot90:
+            row, col = n - 1 - x, y  # 旋转 90°：(行,列)->(n-1-列, 行)
+        else:
+            row, col = y, x
+        if row < h and col < w:  # 只保留 h×w 范围内的格子
+            idx.append(row * w + col)
+    idx = torch.tensor(idx, dtype=torch.long, device=device)
+    inv = torch.empty(h * w, dtype=torch.long, device=device)
+    inv[idx] = torch.arange(h * w, device=device)
+    return idx, inv
+
+
+def _get_hilbert_indices(h, w, rot90, device):
+    key = (h, w, rot90, str(device))
+    if key not in _HILBERT_CACHE:
+        _HILBERT_CACHE[key] = _build_hilbert_indices(h, w, rot90, device)
+    return _HILBERT_CACHE[key]
+
+
+# ═══════════════════════════════════════════════════════════════
 # DropPath
 # ═══════════════════════════════════════════════════════════════
 class DropPath(nn.Module):
@@ -151,11 +208,9 @@ class OmniShift(nn.Module):
         self.conv1x1 = nn.Conv2d(dim, dim, 1, groups=dim, bias=False)
         self.conv3x3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
         self.conv5x5 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim, bias=False)
-        # ★ 新增：3×3 空洞卷积（dilation=2，感受野 5×5 但覆盖不同位置）
         self.conv3x3_d2 = nn.Conv2d(
             dim, dim, 3, padding=2, dilation=2, groups=dim, bias=False
         )
-        # ★ 5 个分支（原来 4 个）
         self.alpha = nn.Parameter(torch.ones(5) * 0.2)
 
         self.register_buffer("conv5x5_reparam_weight", torch.zeros(dim, 1, 5, 5))
@@ -168,7 +223,7 @@ class OmniShift(nn.Module):
             + alpha[1] * self.conv1x1(x)
             + alpha[2] * self.conv3x3(x)
             + alpha[3] * self.conv5x5(x)
-            + alpha[4] * self.conv3x3_d2(x)  # ★ 新增
+            + alpha[4] * self.conv3x3_d2(x)
         )
 
     def reparam_5x5(self):
@@ -176,18 +231,13 @@ class OmniShift(nn.Module):
             return
         alpha = torch.softmax(self.alpha, dim=0)
 
-        # Identity → 5×5
         identity = torch.zeros(self.dim, 1, 5, 5, device=self.conv1x1.weight.device)
         identity[:, :, 2, 2] = 1.0
 
-        # 1×1 → pad 到 5×5
         w1 = F.pad(self.conv1x1.weight, (2, 2, 2, 2))
-        # 3×3 → pad 到 5×5
         w3 = F.pad(self.conv3x3.weight, (1, 1, 1, 1))
-        # 5×5 不变
         w5 = self.conv5x5.weight
 
-        # ★ 3×3 dilation=2 → 填充到 5×5（间隔填零）
         w_d2 = torch.zeros(self.dim, 1, 5, 5, device=self.conv1x1.weight.device)
         w_d2[:, :, 0, 0] = self.conv3x3_d2.weight[:, :, 0, 0]
         w_d2[:, :, 0, 2] = self.conv3x3_d2.weight[:, :, 0, 1]
@@ -204,7 +254,7 @@ class OmniShift(nn.Module):
             + alpha[1] * w1
             + alpha[2] * w3
             + alpha[3] * w5
-            + alpha[4] * w_d2  # ★ 新增
+            + alpha[4] * w_d2
         )
         self.conv5x5_reparam_weight.copy_(combined)
         self._reparam_done = True
@@ -220,23 +270,24 @@ class OmniShift(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# VRWKV Blocks (8-directional)
+# VRWKV Blocks (H + W + 希尔伯特对)
 # ═══════════════════════════════════════════════════════════════
 class VRWKV_SpatialMix(nn.Module):
-    """8 方向空间混合：H + W + ↘ + ↙，每个方向 bi_wkv 内部双向。
+    """4 路空间混合，每路 bi_wkv 内部双向。
 
-    扫描方向：
-        0: H 正向 + H 反向（bi_wkv 内部）
-        1: W 正向 + W 反向（bi_wkv 内部）
-        2: ↘ 正向 + ↖ 反向（bi_wkv 内部）
-        3: ↙ 正向 + ↗ 反向（bi_wkv 内部）
-    共 8 方向，加权融合。
+    scan_mode='hilbert'（默认）:
+        0: H 方向      1: W 方向
+        2: 希尔伯特 A   3: 希尔伯特 B（旋转90°，与 A 垂直互补）
+    scan_mode='diagonal'（原版，用于消融对比）:
+        0: H 方向      1: W 方向
+        2: ↘ 对角线     3: ↙ 对角线
     """
 
-    def __init__(self, n_embd, head_dim=64):
+    def __init__(self, n_embd, head_dim=64, scan_mode="hilbert"):
         super().__init__()
         self.n_embd = n_embd
-        self.num_scans = 4  # H, W, ↘, ↙
+        self.num_scans = 4
+        self.scan_mode = scan_mode
         attn_sz = n_embd
 
         self.omni_shift = OmniShift(dim=n_embd)
@@ -252,7 +303,6 @@ class VRWKV_SpatialMix(nn.Module):
             self.spatial_decay = nn.Parameter(torch.zeros(self.num_scans, self.n_embd))
             self.spatial_first = nn.Parameter(torch.zeros(self.num_scans, self.n_embd))
 
-        # 4 方向融合权重（可学习）
         self.dir_weight = nn.Parameter(torch.ones(self.num_scans) / self.num_scans)
 
     def jit_func(self, x, resolution):
@@ -285,27 +335,48 @@ class VRWKV_SpatialMix(nn.Module):
         r_w = RUN_CUDA(self.spatial_decay[1] / s, self.spatial_first[1] / s, k_t, v_t)
         results.append(rearrange(r_w, "b (w h) c -> b (h w) c", h=h, w=w))
 
-        # ── 扫描 2: ↘ 对角线（bi_wkv 内部 = ↘ + ↖）──
-        idx_main = _get_diag_indices(h, w, "main", k.device)
-        inv_main = _get_inv_indices(idx_main, T, k.device)
-        r_d = RUN_CUDA(
-            self.spatial_decay[2] / s,
-            self.spatial_first[2] / s,
-            k[:, idx_main],
-            v[:, idx_main],
-        )
-        results.append(r_d[:, inv_main])
+        if self.scan_mode == "hilbert":
+            # ── 扫描 2: 希尔伯特 A ──
+            idx_a, inv_a = _get_hilbert_indices(h, w, False, k.device)
+            r_a = RUN_CUDA(
+                self.spatial_decay[2] / s,
+                self.spatial_first[2] / s,
+                k[:, idx_a],
+                v[:, idx_a],
+            )
+            results.append(r_a[:, inv_a])
 
-        # ── 扫描 3: ↙ 对角线（bi_wkv 内部 = ↙ + ↗）──
-        idx_anti = _get_diag_indices(h, w, "anti", k.device)
-        inv_anti = _get_inv_indices(idx_anti, T, k.device)
-        r_a = RUN_CUDA(
-            self.spatial_decay[3] / s,
-            self.spatial_first[3] / s,
-            k[:, idx_anti],
-            v[:, idx_anti],
-        )
-        results.append(r_a[:, inv_anti])
+            # ── 扫描 3: 希尔伯特 B（旋转90°，与 A 垂直互补）──
+            idx_b, inv_b = _get_hilbert_indices(h, w, True, k.device)
+            r_b = RUN_CUDA(
+                self.spatial_decay[3] / s,
+                self.spatial_first[3] / s,
+                k[:, idx_b],
+                v[:, idx_b],
+            )
+            results.append(r_b[:, inv_b])
+        else:
+            # ── 扫描 2: ↘ 对角线（原版）──
+            idx_main = _get_diag_indices(h, w, "main", k.device)
+            inv_main = _get_inv_indices(idx_main, T, k.device)
+            r_d = RUN_CUDA(
+                self.spatial_decay[2] / s,
+                self.spatial_first[2] / s,
+                k[:, idx_main],
+                v[:, idx_main],
+            )
+            results.append(r_d[:, inv_main])
+
+            # ── 扫描 3: ↙ 对角线（原版）──
+            idx_anti = _get_diag_indices(h, w, "anti", k.device)
+            inv_anti = _get_inv_indices(idx_anti, T, k.device)
+            r_e = RUN_CUDA(
+                self.spatial_decay[3] / s,
+                self.spatial_first[3] / s,
+                k[:, idx_anti],
+                v[:, idx_anti],
+            )
+            results.append(r_e[:, inv_anti])
 
         # ── 加权融合 ──
         w_dir = torch.softmax(self.dir_weight, dim=0)
@@ -343,11 +414,11 @@ class VRWKV_ChannelMix(nn.Module):
 class Block(nn.Module):
     """RWKV Block：SpatialMix + ChannelMix，带 DropPath。"""
 
-    def __init__(self, n_embd, hidden_rate=4, drop_path=0.0):
+    def __init__(self, n_embd, hidden_rate=4, drop_path=0.0, scan_mode="hilbert"):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-        self.att = VRWKV_SpatialMix(n_embd)
+        self.att = VRWKV_SpatialMix(n_embd, scan_mode=scan_mode)
         self.ffn = VRWKV_ChannelMix(n_embd, hidden_rate)
         self.gamma1 = nn.Parameter(torch.ones(n_embd), requires_grad=True)
         self.gamma2 = nn.Parameter(torch.ones(n_embd), requires_grad=True)
@@ -461,10 +532,12 @@ class RefSRWKV(nn.Module):
         scale: int = 10,
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
+        scan_mode: str = "hilbert",
     ):
         super().__init__()
         self.scale = scale
         self.dim = dim
+        self.scan_mode = scan_mode
 
         # ── LR 编码器 ──
         self.lr_up = nn.Sequential(
@@ -515,7 +588,10 @@ class RefSRWKV(nn.Module):
         self.encoder_level1 = nn.Sequential(
             *[
                 Block(
-                    n_embd=dim, hidden_rate=hidden_rate, drop_path=dp_rates[dp_idx + i]
+                    n_embd=dim,
+                    hidden_rate=hidden_rate,
+                    drop_path=dp_rates[dp_idx + i],
+                    scan_mode=scan_mode,
                 )
                 for i in range(num_blocks[0])
             ]
@@ -529,6 +605,7 @@ class RefSRWKV(nn.Module):
                     n_embd=dim * 2,
                     hidden_rate=hidden_rate,
                     drop_path=dp_rates[dp_idx + i],
+                    scan_mode=scan_mode,
                 )
                 for i in range(num_blocks[1])
             ]
@@ -542,6 +619,7 @@ class RefSRWKV(nn.Module):
                     n_embd=dim * 4,
                     hidden_rate=hidden_rate,
                     drop_path=dp_rates[dp_idx + i],
+                    scan_mode=scan_mode,
                 )
                 for i in range(num_blocks[2])
             ]
@@ -555,6 +633,7 @@ class RefSRWKV(nn.Module):
                     n_embd=dim * 8,
                     hidden_rate=hidden_rate,
                     drop_path=dp_rates[dp_idx + i],
+                    scan_mode=scan_mode,
                 )
                 for i in range(num_blocks[3])
             ]
@@ -568,7 +647,11 @@ class RefSRWKV(nn.Module):
         )
         self.decoder_level3 = nn.Sequential(
             *[
-                Block(n_embd=dim * 4, hidden_rate=hidden_rate)
+                Block(
+                    n_embd=dim * 4,
+                    hidden_rate=hidden_rate,
+                    scan_mode=scan_mode,
+                )
                 for _ in range(num_blocks[2])
             ]
         )
@@ -580,7 +663,11 @@ class RefSRWKV(nn.Module):
         )
         self.decoder_level2 = nn.Sequential(
             *[
-                Block(n_embd=dim * 2, hidden_rate=hidden_rate)
+                Block(
+                    n_embd=dim * 2,
+                    hidden_rate=hidden_rate,
+                    scan_mode=scan_mode,
+                )
                 for _ in range(num_blocks[1])
             ]
         )
@@ -591,13 +678,16 @@ class RefSRWKV(nn.Module):
             nn.GroupNorm(_gn_groups(dim), dim),
         )
         self.decoder_level1 = nn.Sequential(
-            *[Block(n_embd=dim, hidden_rate=hidden_rate) for _ in range(num_blocks[0])]
+            *[
+                Block(n_embd=dim, hidden_rate=hidden_rate, scan_mode=scan_mode)
+                for _ in range(num_blocks[0])
+            ]
         )
 
         # ── 后处理精修 ──
         self.refinement = nn.Sequential(
             *[
-                Block(n_embd=dim, hidden_rate=hidden_rate)
+                Block(n_embd=dim, hidden_rate=hidden_rate, scan_mode=scan_mode)
                 for _ in range(num_refinement_blocks)
             ]
         )
@@ -779,6 +869,7 @@ class LitRefSRWKV(pl.LightningModule):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # scan_mode: "hilbert"(默认，垂直希尔伯特对) / "diagonal"(原版对角线，用于对比)
     model = RefSRWKV(
         inp_channels=3,
         out_channels=3,
@@ -787,6 +878,7 @@ if __name__ == "__main__":
         num_refinement_blocks=8,
         scale=10,
         drop_path_rate=0.1,
+        scan_mode="hilbert",
     ).to(device)
 
     lr = torch.randn(2, 3, 48, 48).to(device)
