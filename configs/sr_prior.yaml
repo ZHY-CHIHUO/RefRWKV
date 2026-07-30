@@ -14,7 +14,7 @@ model:
   hidden_rate: 4
   scan_mode: hilbert
   # ── 优化器 ──
-  learning_rate: 2.0e-4
+  learning_rate: 4.0e-4
   warmup_steps: 500
   # ── ★ v2 新增 ──
   grad_clip_norm: 1.0        # LitRefSRWKV 内部的 fallback 值
@@ -30,11 +30,11 @@ data:
   ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
   ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
   ref_gray_prob: 0.2
-  batch_size: 6
+  batch_size: 4
   val_batch_size: 1
   num_workers: 8
   val_num_workers: 2
-  prefetch_factor: 6
+  prefetch_factor: 4
 
 train:
   devices: 1
@@ -48,6 +48,7 @@ train:
   grad_clip_val: 1.0
   grad_clip_algorithm: norm   # ★ 新增："norm" 或 "value"
   seed: 42
+  accumulate_grad_batches: 2
 
 output:
   checkpoint_dir: "checkpoints/refrwkv_sr_v2"
