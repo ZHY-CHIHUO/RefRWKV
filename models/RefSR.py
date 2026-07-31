@@ -302,37 +302,35 @@ class OmniShift(nn.Module):
 # VRWKV Blocks (H + W + 希尔伯特对)
 # ═══════════════════════════════════════════════════════════════
 class VRWKV_SpatialMix(nn.Module):
-    """4 路空间混合，每路 bi_wkv 内部双向。
+    """两路串联扫描 + 融合。
 
-    scan_mode='hilbert'（默认）:
-        0: H 方向      1: W 方向
-        2: 希尔伯特 A   3: 希尔伯特 B（旋转90°，与 A 垂直互补）
-    scan_mode='diagonal'（原版，用于消融对比）:
-        0: H 方向      1: W 方向
-        2: ↘ 对角线     3: ↙ 对角线
+    路径1（笛卡尔）：H → W 串联
+    路径2（空间填充）：
+        scan_mode='hilbert'  → 希尔伯特A → 希尔伯特B 串联
+        scan_mode='diagonal' → ↘对角线 → ↙对角线 串联
+    两路结果用可学习权重融合。
     """
 
     def __init__(self, n_embd, head_dim=64, scan_mode="hilbert"):
         super().__init__()
         self.n_embd = n_embd
-        self.num_scans = 4
         self.scan_mode = scan_mode
         attn_sz = n_embd
 
         self.omni_shift = OmniShift(dim=n_embd)
-
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
         self.value = nn.Linear(n_embd, attn_sz, bias=False)
         self.receptance = nn.Linear(n_embd, attn_sz, bias=False)
         self.output = nn.Linear(attn_sz, n_embd, bias=False)
-
         self.register_buffer("scale", torch.tensor(n_embd**0.5))
 
+        # 4 组 decay/first：路径1 用 [0],[1]，路径2 用 [2],[3]
         with torch.no_grad():
-            self.spatial_decay = nn.Parameter(torch.zeros(self.num_scans, self.n_embd))
-            self.spatial_first = nn.Parameter(torch.zeros(self.num_scans, self.n_embd))
+            self.spatial_decay = nn.Parameter(torch.zeros(4, self.n_embd))
+            self.spatial_first = nn.Parameter(torch.zeros(4, self.n_embd))
 
-        self.dir_weight = nn.Parameter(torch.ones(self.num_scans) / self.num_scans)
+        # 两路融合权重（softmax 归一化）
+        self.path_weight = nn.Parameter(torch.zeros(2))  # [路径1, 路径2]
 
     def jit_func(self, x, resolution):
         h, w = resolution
@@ -345,69 +343,55 @@ class VRWKV_SpatialMix(nn.Module):
         sr = torch.sigmoid(r)
         return sr, k, v
 
+    def _scan_h(self, k, v, j):
+        """H 方向扫描。"""
+        s = self.scale
+        return RUN_CUDA(self.spatial_decay[j] / s, self.spatial_first[j] / s, k, v)
+
+    def _scan_w(self, k, v, j, resolution):
+        """W 方向扫描（转置 → WKV → 转置回）。"""
+        h, w = resolution
+        s = self.scale
+        k_t = rearrange(k, "b (h w) c -> b (w h) c", h=h, w=w)
+        v_t = rearrange(v, "b (h w) c -> b (w h) c", h=h, w=w)
+        r = RUN_CUDA(self.spatial_decay[j] / s, self.spatial_first[j] / s, k_t, v_t)
+        return rearrange(r, "b (w h) c -> b (h w) c", h=h, w=w)
+
+    def _scan_reorder(self, k, v, j, idx, inv):
+        """按任意索引重排 → WKV → 重排回。"""
+        s = self.scale
+        r = RUN_CUDA(
+            self.spatial_decay[j] / s,
+            self.spatial_first[j] / s,
+            k[:, idx],
+            v[:, idx],
+        )
+        return r[:, inv]
+
     def forward(self, x, resolution):
         B, T, C = x.size()
         h, w = resolution
         sr, k, v = self.jit_func(x, resolution)
-        s = self.scale
 
-        results = []
+        # ══ 路径1：H → W 串联 ══
+        v1 = self._scan_h(k, v, 0)  # H 扫描，v1 = H(原始)
+        v1 = self._scan_w(k, v1, 1, resolution)  # W 扫描，v1 = W(H(原始))
 
-        # ── 扫描 0: H 方向（bi_wkv 内部 = H正 + H反）──
-        results.append(
-            RUN_CUDA(self.spatial_decay[0] / s, self.spatial_first[0] / s, k, v)
-        )
-
-        # ── 扫描 1: W 方向（bi_wkv 内部 = W正 + W反）──
-        k_t = rearrange(k, "b (h w) c -> b (w h) c", h=h, w=w)
-        v_t = rearrange(v, "b (h w) c -> b (w h) c", h=h, w=w)
-        r_w = RUN_CUDA(self.spatial_decay[1] / s, self.spatial_first[1] / s, k_t, v_t)
-        results.append(rearrange(r_w, "b (w h) c -> b (h w) c", h=h, w=w))
-
+        # ══ 路径2：空间填充曲线串联 ══
         if self.scan_mode == "hilbert":
-            # ── 扫描 2: 希尔伯特 A ──
             idx_a, inv_a = _get_hilbert_indices(h, w, False, k.device)
-            r_a = RUN_CUDA(
-                self.spatial_decay[2] / s,
-                self.spatial_first[2] / s,
-                k[:, idx_a],
-                v[:, idx_a],
-            )
-            results.append(r_a[:, inv_a])
-
-            # ── 扫描 3: 希尔伯特 B（旋转90°，与 A 垂直互补）──
             idx_b, inv_b = _get_hilbert_indices(h, w, True, k.device)
-            r_b = RUN_CUDA(
-                self.spatial_decay[3] / s,
-                self.spatial_first[3] / s,
-                k[:, idx_b],
-                v[:, idx_b],
-            )
-            results.append(r_b[:, inv_b])
+            v2 = self._scan_reorder(k, v, 2, idx_a, inv_a)  # HilA(原始)
+            v2 = self._scan_reorder(k, v2, 3, idx_b, inv_b)  # HilB(HilA(原始))
         else:
-            # ── 扫描 2: ↘ 对角线（原版）── ★ v2: idx/inv 一起从缓存取
-            idx_main, inv_main = _get_diag_indices(h, w, "main", k.device)
-            r_d = RUN_CUDA(
-                self.spatial_decay[2] / s,
-                self.spatial_first[2] / s,
-                k[:, idx_main],
-                v[:, idx_main],
-            )
-            results.append(r_d[:, inv_main])
+            idx_m, inv_m = _get_diag_indices(h, w, "main", k.device)
+            idx_a, inv_a = _get_diag_indices(h, w, "anti", k.device)
+            v2 = self._scan_reorder(k, v, 2, idx_m, inv_m)  # ↘(原始)
+            v2 = self._scan_reorder(k, v2, 3, idx_a, inv_a)  # ↙(↘(原始))
 
-            # ── 扫描 3: ↙ 对角线（原版）── ★ v2: idx/inv 一起从缓存取
-            idx_anti, inv_anti = _get_diag_indices(h, w, "anti", k.device)
-            r_e = RUN_CUDA(
-                self.spatial_decay[3] / s,
-                self.spatial_first[3] / s,
-                k[:, idx_anti],
-                v[:, idx_anti],
-            )
-            results.append(r_e[:, inv_anti])
-
-        # ── 加权融合 ──
-        w_dir = torch.softmax(self.dir_weight, dim=0)
-        out = sum(w_dir[i] * results[i] for i in range(self.num_scans))
+        # ══ 两路融合 ══
+        w_path = torch.softmax(self.path_weight, dim=0)
+        out = w_path[0] * v1 + w_path[1] * v2
 
         x = sr * out
         x = self.output(x)
