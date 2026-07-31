@@ -913,13 +913,12 @@ class RefSRWKV(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# ★ v2 新增：EMA（指数移动平均）
+# ★ EMA（指数移动平均）— 延迟初始化 + 设备自适应
 # ═══════════════════════════════════════════════════════════════
 class EMA:
     """
-    模型参数的指数移动平均（延迟初始化，兼容 PL 自动设备迁移）。
-
-    shadow 在第一次 update() 时才创建，此时 PL 已经把模型移到 GPU。
+    模型参数的指数移动平均。
+    shadow 在第一次 update() 时才创建（此时 PL 已把模型移到 GPU）。
     """
 
     def __init__(self, decay: float = 0.999):
@@ -929,7 +928,6 @@ class EMA:
         self._initialized = False
 
     def _lazy_init(self, model: nn.Module):
-        """第一次调用时克隆参数（此时模型已在正确设备上）。"""
         if self._initialized:
             return
         for name, param in model.named_parameters():
@@ -942,20 +940,22 @@ class EMA:
         self._lazy_init(model)
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
+                if self.shadow[name].device != param.device:
+                    self.shadow[name] = self.shadow[name].to(param.device)
                 self.shadow[name].mul_(self.decay).add_(
                     param.data, alpha=1.0 - self.decay
                 )
 
     def apply_shadow(self, model: nn.Module):
-        """将 EMA 权重写入模型（先备份当前权重）。"""
         self.backup = {}
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
+                if self.shadow[name].device != param.device:
+                    self.shadow[name] = self.shadow[name].to(param.device)
                 self.backup[name] = param.data.clone()
                 param.data.copy_(self.shadow[name])
 
     def restore(self, model: nn.Module):
-        """恢复 apply_shadow 之前的训练权重。"""
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.backup:
                 param.data.copy_(self.backup[name])
@@ -975,16 +975,18 @@ class EMA:
 
 
 # ═══════════════════════════════════════════════════════════════
-# LitRefSRWKV
+# ★ LitRefSRWKV（完整版）
 # ═══════════════════════════════════════════════════════════════
 class LitRefSRWKV(pl.LightningModule):
     """
     PyTorch Lightning 训练封装。
 
-    ★ v2 变更：
-    - 学习率：LinearLR warmup → ReduceLROnPlateau（SequentialLR 串联）
-    - 梯度裁剪：默认 max_norm=1.0
-    - EMA：训练时持续更新，验证/测试时自动切换 EMA 权重
+    学习率策略：
+      - 前 warmup_steps 步：线性升温 0.1%→100%（on_train_batch_start）
+      - 之后：ReduceLROnPlateau，每次验证后检查，连续 5 次没改善 → LR×0.5
+    其他：
+      - 梯度裁剪（默认 max_norm=1.0）
+      - EMA（验证/测试时自动切换）
     """
 
     def __init__(
@@ -1008,10 +1010,16 @@ class LitRefSRWKV(pl.LightningModule):
         self.hr_key = hr_key
         self.ref_key = ref_key
 
-        # ★ v2: EMA
+        # EMA（延迟初始化，第一次 update 时才克隆参数）
         self.ema = EMA(decay=ema_decay) if use_ema else None
 
-    # ── 数据解包 ──
+        # Plateau 调度器（在 configure_optimizers 中创建）
+        self.plateau_scheduler = None
+        self._pending_plateau_state = None  # 断点续训时暂存
+
+    # ──────────────────────────────────────────────
+    # 数据
+    # ──────────────────────────────────────────────
     def _unpack_batch(self, batch):
         if isinstance(batch, dict):
             return batch[self.lr_key], batch[self.hr_key], batch[self.ref_key]
@@ -1020,7 +1028,9 @@ class LitRefSRWKV(pl.LightningModule):
     def forward(self, lr, ref):
         return self.model_sr(lr, ref)
 
-    # ── 训练 ──
+    # ──────────────────────────────────────────────
+    # 训练
+    # ──────────────────────────────────────────────
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
@@ -1028,12 +1038,22 @@ class LitRefSRWKV(pl.LightningModule):
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
+    def on_train_batch_start(self, batch, batch_idx):
+        """Warmup：前 warmup_steps 步线性升温。"""
+        if self.global_step < self.hparams.warmup_steps:
+            warmup_progress = (self.global_step + 1) / self.hparams.warmup_steps
+            lr_scale = 1e-3 + (1.0 - 1e-3) * warmup_progress
+            for pg in self.optimizers().param_groups:
+                pg["lr"] = self.hparams.learning_rate * lr_scale
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """每个训练步结束后更新 EMA。"""
+        """每步更新 EMA。"""
         if self.ema is not None:
             self.ema.update(self.model_sr)
 
-    # ── 验证（使用 EMA 权重）──
+    # ──────────────────────────────────────────────
+    # 验证（EMA 权重 + 手动调度 Plateau）
+    # ──────────────────────────────────────────────
     def on_validation_epoch_start(self):
         if self.ema is not None:
             self.ema.apply_shadow(self.model_sr)
@@ -1046,10 +1066,21 @@ class LitRefSRWKV(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
+        # 1. 恢复 EMA
         if self.ema is not None:
             self.ema.restore(self.model_sr)
 
-    # ── 测试（使用 EMA 权重）──
+        # 2. ★ 每次验证后手动 step Plateau（patience=5 = 5 次验证）
+        if self.plateau_scheduler is not None:
+            val_loss = self.trainer.callback_metrics.get("val_loss")
+            if val_loss is not None:
+                self.plateau_scheduler.step(val_loss)
+                current_lr = self.plateau_scheduler.optimizer.param_groups[0]["lr"]
+                self.log("lr", current_lr, prog_bar=True, logger=True)
+
+    # ──────────────────────────────────────────────
+    # 测试（EMA 权重）
+    # ──────────────────────────────────────────────
     def on_test_epoch_start(self):
         if self.ema is not None:
             self.ema.apply_shadow(self.model_sr)
@@ -1065,34 +1096,19 @@ class LitRefSRWKV(pl.LightningModule):
         if self.ema is not None:
             self.ema.restore(self.model_sr)
 
-    # ── ★ v2: 优化器 + 调度器（LinearLR warmup → ReduceLROnPlateau）──
-    # ── ★ 修复：去掉 SequentialLR，只保留 ReduceLROnPlateau ──
+    # ──────────────────────────────────────────────
+    # ★ 优化器（Plateau 手动管理，不交给 PL）
+    # ──────────────────────────────────────────────
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        self.plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=5
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
+        return optimizer  # ← 只返回 optimizer
 
-    # ── ★ warmup：在每步训练开始前手动调整 LR ──
-    # 500 步 warmup 远小于 1 epoch（~12349 步），
-    # ReduceLROnPlateau 在 epoch 结束才触发，两者不冲突。
-    def on_train_batch_start(self, batch, batch_idx):
-        if self.global_step < self.hparams.warmup_steps:
-            warmup_progress = (self.global_step + 1) / self.hparams.warmup_steps
-            lr_scale = 1e-3 + (1.0 - 1e-3) * warmup_progress  # 0.001 → 1.0
-            for pg in self.optimizers().param_groups:
-                pg["lr"] = self.hparams.learning_rate * lr_scale
-
-    # ── ★ v2: 梯度裁剪 ──
+    # ──────────────────────────────────────────────
+    # 梯度裁剪
+    # ──────────────────────────────────────────────
     def configure_gradient_clipping(
         self,
         optimizer,
@@ -1107,16 +1123,33 @@ class LitRefSRWKV(pl.LightningModule):
                 gradient_clip_algorithm=gradient_clip_algorithm or "norm",
             )
 
-    # ── Checkpoint 中保存 / 恢复 EMA ──
+    # ──────────────────────────────────────────────
+    # Checkpoint 保存 / 恢复
+    # ──────────────────────────────────────────────
     def on_save_checkpoint(self, checkpoint):
         if self.ema is not None:
             checkpoint["ema_state_dict"] = self.ema.state_dict()
+        if self.plateau_scheduler is not None:
+            checkpoint["plateau_scheduler"] = self.plateau_scheduler.state_dict()
 
     def on_load_checkpoint(self, checkpoint):
         if self.ema is not None and "ema_state_dict" in checkpoint:
             self.ema.load_state_dict(checkpoint["ema_state_dict"])
+        # 暂存，等 on_train_start 时 scheduler 已创建再恢复
+        self._pending_plateau_state = checkpoint.get("plateau_scheduler")
 
+    # ──────────────────────────────────────────────
+    # 训练开始
+    # ──────────────────────────────────────────────
     def on_train_start(self):
+        # 恢复 Plateau 调度器状态（断点续训）
+        if (
+            self._pending_plateau_state is not None
+            and self.plateau_scheduler is not None
+        ):
+            self.plateau_scheduler.load_state_dict(self._pending_plateau_state)
+            self._pending_plateau_state = None
+
         total = sum(p.numel() for p in self.parameters())
         ema_info = f" | EMA decay={self.ema.decay}" if self.ema else " | EMA=off"
         print(

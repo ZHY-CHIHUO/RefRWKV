@@ -14,7 +14,7 @@ model:
   hidden_rate: 4
   scan_mode: hilbert
   # ── 优化器 ──
-  learning_rate: 4.0e-4
+  learning_rate: 2.0e-4
   warmup_steps: 500
   # ── ★ v2 新增 ──
   grad_clip_norm: 1.0        # LitRefSRWKV 内部的 fallback 值
