@@ -8,7 +8,7 @@ model:
   out_channels: 3
   dim: 48
   num_blocks: [4, 6, 6, 8]
-  num_refinement_blocks: 8
+  num_refinement_blocks: 4
   scale: 10
   drop_path_rate: 0.1
   hidden_rate: 4
