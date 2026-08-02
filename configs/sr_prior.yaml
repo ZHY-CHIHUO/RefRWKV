@@ -12,10 +12,9 @@ model:
   scale: 10
   drop_path_rate: 0.1
   hidden_rate: 4
-  scan_mode: hilbert
   # ── 优化器 ──
-  learning_rate: 2.0e-4
-  warmup_steps: 500
+  learning_rate: 5.0e-5
+  warmup_steps: 100
   # ── ★ v2 新增 ──
   grad_clip_norm: 1.0        # LitRefSRWKV 内部的 fallback 值
   ema_decay: 0.999            # EMA 衰减率
