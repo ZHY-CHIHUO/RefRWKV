@@ -54,7 +54,7 @@ model:
     scale: 10
     drop_path_rate: 0.1
     hidden_rate: 4
-    ckpt_path: "checkpoints/refrwkv_sr/last.ckpt"
+    ckpt_path: "checkpoints/refrwkv_sr/best.ckpt"
 
   use_discriminator: false
   gan_enabled: false
