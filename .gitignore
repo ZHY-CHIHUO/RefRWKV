@@ -10,8 +10,9 @@ build/
 *.lmdb/
 RefSR_data/ALL_2/
 RefSR_data/ALL_2_zip/
-RefSR_data/CUFED
+RefSR_data/CUFED/
 RefSR_data/CUFED5/
+RefSR_data/HRMS_SCD/
 data/
 
 # ===== 模型权重 (太大,不上传) =====
