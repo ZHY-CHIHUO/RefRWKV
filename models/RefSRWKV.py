@@ -338,7 +338,7 @@ class RefSRWKV(nn.Module):
 
         # ── LR 编码器 ──
         self.lr_up = nn.Sequential(
-            nn.Upsample(scale_factor=2.5, mode="bilinear", align_corners=False),
+            # nn.Upsample(scale_factor=2.5, mode="bilinear", align_corners=False),
             nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False),
             nn.GroupNorm(_gn_groups(dim), dim),
             nn.ReLU(inplace=True),
@@ -484,7 +484,21 @@ class RefSRWKV(nn.Module):
         return ref_1, ref_2, ref_3, ref_4
 
     def forward(self, lr, ref):
-        fea = self.lr_up(lr)
+        # fea = self.lr_up(lr)
+        # ★ 动态计算 Level1 目标尺寸（= Ref 经过 PixelUnshuffle(4) 后的尺寸）
+        target_h = ref.shape[2] // 4
+        target_w = ref.shape[3] // 4
+
+        # ★ 将 LR 插值到 Level1 分辨率（自动适配任意 scale）
+        if lr.shape[2] != target_h or lr.shape[3] != target_w:
+            fea = F.interpolate(
+                lr, size=(target_h, target_w),
+                mode="bilinear", align_corners=False
+            )
+        else:
+            fea = lr  # scale=4 时 LR 和 Level1 同尺寸，跳过插值
+
+        fea = self.lr_up(fea)  # 只做卷积特征提取，不做尺寸变换
         ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref)
 
         e1 = self.encoder_level1(self.fuse1(fea, ref_1))
