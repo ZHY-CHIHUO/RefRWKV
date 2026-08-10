@@ -1165,7 +1165,7 @@ class SD2RefGANSystem(LightningModule):
                 for i in range(len(sr_batch)):
                     try:
                         m = self.iqa.evaluate_single(
-                            sr_batch[i].cpu().numpy(), hq_batch[i].cpu().numpy()
+                            sr_batch[i].float().cpu().numpy(), hq_batch[i].float().cpu().numpy()
                         )
                         for k, v in m.items():
                             agg[k] = agg.get(k, 0.0) + v
@@ -1228,7 +1228,7 @@ class SD2RefGANSystem(LightningModule):
                 continue
             img = val_results[image_key][0]
             pil_img = Image.fromarray(
-                (img.detach().cpu().permute(1, 2, 0).numpy() * 255)
+                (img.float().detach().cpu().permute(1, 2, 0).numpy() * 255)
                 .clip(0, 255)
                 .astype(np.uint8)
             )
@@ -1240,7 +1240,7 @@ class SD2RefGANSystem(LightningModule):
             images_to_concat.append(pil_img)
 
         if sr_prior is not None:
-            sr_img = ((sr_prior + 1.0) / 2.0)[0].detach().cpu().permute(1, 2, 0).numpy()
+            sr_img = ((sr_prior.float() + 1.0) / 2.0)[0].detach().cpu().permute(1, 2, 0).numpy()
             sr_img = (
                 (np.nan_to_num(sr_img, nan=0.0, posinf=1.0, neginf=0.0) * 255)
                 .clip(0, 255)
