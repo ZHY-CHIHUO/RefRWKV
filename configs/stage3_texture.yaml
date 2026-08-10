@@ -107,7 +107,7 @@ train:
   devices: 1
   precision: "32"
   max_epochs: 100
-  val_check_interval: 0.25
+  val_check_interval: 0.1
   log_every_n_steps: 20
   early_stopping_patience: 20
   save_top_k: 3

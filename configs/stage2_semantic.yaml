@@ -102,7 +102,7 @@ train:
   devices: 1
   precision: "bf16-mixed"
   max_epochs: 100
-  val_check_interval: 0.2
+  val_check_interval: 0.1
   log_every_n_steps: 20
   early_stopping_patience: 50
   save_top_k: 3
