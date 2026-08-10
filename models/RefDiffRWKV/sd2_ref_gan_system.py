@@ -1177,6 +1177,19 @@ class SD2RefGANSystem(LightningModule):
                     for k, v in agg.items():
                         self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
                         self.log(f"val_{k}", v / n, on_epoch=True)
+
+                    # ★ 用训练同款 VGG-LPIPS 覆盖 val/lpips
+                    # IQA 内置的是 AlexNet LPIPS，与训练 loss（VGG）不一致；
+                    # 这里直接用 self.net_lpips 计算，确保验证指标与优化目标对齐。
+                    sr_t = torch.stack([s for s in sr_batch]).to(self.device)
+                    hq_t = torch.stack([h for h in hq_batch]).to(self.device)
+                    # val_results 值域 [0, 1] → LPIPS 期望 [-1, 1]
+                    sr_t = sr_t * 2 - 1
+                    hq_t = hq_t * 2 - 1
+                    with torch.no_grad():
+                        val_lpips_vgg = self.net_lpips(sr_t, hq_t).mean()
+                    self.log("val/lpips", val_lpips_vgg, on_epoch=True, prog_bar=True)
+                    self.log("val_lpips", val_lpips_vgg, on_epoch=True)
                 else:
                     logger.error(
                         "IQA 全部失败 (%d/%d)，本 epoch 无有效指标",

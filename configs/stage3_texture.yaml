@@ -83,7 +83,7 @@ model:
   grad_warn_threshold: 100.0
 
   sample_steps: 20
-  fr_metrics: [psnr, ssim, lpips]
+  fr_metrics: [psnr, ssim, dists]xz
   t_start: 300
   guidance_scale: 0.0
   t_stop: 200
