@@ -518,6 +518,11 @@ class RefSRWKV(nn.Module):
 
         d1 = self.refinement(d1)
         hr_feat = self.up_final(d1)
+        # --- 临时 Debug 保险丝 ---
+        if torch.isnan(hr_feat).any() or torch.isinf(hr_feat).any():
+            print(f"[WARNING] hr_feat contains NaN/Inf! Clamping...")
+            hr_feat = torch.nan_to_num(hr_feat, nan=0.0, posinf=1.0, neginf=-1.0)
+        # -------------------------
         out = self.output_conv(hr_feat)
 
         residual = self.ref_guided_refine(torch.cat([out, ref], dim=1))

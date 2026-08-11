@@ -144,10 +144,12 @@ class SD2RefGANSystem(LightningModule):
         try:
             from RefRWKV.evaluation.eval_pyiqa import IQAEngine
 
+            full_fr_metrics = fr_metrics or ["psnr", "ssim", "lpips", "dists"]
+            iqa_fr_metrics = [m for m in full_fr_metrics if m != "lpips"]
             self.iqa = IQAEngine(
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 nr_metrics=[],
-                fr_metrics=fr_metrics or ["psnr", "ssim", "lpips", "dists"],
+                fr_metrics=iqa_fr_metrics,
                 use_y_channel=True,
                 verbose=False,
             )
@@ -1165,7 +1167,8 @@ class SD2RefGANSystem(LightningModule):
                 for i in range(len(sr_batch)):
                     try:
                         m = self.iqa.evaluate_single(
-                            sr_batch[i].float().cpu().numpy(), hq_batch[i].float().cpu().numpy()
+                            sr_batch[i].float().cpu().numpy(),
+                            hq_batch[i].float().cpu().numpy(),
                         )
                         for k, v in m.items():
                             agg[k] = agg.get(k, 0.0) + v
@@ -1253,7 +1256,13 @@ class SD2RefGANSystem(LightningModule):
             images_to_concat.append(pil_img)
 
         if sr_prior is not None:
-            sr_img = ((sr_prior.float() + 1.0) / 2.0)[0].detach().cpu().permute(1, 2, 0).numpy()
+            sr_img = (
+                ((sr_prior.float() + 1.0) / 2.0)[0]
+                .detach()
+                .cpu()
+                .permute(1, 2, 0)
+                .numpy()
+            )
             sr_img = (
                 (np.nan_to_num(sr_img, nan=0.0, posinf=1.0, neginf=0.0) * 255)
                 .clip(0, 255)
