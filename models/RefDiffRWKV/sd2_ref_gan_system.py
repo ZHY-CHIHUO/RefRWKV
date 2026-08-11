@@ -681,7 +681,15 @@ class SD2RefGANSystem(LightningModule):
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
                 except RuntimeError:
-                    pass  # CUDA 上下文已损坏，无法清理
+                    pass
+
+                # 如果同步失败，说明 CUDA context 已损坏，强制停止当前 step
+                try:
+                    torch.cuda.synchronize()
+                except RuntimeError:
+                    logger.error("[G step] CUDA context 已损坏，无法恢复")
+                    self.trainer.should_stop = True
+                    return None
                 g_opt.zero_grad(set_to_none=True)
                 self._g_accum_count = 0
                 if self.sr_model is not None:
