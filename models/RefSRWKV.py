@@ -89,31 +89,10 @@ class WKV(torch.autograd.Function):
 
 @_compiler_disable()
 def RUN_CUDA(w, u, k, v):
-    # 维度 / shape 检查
-    assert k.ndim == 3, f"k.ndim={k.ndim}, expected 3"
-    assert v.shape == k.shape, f"v.shape={v.shape} != k.shape={k.shape}"
-    B, T, C = k.shape
-    assert w.numel() == C, f"w.numel()={w.numel()} != C={C}"
-    assert u.numel() == C, f"u.numel()={u.numel()} != C={C}"
-    assert T > 0, f"T={T} must be > 0"
-    assert C >= 16, f"C={C} must be >= 16"
-    assert (B * C) % 16 == 0, f"(B*C) % 16 != 0, B={B}, C={C}"
-
-    # device / dtype 检查
-    assert w.device == k.device, f"w.device={w.device} != k.device={k.device}"
-    assert u.device == k.device, f"u.device={u.device} != k.device={k.device}"
-    assert v.device == k.device, f"v.device={v.device} != k.device={k.device}"
-    assert k.dtype == torch.float32, f"k.dtype={k.dtype}, expected fp32"
-    assert v.dtype == torch.float32, f"v.dtype={v.dtype}, expected fp32"
-
-    print(
-        "[WKV]",
-        f"B={B} T={T} C={C}",
-        f"w={tuple(w.shape)} u={tuple(u.shape)}",
-        f"k={tuple(k.shape)} v={tuple(v.shape)}",
-        f"device={k.device} dtype={k.dtype}",
-    )
-
+    w = w.float()
+    u = u.float()
+    k = k.float()
+    v = v.float()
     return WKV.apply(w, u, k, v)
 
 
