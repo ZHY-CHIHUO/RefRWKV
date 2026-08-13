@@ -413,12 +413,15 @@ class GlobalSemanticModule(nn.Module):
         ref_small = self._normalize_for_dinov2(ref_small)
 
         if self.freeze_dinov2:
-            with torch.no_grad():
-                outputs = self.dinov2(ref_small)
+            # bf16 推理：DINOv2 冻结无梯度，半精度省显存提速，转回 fp32 供后续计算
+            with torch.no_grad(), torch.amp.autocast(
+                ref_small.device.type, dtype=torch.bfloat16
+            ):
+                features = self.dinov2(ref_small).last_hidden_state[:, 1:, :].float()
         else:
             outputs = self.dinov2(ref_small)
+            features = outputs.last_hidden_state[:, 1:, :]
 
-        features = outputs.last_hidden_state[:, 1:, :]  # (B, 256, dino_dim)
         features = torch.nan_to_num(features, nan=0.0, posinf=10.0, neginf=-10.0)
         features = self.proj(features)  # (B, 256, base_dim)
 

@@ -355,11 +355,36 @@ class SD2RefGANSystem(LightningModule):
                 self._g_dummy_param = nn.Parameter(torch.zeros(1))
             g_params = [self._g_dummy_param]
 
-        g_opt = torch.optim.AdamW(
-            g_params,
-            lr=self.hparams.g_lr,
-            weight_decay=self.hparams.g_weight_decay,
-        )
+        # 语义分支（随机初始化）用 5 倍学习率，LoRA/Adapter 保持原学习率
+        new_semantic_params = []
+        pretrained_params = []
+        for n, p in self.generator.named_parameters():
+            if not p.requires_grad or id(p) in sr_param_ids:
+                continue
+            if any(k in n for k in ["semantic_pyramid", "sem_proj", "sr_conditioner"]):
+                new_semantic_params.append(p)
+            else:
+                pretrained_params.append(p)
+
+        if new_semantic_params:
+            g_opt = torch.optim.AdamW(
+                [
+                    {"params": pretrained_params, "lr": self.hparams.g_lr},
+                    {"params": new_semantic_params, "lr": self.hparams.g_lr * 5},
+                ],
+                weight_decay=self.hparams.g_weight_decay,
+            )
+            logger.info(
+                "G 优化器参数分组: pretrained=%d (lr=%.1e), semantic=%d (lr=%.1e)",
+                len(pretrained_params), self.hparams.g_lr,
+                len(new_semantic_params), self.hparams.g_lr * 5,
+            )
+        else:
+            g_opt = torch.optim.AdamW(
+                g_params,
+                lr=self.hparams.g_lr,
+                weight_decay=self.hparams.g_weight_decay,
+            )
         self._opt_idx["g"] = len(opts)
         opts.append(g_opt)
 
