@@ -23,7 +23,9 @@ logs/
 
 # ===== 配置 & 脚本 (按需隐藏) =====
 # configs/
-scripts/
+scripts/*
+!scripts/train_sd2_gan.py
+!scripts/train_sr_prior.py
 
 # ===== 结果文件 (按需保留，如果不需要可取消注释) =====
 results/

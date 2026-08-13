@@ -38,6 +38,10 @@ model:
   prediction_type: "epsilon"
   t_min: 300
   t_max: 700
+  train_t_min: 0
+  train_t_max: 999
+  aux_t_min: 100
+  aux_t_max: 400
   cfg_drop_prob: 0.2
   control_scale: 1.0
 
@@ -69,6 +73,9 @@ model:
   lambda_lpips: 0.0
   lambda_gan: 0.0
   lambda_gan_texture: 0.0
+  lambda_sr_noise: 1.0          # Stage2: HR/SR 等权
+  gan_crop_size: 256
+  gan_warmup_steps: 3000
 
   use_amp: true
   accumulate_grad_batches: 8

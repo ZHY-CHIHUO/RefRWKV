@@ -40,6 +40,10 @@ model:
   prediction_type: "epsilon"
   t_min: 300
   t_max: 700
+  train_t_min: 0
+  train_t_max: 999              # Phase1 HR epsilon 仍全范围
+  aux_t_min: 100
+  aux_t_max: 400                # Phase2 pred_x0 / LPIPS 对齐 t_start=300
   cfg_drop_prob: 0.2
   control_scale: 1.0
 
@@ -74,6 +78,9 @@ model:
   lambda_lpips: 0.0                # ★ 开启
   lambda_gan: 0.0
   lambda_gan_texture: 0.0
+  lambda_sr_noise: 0.0          # Stage3: 关闭 SR epsilon，改走 pred_x0
+  gan_crop_size: 256
+  gan_warmup_steps: 3000
 
   use_amp: true
   accumulate_grad_batches: 8

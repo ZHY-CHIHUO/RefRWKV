@@ -39,6 +39,10 @@ model:
   prediction_type: "epsilon"
   t_min: 300
   t_max: 700
+  train_t_min: 0
+  train_t_max: 999
+  aux_t_min: 100
+  aux_t_max: 400
   cfg_drop_prob: 0.2
   control_scale: 1.0
 
@@ -90,6 +94,9 @@ model:
   lambda_lpips: 0.5
   lambda_gan: 0.02
   lambda_gan_texture: 0.05
+  lambda_sr_noise: 0.0          # 沿用 Stage3：HR epsilon + pred_x0 辅助
+  gan_crop_size: 256            # 图像空间 256×256 → latent 32×32
+  gan_warmup_steps: 3000
 
   use_amp: false
   accumulate_grad_batches: 8

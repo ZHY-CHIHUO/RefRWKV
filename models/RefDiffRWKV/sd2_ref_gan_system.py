@@ -71,6 +71,13 @@ class SD2RefGANSystem(LightningModule):
         use_swap_test: bool = False,
         swap_ratio: float = 0.5,
         dtex_conf_weight: bool = False,
+        lambda_sr_noise: float = 1.0,
+        gan_crop_size: int = 256,
+        train_t_min: int = 0,
+        train_t_max: int = 999,
+        aux_t_min: int = 100,
+        aux_t_max: int = 400,
+        gan_warmup_steps: int = 3000,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["generator", "discriminator", "sr_model"])
@@ -107,6 +114,20 @@ class SD2RefGANSystem(LightningModule):
         # D_tex 置信加权（Phase2 专用；开启后 D_tex 只在 raw cos_map
         # 高置信的局部匹配区域执法）
         self.dtex_conf_weight = dtex_conf_weight
+
+        self.lambda_sr_noise = lambda_sr_noise
+        self.gan_crop_size = gan_crop_size
+        assert train_t_min <= train_t_max, (
+            f"train_t_min({train_t_min}) 必须 <= train_t_max({train_t_max})"
+        )
+        assert aux_t_min <= aux_t_max, (
+            f"aux_t_min({aux_t_min}) 必须 <= aux_t_max({aux_t_max})"
+        )
+        self.train_t_min = train_t_min
+        self.train_t_max = train_t_max
+        self.aux_t_min = aux_t_min
+        self.aux_t_max = aux_t_max
+        self.gan_warmup_steps = gan_warmup_steps
 
         self._nan_g_count = 0
         self._nan_d_count = 0
@@ -166,23 +187,7 @@ class SD2RefGANSystem(LightningModule):
     # ═══════════════════════════════════════════════════════
 
     def _build_zero_intrablock(self, x_input: torch.Tensor) -> List[torch.Tensor]:
-        bsz, _, latent_h, latent_w = x_input.shape
-
-        def _half(h, w):
-            return (h + 1) // 2, (w + 1) // 2
-
-        h0, w0 = latent_h, latent_w
-        h1, w1 = _half(h0, w0)
-        h2, w2 = _half(h1, w1)
-        h3, w3 = _half(h2, w2)
-
-        return [
-            x_input.new_zeros(bsz, ch, th, tw)
-            for (th, tw), ch in zip(
-                [(h0, w0), (h1, w1), (h2, w2), (h3, w3)],
-                [320, 640, 1280, 1280],
-            )
-        ]
+        return self.generator.build_zero_intrablock(x_input)
 
     # ═══════════════════════════════════════════════════════
     #  公共 pred_x0 基础逻辑
@@ -198,19 +203,15 @@ class SD2RefGANSystem(LightningModule):
         down_intrablock=None,
         return_pixel: bool = True,
     ):
-        x_t = self.generator.noise_scheduler.add_noise(latent, noise, t)
+        x_t = self.generator.add_noise(latent, noise, t)
         x_input = self.generator.concat_sr_latent(x_t, sr_latent_cond)
 
-        eps_pred = self.generator.unet(
+        eps_pred = self.generator.forward_unet(
             x_input,
             t,
-            encoder_hidden_states=context,
-            down_intrablock_additional_residuals=(
-                down_intrablock
-                if down_intrablock is not None
-                else self._build_zero_intrablock(x_input)
-            ),
-        ).sample
+            context,
+            down_intrablock=down_intrablock,
+        )
 
         pred_x0 = self.generator.predict_x0_from_eps(x_t, t, eps_pred)
         pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
@@ -273,46 +274,26 @@ class SD2RefGANSystem(LightningModule):
         Returns:
             pred 或 (pred, conf_dtex)
         """
-        latent_h, latent_w = sr_latent_precomputed.shape[2:]
-        bsz = lr.shape[0]
-
-        need_cos = self.generator.use_confidence_gate or (
-            self.dtex_conf_weight and return_conf
-        )
-        cos_maps = cos_maps_raw = None
-        if need_cos:
-            adapter_out = self.generator.adapter(lr, ref, return_cos_sim_map=True)
-            ref_feats, cos_maps, cos_maps_raw = self.generator._unpack_adapter_out(
-                adapter_out
-            )
-        else:
-            ref_feats = self.generator.adapter(lr, ref)
-
-        sem_tokens = None
-        if self.generator.use_semantic:
-            sem_pyramid = self.generator.global_semantic(
-                ref, sr_latent=sr_latent_precomputed.detach()
-            )
-            sem_tokens = self.generator.build_sem_tokens(sem_pyramid)
-        context = self.generator.build_context(bsz, sem_tokens)
-        down_intrablock = self.generator.build_down_intrablock(
-            ref_feats, latent_h, latent_w, t=t, cos_maps=cos_maps
+        cond = self.generator.prepare_condition(
+            lr,
+            ref,
+            sr_latent=sr_latent_precomputed.detach(),
+            t=t,
+            return_conf=return_conf,
+            latent_hw=sr_latent_precomputed.shape[-2:],
         )
         pred = self._pred_x0_base(
             latent=sr_latent_precomputed,
             sr_latent_cond=sr_latent_precomputed.detach(),
             t=t,
             noise=noise,
-            context=context,
-            down_intrablock=down_intrablock,
+            context=cond["context"],
+            down_intrablock=cond["down_intrablock"],
             return_pixel=not return_latent,
         )
 
         if return_conf:
-            conf_dtex = None
-            if cos_maps_raw is not None and len(cos_maps_raw) > 1:
-                conf_dtex = cos_maps_raw[1].detach().float()
-            return pred, conf_dtex
+            return pred, cond.get("conf_dtex")
         return pred
 
     # ═══════════════════════════════════════════════════════
@@ -670,7 +651,7 @@ class SD2RefGANSystem(LightningModule):
             sr_pixel = torch.nan_to_num(
                 sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0
             ).clamp(-1.0, 1.0)
-            return self.generator.encode_latent(sr_pixel.to(self.generator.vae.dtype))
+            return self.generator.encode_latent(sr_pixel.to(self.generator.latent_dtype))
 
     def _get_sr_latent_with_grad(self, lr, ref):
         """SR latent（保留计算图，用于 sr_fixed=False 的 G step，梯度反传到 SR 模型）。
@@ -686,8 +667,76 @@ class SD2RefGANSystem(LightningModule):
                 sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0
             ).clamp(-1.0, 1.0)
             return self.generator.encode_latent_with_grad(
-                sr_pixel.to(self.generator.vae.dtype)
+                sr_pixel.to(self.generator.latent_dtype)
             )
+
+    # ═══════════════════════════════════════════════════════
+    #  Stage 1/2: SR 路径噪声 MSE 计算
+    # ═══════════════════════════════════════════════════════
+
+    def _sample_train_timesteps(self, bsz: int, device, t_min=None, t_max=None):
+        lo = self.train_t_min if t_min is None else t_min
+        hi = self.train_t_max if t_max is None else t_max
+        return torch.randint(lo, hi + 1, (bsz,), device=device, dtype=torch.long)
+
+    def _compute_hr_noise_loss(self, lr, ref, hr_latent, sr_latent):
+        """单路径 HR epsilon MSE，timestep 由 System 持有。"""
+        bsz = lr.shape[0]
+        device = lr.device
+        noise = torch.randn_like(hr_latent)
+        t = self._sample_train_timesteps(bsz, device)
+        x_t = self.generator.add_noise(hr_latent, noise, t)
+        x_input = self.generator.concat_sr_latent(x_t, sr_latent)
+        cond = self.generator.prepare_condition(
+            lr,
+            ref,
+            sr_latent=x_input[:, 4:].detach(),
+            t=t,
+            latent_hw=hr_latent.shape[-2:],
+        )
+        eps_pred = self.generator.forward_unet(
+            x_input, t, cond["context"], cond["down_intrablock"]
+        )
+        return F.mse_loss(eps_pred, noise)
+
+    def _compute_dual_path_loss(self, lr, ref, hr_latent, sr_latent):
+        """HR/SR 双路径共享 noise + timestep，一次 UNet 前向。"""
+        bsz = lr.shape[0]
+        device = lr.device
+
+        noise = torch.randn_like(hr_latent)
+        t = self._sample_train_timesteps(bsz, device)
+
+        x_t_hr = self.generator.add_noise(hr_latent, noise, t)
+        x_t_sr = self.generator.add_noise(sr_latent, noise, t)
+
+        x_t_combined = torch.cat([x_t_hr, x_t_sr], dim=0)
+        t_combined = torch.cat([t, t], dim=0)
+        sr_latent_combined = torch.cat([sr_latent, sr_latent], dim=0)
+
+        cond = self.generator.prepare_condition(
+            lr,
+            ref,
+            sr_latent=sr_latent.detach(),
+            t=t,
+            latent_hw=sr_latent.shape[-2:],
+        )
+        cond = self.generator.expand_condition(cond, n=2)
+
+        x_input_combined = self.generator.concat_sr_latent(
+            x_t_combined, sr_latent_combined
+        )
+        eps_pred_combined = self.generator.forward_unet(
+            x_input_combined,
+            t_combined,
+            cond["context"],
+            cond["down_intrablock"],
+        )
+
+        eps_pred_hr, eps_pred_sr = torch.chunk(eps_pred_combined, 2, dim=0)
+        loss_hr = F.mse_loss(eps_pred_hr, noise)
+        loss_sr = F.mse_loss(eps_pred_sr, noise)
+        return loss_hr, loss_sr
 
     # ═══════════════════════════════════════════════════════
     #  Early Stop
@@ -711,7 +760,7 @@ class SD2RefGANSystem(LightningModule):
 
     def training_step(self, batch, batch_idx):
         # D 预热：仅在 GAN 启用时
-        if self.gan_enabled and self.global_step < 3000:
+        if self.gan_enabled and self.global_step < self.gan_warmup_steps:
             return self._discriminator_step(batch, batch_idx)
         # G/D 交替（仅 GAN 启用时切 D phase）
         if self._gd_phase == 0:
@@ -728,12 +777,44 @@ class SD2RefGANSystem(LightningModule):
 
         lr, ref, hr = self.generator.get_input(batch)
 
+        # ★ 修复：在 try 块外初始化 sr_latent 和 hr_latent
+        sr_latent = None
+        hr_latent = None
+
+        # ═══════════════════════════════════════════════════════
+        # Phase 1: 二合一双路径扩散 ε-prediction loss
+        # ═══════════════════════════════════════════════════════
         try:
             with torch.amp.autocast(
                 self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
             ):
-                out = self.generator.forward(lr, ref, hr)
-                loss = out["loss"]
+                # 1. 编码 hr_latent
+                hr_latent = self.generator.encode_latent(hr)
+
+                # ★ 2. 根据 sr_fixed 选择是否保留梯度
+                if not self.sr_fixed:
+                    sr_latent = self._get_sr_latent_with_grad(lr, ref)  # 保留梯度
+                else:
+                    sr_latent = self._get_sr_latent_precomputed(lr, ref)  # 无梯度
+
+                # 3. 双路径计算
+                if sr_latent is not None and self.lambda_sr_noise > 0:
+                    loss_hr, loss_sr = self._compute_dual_path_loss(
+                        lr, ref, hr_latent, sr_latent
+                    )
+                    loss = loss_hr + self.lambda_sr_noise * loss_sr
+                    self.log("train/G_hr_noise", loss_hr.detach(), on_step=True)
+                    self.log("train/G_sr_noise", loss_sr.detach(), on_step=True)
+                else:
+                    # Stage 3+：关闭 SR epsilon，但仍由 System 采样 timestep
+                    loss_hr = self._compute_hr_noise_loss(
+                        lr, ref, hr_latent, sr_latent
+                    )
+                    loss = loss_hr
+                    loss_sr = torch.zeros_like(loss)
+                    self.log("train/G_hr_noise", loss_hr.detach(), on_step=True)
+                    self.log("train/G_sr_noise", loss_sr.detach(), on_step=True)
+
         except (RuntimeError, TypeError, AttributeError) as e:
             err_msg = str(e)
             is_cuda_error = isinstance(e, RuntimeError) and (
@@ -751,7 +832,6 @@ class SD2RefGANSystem(LightningModule):
                     torch.cuda.synchronize()
                 except RuntimeError:
                     pass
-
                 try:
                     torch.cuda.synchronize()
                 except RuntimeError:
@@ -768,6 +848,7 @@ class SD2RefGANSystem(LightningModule):
                 return None
             raise
 
+        # NaN 检查
         if torch.isnan(loss) or torch.isinf(loss):
             logger.warning("[G step] 主扩散 loss NaN/Inf, batch=%d", batch_idx)
             self._consecutive_nan_g += 1
@@ -780,12 +861,16 @@ class SD2RefGANSystem(LightningModule):
             return None
         self._consecutive_nan_g = 0
 
+        # 反向传播 Phase 1
         loss_main = loss / self.accumulate_grad_batches
         if self.scaler_g is not None:
             self.scaler_g.scale(loss_main).backward()
         else:
             loss_main.backward()
 
+        # ═══════════════════════════════════════════════════════
+        # Phase 2: 辅助 loss (diff_sr / LPIPS / GAN)
+        # ═══════════════════════════════════════════════════════
         aux_loss_val = None
         aux_loss_enabled = self.sr_model is not None and (
             self.lambda_diff_sr > 0 or self.lambda_lpips > 0
@@ -800,16 +885,20 @@ class SD2RefGANSystem(LightningModule):
                 with torch.amp.autocast(
                     self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
                 ):
-                    if not self.sr_fixed:
-                        sr_latent = self._get_sr_latent_with_grad(lr, ref)
-                    else:
-                        sr_latent = self._get_sr_latent_precomputed(lr, ref)
+                    # ★ 获取 sr_latent (如果 Phase 1 没算，这里算)
+                    if sr_latent is None:
+                        if not self.sr_fixed:
+                            sr_latent = self._get_sr_latent_with_grad(lr, ref)
+                        else:
+                            sr_latent = self._get_sr_latent_precomputed(lr, ref)
 
-                    t_sr = torch.randint(
-                        100, 401, (bsz,), device=lr.device, dtype=torch.long
+                    # Phase 2 的 t 范围由 System 持有（默认 [100, 400]，对齐推理 t_start=300）
+                    t_sr = self._sample_train_timesteps(
+                        bsz, lr.device, t_min=self.aux_t_min, t_max=self.aux_t_max
                     )
                     noise_sr = torch.randn_like(sr_latent)
 
+                    # 调用 _adapter_pred_x0 获取 pred_x0_latent
                     if self.dtex_conf_weight:
                         pred_x0_latent, conf_dtex = self._adapter_pred_x0(
                             lr,
@@ -833,13 +922,13 @@ class SD2RefGANSystem(LightningModule):
 
                     aux_loss = 0.0
 
+                    # 1. diff_sr (Latent MSE)
                     if self.lambda_diff_sr > 0:
-                        loss_diff_sr = F.mse_loss(
-                            pred_x0_latent, out["hr_latent"].detach()
-                        )
+                        loss_diff_sr = F.mse_loss(pred_x0_latent, hr_latent.detach())
                         aux_loss = aux_loss + self.lambda_diff_sr * loss_diff_sr
                         self.log("train/G_diff_sr", loss_diff_sr.detach(), on_step=True)
 
+                    # 2. LPIPS (降频，下采样)
                     pred_sr_pixel = None
                     if self.lambda_lpips > 0 and batch_idx % 4 == 0:
                         pred_sr_pixel = self.generator.decode_latent(pred_x0_latent)
@@ -872,20 +961,43 @@ class SD2RefGANSystem(LightningModule):
                                 "[G step] LPIPS NaN/Inf (#%d)，跳过", self._nan_g_count
                             )
 
+                    # 3. GAN Loss (降频，动态裁剪)
                     if gan_active and batch_idx % 4 == 2:
                         if pred_sr_pixel is None:
                             pred_sr_pixel = self.generator.decode_latent(pred_x0_latent)
-                        i = torch.randint(0, 480 - 256, (1,)).item()
-                        j = torch.randint(0, 480 - 256, (1,)).item()
-                        fake_crop = pred_sr_pixel[:, :, i : i + 256, j : j + 256]
-                        ref_crop = ref[:, :, i : i + 256, j : j + 256]
-                        conf_crop = (
-                            conf_dtex[
-                                :, :, i // 8 : (i + 256) // 8, j // 8 : (j + 256) // 8
+
+                        H, W = pred_sr_pixel.shape[-2:]
+                        crop_size = self.gan_crop_size
+                        if H > crop_size and W > crop_size:
+                            i = torch.randint(0, H - crop_size + 1, (1,)).item()
+                            j = torch.randint(0, W - crop_size + 1, (1,)).item()
+                            fake_crop = pred_sr_pixel[
+                                :, :, i : i + crop_size, j : j + crop_size
                             ]
-                            if conf_dtex is not None
-                            else None
-                        )
+                            ref_crop = ref[:, :, i : i + crop_size, j : j + crop_size]
+
+                            # 动态计算 conf 裁剪比例
+                            scale_h = (
+                                conf_dtex.shape[-2] / H if conf_dtex is not None else 1
+                            )
+                            scale_w = (
+                                conf_dtex.shape[-1] / W if conf_dtex is not None else 1
+                            )
+                            conf_crop = (
+                                conf_dtex[
+                                    :,
+                                    :,
+                                    int(i * scale_h) : int((i + crop_size) * scale_h),
+                                    int(j * scale_w) : int((j + crop_size) * scale_w),
+                                ]
+                                if conf_dtex is not None
+                                else None
+                            )
+                        else:
+                            fake_crop = pred_sr_pixel
+                            ref_crop = ref
+                            conf_crop = conf_dtex
+
                         with torch.amp.autocast(self.device.type, enabled=False):
                             gan_loss = self.discriminator.compute_g_loss(
                                 fake_crop.float(),
@@ -903,6 +1015,7 @@ class SD2RefGANSystem(LightningModule):
                                 "[G step] GAN NaN/Inf (#%d)", self._nan_g_count
                             )
 
+                    # 反向传播 Phase 2
                     if isinstance(aux_loss, torch.Tensor) and aux_loss.item() != 0:
                         aux_loss_val = aux_loss.detach()
                         aux_loss_scaled = aux_loss / self.accumulate_grad_batches
@@ -936,12 +1049,19 @@ class SD2RefGANSystem(LightningModule):
                 else:
                     raise
 
+        # ═══════════════════════════════════════════════════════
+        # 梯度累积 & Optimizer Step
+        # ═══════════════════════════════════════════════════════
         self._g_accum_count += 1
 
         if self._g_accum_count >= self.accumulate_grad_batches:
+            # ★ 修复：只有在 SR 模型确实有梯度时才创建 sr_opt
+            sr_has_grad = (
+                not self.sr_fixed and sr_latent is not None and sr_latent.requires_grad
+            )
             sr_opt = (
                 self._get_sr_opt()
-                if (not self.sr_fixed and (aux_loss_enabled or gan_active))
+                if (sr_has_grad and (aux_loss_enabled or gan_active))
                 else None
             )
 
@@ -986,16 +1106,18 @@ class SD2RefGANSystem(LightningModule):
                 self._g_steps_since_d = 0
                 self._unfreeze_discriminator()
 
+        # ═══════════════════════════════════════════════════════
+        # 日志记录
+        # ═══════════════════════════════════════════════════════
         g_total = loss.detach() + (aux_loss_val if aux_loss_val is not None else 0.0)
         self.log("train/G_total", g_total, on_step=True, prog_bar=True)
-        self.log("train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True)
+        self.log("train/G_diff_hr", loss_hr.detach(), on_step=True, prog_bar=True)
 
         return g_total
 
     # ═══════════════════════════════════════════════════════
     #  Discriminator Step
     # ═══════════════════════════════════════════════════════
-
     def _discriminator_step(self, batch, batch_idx):
         if self.discriminator is None or (
             self.lambda_gan_semantic == 0.0 and self.lambda_gan_texture == 0.0
@@ -1032,8 +1154,9 @@ class SD2RefGANSystem(LightningModule):
             return None
         self._consecutive_nan_d = 0
 
+        # ═══════════════════════════════════════════════════════
         # 生成 fake / real（全部 no_grad，D 不需要 G 的梯度）
-
+        # ═══════════════════════════════════════════════════════
         conf_dtex = None
         try:
             with torch.no_grad():
@@ -1041,13 +1164,11 @@ class SD2RefGANSystem(LightningModule):
                     self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
                 ):
                     sr_latent = self._get_sr_latent_precomputed(lr, ref)
-                    _num_t = self.generator.noise_scheduler.config.num_train_timesteps
-                    t = torch.randint(
-                        self.generator.t_min,
-                        self.generator.t_max + 1,
-                        (bsz,),
-                        device=lr.device,
-                        dtype=torch.long,
+                    t = self._sample_train_timesteps(
+                        bsz,
+                        lr.device,
+                        t_min=self.aux_t_min,
+                        t_max=self.aux_t_max,
                     )
                     noise = torch.randn_like(sr_latent)
                     pred_hr_pixel = self._no_adapter_pred_x0(hr, sr_latent, t, noise)
@@ -1090,7 +1211,52 @@ class SD2RefGANSystem(LightningModule):
                 return None
             raise
 
-        for name, tensor in [("fake", fake), ("real", real)]:
+        # ═══════════════════════════════════════════════════════
+        # 随机裁剪 patch（与 G step 保持一致，防止分布偏移）
+        # ═══════════════════════════════════════════════════════
+        crop_i = crop_j = None
+        if self.gan_crop_size > 0 and fake.shape[-1] > self.gan_crop_size:
+            crop_i = torch.randint(
+                0, fake.shape[-2] - self.gan_crop_size + 1, (1,)
+            ).item()
+            crop_j = torch.randint(
+                0, fake.shape[-1] - self.gan_crop_size + 1, (1,)
+            ).item()
+            fake_crop = fake[
+                :,
+                :,
+                crop_i : crop_i + self.gan_crop_size,
+                crop_j : crop_j + self.gan_crop_size,
+            ]
+            real_crop = real[
+                :,
+                :,
+                crop_i : crop_i + self.gan_crop_size,
+                crop_j : crop_j + self.gan_crop_size,
+            ]
+            # 按比例裁剪 conf_dtex (通常 conf 是 60x60，fake 是 480x480，比例是 1/8)
+            if conf_dtex is not None:
+                scale_h = conf_dtex.shape[-2] / fake.shape[-2]
+                scale_w = conf_dtex.shape[-1] / fake.shape[-1]
+                conf_dtex_crop = conf_dtex[
+                    :,
+                    :,
+                    int(crop_i * scale_h) : int(
+                        (crop_i + self.gan_crop_size) * scale_h
+                    ),
+                    int(crop_j * scale_w) : int(
+                        (crop_j + self.gan_crop_size) * scale_w
+                    ),
+                ]
+            else:
+                conf_dtex_crop = None
+        else:
+            fake_crop = fake
+            real_crop = real
+            conf_dtex_crop = conf_dtex
+
+        # NaN 检查 (fake_crop, real_crop)
+        for name, tensor in [("fake", fake_crop), ("real", real_crop)]:
             if torch.isnan(tensor).any() or torch.isinf(tensor).any():
                 self._nan_d_count += 1
                 self._consecutive_nan_d += 1
@@ -1109,7 +1275,9 @@ class SD2RefGANSystem(LightningModule):
 
         sem_updated = tex_updated = False
 
-        # ── 语义 D ──
+        # ═══════════════════════════════════════════════════════
+        # 语义 D
+        # ═══════════════════════════════════════════════════════
         if (
             self.lambda_gan_semantic > 0
             and self.discriminator.use_semantic_d
@@ -1117,7 +1285,11 @@ class SD2RefGANSystem(LightningModule):
         ):
             with torch.amp.autocast(self.device.type, enabled=False):
                 loss_d_sem = self.discriminator.compute_d_loss(
-                    real, fake, ref=None, lambda_semantic=1.0, lambda_texture=0.0
+                    real_crop,
+                    fake_crop,
+                    ref=None,
+                    lambda_semantic=1.0,
+                    lambda_texture=0.0,
                 )
 
             if not torch.isnan(loss_d_sem) and not torch.isinf(loss_d_sem):
@@ -1144,14 +1316,16 @@ class SD2RefGANSystem(LightningModule):
                     "[D step] loss_d_sem NaN/Inf (#%d)，跳过", self._nan_d_count
                 )
 
-        # ── 纹理 D ──
+        # ═══════════════════════════════════════════════════════
+        # 纹理 D
+        # ═══════════════════════════════════════════════════════
         if (
             self.lambda_gan_texture > 0
             and self.discriminator.use_texture_d
             and d_tex_opt is not None
         ):
             # ── 方案C：Swap Test ──
-            # 注意：conf_dtex 不随 ref_for_d 交换。conf 标记的是"fake 的
+            # 注意：conf_dtex_crop 不随 ref_for_d 交换。conf 标记的是"fake 的
             # 哪些区域含有 ref 借来的纹理"，这些区域正是与错误 ref 比对时
             # 能暴露不匹配的位置，保持原样即可。
             if self.use_swap_test and bsz > 1:
@@ -1162,14 +1336,25 @@ class SD2RefGANSystem(LightningModule):
             else:
                 ref_for_d = ref
 
+            # 与 fake_crop/real_crop 使用相同坐标裁剪 ref
+            if crop_i is not None:
+                ref_for_d_crop = ref_for_d[
+                    :,
+                    :,
+                    crop_i : crop_i + self.gan_crop_size,
+                    crop_j : crop_j + self.gan_crop_size,
+                ].float()
+            else:
+                ref_for_d_crop = ref_for_d.float()
+
             with torch.amp.autocast(self.device.type, enabled=False):
                 loss_d_tex = self.discriminator.compute_d_loss(
-                    real,
-                    fake,
-                    ref=ref_for_d,
+                    real_crop,
+                    fake_crop,
+                    ref=ref_for_d_crop,
                     lambda_semantic=0.0,
                     lambda_texture=1.0,
-                    tex_weight=conf_dtex,
+                    tex_weight=conf_dtex_crop,
                 )
 
             if not torch.isnan(loss_d_tex) and not torch.isinf(loss_d_tex):
@@ -1288,7 +1473,7 @@ class SD2RefGANSystem(LightningModule):
                         len(sr_batch),
                     )
 
-            if batch_idx == 0 and self.logger is not None:
+            if batch_idx < 5 and self.logger is not None:
                 self._save_validation_images(val_results, lr, ref, hr)
 
             del val_results, lr, ref, hr
@@ -1376,11 +1561,7 @@ class SD2RefGANSystem(LightningModule):
         # 强制冻结模块保持 eval（防止 Lightning 递归 .train() 打开 DropPath）
         if self.sr_model is not None and self.sr_fixed:
             self.sr_model.eval()
-        if self.generator.global_semantic is not None:
-            # 只冻结 DINOv2 backbone，proj 和 pyramid 保持 train 模式
-            self.generator.global_semantic.dinov2.eval()
-        if self.generator.vae is not None:
-            self.generator.vae.eval()
+        self.generator.freeze_eval_modules()
 
     def on_validation_epoch_start(self):
         self._freeze_discriminator()

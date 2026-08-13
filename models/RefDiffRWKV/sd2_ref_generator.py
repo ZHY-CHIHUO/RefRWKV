@@ -25,7 +25,7 @@ sd2_ref_generator.py — SD2 Ref-guided Generator (latent ε-prediction)
 import os
 import logging
 import numpy as np
-from typing import Optional, List, Tuple, Dict
+from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image
 
 import torch
@@ -114,6 +114,8 @@ class SD2RefGenerator(LightningModule):
         self.lr_key = lr_key
         self.ref_key = ref_key
         self.hr_key = hr_key
+        # 仅用于：① 独立 Generator.forward / p_losses；② 时序门控归一化。
+        # 四阶段课程的训练 t 范围由 System 持有，不要在这里采样。
         self.t_min = t_min
         self.t_max = t_max
         assert t_min <= t_max, f"t_min({t_min}) 必须 <= t_max({t_max})"
@@ -395,7 +397,9 @@ class SD2RefGenerator(LightningModule):
 
         # ── 方案B：时序门控 ──
         if self.use_temporal_gate and t is not None:
-            t_ratio = 1.0 - t.float().mean().item() / self.t_max
+            # 用 scheduler 总步数归一化，避免课程 t 超出 Generator.t_max 时 scale 变负
+            t_norm = max(self.num_train_timesteps - 1, 1)
+            t_ratio = 1.0 - t.float().mean().item() / t_norm
             scale = (
                 self.control_scale_min
                 + (self.control_scale_max - self.control_scale_min) * t_ratio
@@ -432,8 +436,196 @@ class SD2RefGenerator(LightningModule):
         return residuals
 
     # ═══════════════════════════════════════════════════════
-    #  核心 UNet 前向
+    #  条件 / UNet 原子接口（供 System 调用，勿再直连内部模块）
     # ═══════════════════════════════════════════════════════
+
+    @property
+    def num_train_timesteps(self) -> int:
+        return int(self.noise_scheduler.config.num_train_timesteps)
+
+    @property
+    def latent_dtype(self) -> torch.dtype:
+        return next(self.vae.parameters()).dtype
+
+    def add_noise(
+        self, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor
+    ) -> torch.Tensor:
+        return self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+    def empty_context(
+        self,
+        bsz: int,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        return torch.zeros(
+            bsz,
+            self.CROSS_ATTN_CTX_LEN,
+            self.cross_attn_dim,
+            device=device if device is not None else self.device,
+            dtype=dtype,
+        )
+
+    def build_zero_intrablock(self, x_input: torch.Tensor) -> List[torch.Tensor]:
+        """按 UNet 四层实际分辨率构造全零 residual，空间尺寸不能共用 x_input。"""
+        bsz, _, latent_h, latent_w = x_input.shape
+        h0, w0 = latent_h, latent_w
+        h1, w1 = _half_resolution(h0, w0)
+        h2, w2 = _half_resolution(h1, w1)
+        h3, w3 = _half_resolution(h2, w2)
+        return [
+            x_input.new_zeros(bsz, ch, th, tw)
+            for (th, tw), ch in zip(
+                [(h0, w0), (h1, w1), (h2, w2), (h3, w3)],
+                [320, 640, 1280, 1280],
+            )
+        ]
+
+    def freeze_eval_modules(self) -> None:
+        """训练时强制冻结子模块保持 eval（VAE / DINOv2）。"""
+        if self.global_semantic is not None:
+            self.global_semantic.dinov2.eval()
+        self.vae.eval()
+
+    def prepare_condition(
+        self,
+        lr: torch.Tensor,
+        ref: torch.Tensor,
+        sr_latent: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+        ref_input: Optional[torch.Tensor] = None,
+        return_conf: bool = False,
+        latent_hw: Optional[Tuple[int, int]] = None,
+    ) -> Dict[str, Any]:
+        """构建 adapter residual + semantic context。
+
+        不负责加噪 / concat / UNet。System 可对返回值做 batch 复制后再
+        调用 forward_unet，避免双路径重复跑 adapter / DINOv2。
+
+        Returns:
+            context, down_intrablock；return_conf 时另给 conf_dtex
+            （raw cos_map scale2，已 detach，供 D_tex 加权）。
+        """
+        bsz = lr.shape[0]
+        ref_input = ref if ref_input is None else ref_input
+
+        need_cos = self.use_confidence_gate or return_conf
+        cos_maps = raw_cos_maps = None
+        if need_cos:
+            adapter_out = self.adapter(lr, ref_input, return_cos_sim_map=True)
+            ref_feats, cos_maps, raw_cos_maps = self._unpack_adapter_out(adapter_out)
+        else:
+            ref_feats = self.adapter(lr, ref_input)
+
+        sem_tokens = None
+        if self.use_semantic:
+            # sr_latent=None 时语义模块走无条件偏置，行为可控
+            sem_pyramid = self.global_semantic(ref_input, sr_latent=sr_latent)
+            sem_tokens = self.build_sem_tokens(sem_pyramid)
+        context = self.build_context(bsz, sem_tokens)
+
+        if latent_hw is not None:
+            latent_h, latent_w = latent_hw
+        elif sr_latent is not None:
+            latent_h, latent_w = sr_latent.shape[-2:]
+        else:
+            latent_h, latent_w = _compute_latent_size(ref)
+
+        down_intrablock = self.build_down_intrablock(
+            ref_feats, latent_h, latent_w, t=t, cos_maps=cos_maps
+        )
+
+        out: Dict[str, Any] = {
+            "context": context,
+            "down_intrablock": down_intrablock,
+        }
+        if return_conf:
+            conf_dtex = None
+            if raw_cos_maps is not None and len(raw_cos_maps) > 1:
+                conf_dtex = raw_cos_maps[1].detach().float()
+            out["conf_dtex"] = conf_dtex
+        return out
+
+    def expand_condition(self, cond: Dict[str, Any], n: int = 2) -> Dict[str, Any]:
+        """沿 batch 维复制条件，供 HR/SR 双路径一次 UNet 前向。"""
+        if n <= 1:
+            return cond
+        expanded = {
+            "context": cond["context"].repeat(n, *([1] * (cond["context"].ndim - 1))),
+            "down_intrablock": [
+                residual.repeat(n, *([1] * (residual.ndim - 1)))
+                for residual in cond["down_intrablock"]
+            ],
+        }
+        if "conf_dtex" in cond and cond["conf_dtex"] is not None:
+            expanded["conf_dtex"] = cond["conf_dtex"].repeat(
+                n, *([1] * (cond["conf_dtex"].ndim - 1))
+            )
+        return expanded
+
+    def forward_unet(
+        self,
+        x_input: torch.Tensor,
+        t: torch.Tensor,
+        context: torch.Tensor,
+        down_intrablock: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """已准备好的 8 通道 UNet 输入。x_input 必须是 concat 后的结果。"""
+        if x_input.shape[1] != 8:
+            raise ValueError(
+                f"forward_unet 只接受 8 通道 x_input，收到 {x_input.shape[1]} 通道。"
+                "4 通道 x_t 请走 predict_noise。"
+            )
+        if down_intrablock is None:
+            down_intrablock = self.build_zero_intrablock(x_input)
+        return self.unet(
+            x_input,
+            t,
+            encoder_hidden_states=context,
+            down_intrablock_additional_residuals=list(down_intrablock),
+        ).sample
+
+    def predict_noise(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        lr: torch.Tensor,
+        ref: torch.Tensor,
+        sr_latent_cond: Optional[torch.Tensor] = None,
+        ref_input: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """4 通道 x_t → ε。内部明确拼接 sr_latent_cond，禁止传入已 concat 的 8 通道。"""
+        if x_t.shape[1] != 4:
+            raise ValueError(
+                f"predict_noise 只接受 4 通道 x_t，收到 {x_t.shape[1]} 通道。"
+                "已拼接的 8 通道输入请用 apply_model / forward_unet。"
+            )
+        x_input = self.concat_sr_latent(x_t, sr_latent_cond)
+        # 语义分支必须看到实际拼接后的后 4 通道（None 时为全零，而非隐式跳过）
+        cond = self.prepare_condition(
+            lr,
+            ref,
+            sr_latent=x_input[:, 4:],
+            t=t,
+            ref_input=ref_input,
+            latent_hw=x_t.shape[-2:],
+        )
+        return self.forward_unet(x_input, t, cond["context"], cond["down_intrablock"])
+
+    def predict_x0(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        lr: torch.Tensor,
+        ref: torch.Tensor,
+        sr_latent_cond: Optional[torch.Tensor] = None,
+        ref_input: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """4 通道 x_t → pred_x0。UNet 仍是 ε-prediction，这里只做 scheduler 反推。"""
+        noise_pred = self.predict_noise(
+            x_t, t, lr, ref, sr_latent_cond=sr_latent_cond, ref_input=ref_input
+        )
+        return self.predict_x0_from_eps(x_t, t, noise_pred)
 
     def apply_model(
         self,
@@ -443,40 +635,22 @@ class SD2RefGenerator(LightningModule):
         ref: torch.Tensor,
         ref_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        bsz = x_input.shape[0]
-        ref_input = ref if ref_input is None else ref_input
-
-        # ── 方案A：获取置信图（传播后置信，用于注入门控）──
-        if self.use_confidence_gate:
-            adapter_out = self.adapter(lr, ref_input, return_cos_sim_map=True)
-            ref_feats, cos_maps, _ = self._unpack_adapter_out(adapter_out)
-            # raw_cos_maps（第三个返回值）在此丢弃：
-            # 它由 gan_system._adapter_pred_x0 直接调 adapter 取用（D_tex 加权）
-        else:
-            ref_feats = self.adapter(lr, ref_input)
-            cos_maps = None
-
-        sem_tokens = None
-        if self.use_semantic:
-            # x_input = concat(x_t, sr_latent_cond)，后 4 通道即 SR 条件；
-            # sr_latent_cond=None 时 concat_sr_latent 拼的是全零，
-            # 经 SRLatentConditioner 后等价于固定偏置（无条件），行为可控
-            sr_latent_cond = x_input[:, 4:] if x_input.shape[1] == 8 else None
-            # DINOv2 前向在 GlobalSemanticModule.forward 内部已有 no_grad 保护
-            # proj 和 semantic_pyramid 需要梯度，不能包裹 no_grad
-            sem_pyramid = self.global_semantic(ref_input, sr_latent=sr_latent_cond)
-            sem_tokens = self.build_sem_tokens(sem_pyramid)
-        context = self.build_context(bsz, sem_tokens)
-        _, _, latent_h, latent_w = x_input.shape
-        down_intrablock = self.build_down_intrablock(
-            ref_feats, latent_h, latent_w, t=t, cos_maps=cos_maps
+        """采样路径：接收已拼接的 8 通道 x_input。训练请优先用 predict_noise。"""
+        if x_input.shape[1] != 8:
+            raise ValueError(
+                f"apply_model 只接受已拼接的 8 通道 x_input，收到 {x_input.shape[1]} 通道。"
+            )
+        # 后 4 通道即 SR 条件；全零时语义分支等价于固定偏置
+        sr_latent_cond = x_input[:, 4:]
+        cond = self.prepare_condition(
+            lr,
+            ref,
+            sr_latent=sr_latent_cond,
+            t=t,
+            ref_input=ref_input,
+            latent_hw=x_input.shape[-2:],
         )
-        return self.unet(
-            x_input,
-            t,
-            encoder_hidden_states=context,
-            down_intrablock_additional_residuals=list(down_intrablock),
-        ).sample
+        return self.forward_unet(x_input, t, cond["context"], cond["down_intrablock"])
 
     def get_input(self, batch, bs: Optional[int] = None, *args, **kwargs):
         lr = batch[self.lr_key]
