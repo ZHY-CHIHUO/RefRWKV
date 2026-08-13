@@ -4,28 +4,19 @@ sd2_ref_gan_system.py — G/D 分离 + 交替训练系统
 设计原则：
 1. 持有 SD2RefGenerator 和 SD2RefDiscriminator；
 2. 手动优化 + AMP + 梯度累积，按 phase 控制 G/D 交替；
-3. G step 中扩散 loss 为主，GAN / LPIPS 为辅助；
+3. G step 中扩散 loss 为主，diff_sr / LPIPS / GAN 为辅助；
 4. D step 中用单步 pred_x0 生成 fake/real，更新判别器；
 5. 所有进入判别器的图像统一保持在 [-1, 1] 值域。
 6. 无 adapter 路径复用 generator UNet + 零残差注入，零额外显存开销。
 
-本版变更（决策链接线）：
-1. 新增 dtex_conf_weight 开关（Phase2 专用）：D_tex 按局部匹配置信
-   （raw cos_map scale2，传播前）加权执法——可信区强制纹理一致，
-   借来的/脑补区不执法。weight 在 _adapter_pred_x0 内 detach，
-   作为门控信号不回传梯度。
-2. _adapter_pred_x0 支持 return_conf：通过 generator._unpack_adapter_out
-   解包 adapter 三元组 (feats, cos_maps, raw_cos_maps)，取 raw 的
-   scale2 (B,1,60,60) 作为 conf_dtex 返回。
-3. _adapter_pred_x0 的语义模块补传 sr_latent（SR 条件分支在
-   Phase2 / D step 路径同样生效，与 apply_model 行为对齐）。
-4. load_state_dict 跳过 generator.global_semantic.semantic_pyramid.*
-   —— WKV 扫描公式已从简化版（忽略 k）升级为标准 RWKV4（含 k 与 u），
-   旧金字塔权重语义不兼容，必须随机初始化重训；UNet/LoRA/Adapter/
-   sem_proj 权重不受影响，正常继承。
-5. Swap test 与 tex_weight 的关系：conf_dtex 不随 ref_for_d 交换——
-   conf 标记的是"fake 的哪些区域含有 ref 借来的纹理"，这些区域正是
-   与错误 ref 比对时能暴露不匹配的位置，保持原样即可。
+四阶段训练：
+- Stage 1  基础扩散：HR/SR 双路径噪声 MSE，SR 路径降频 + 权重递增
+- Stage 2  语义注入：DINOv2(冻结) + RWKV 金字塔 → cross-attention，
+           语义分支 5× 学习率分组
+- Stage 3  像素感知约束：SR 起点单步重建，diff_sr 走 latent MSE，
+           LPIPS 降频 + 半分辨率；t 收窄 [100, 400] 对齐推理 t_start=300
+- Stage 4  对抗训练：随机切割 256×256 patch 喂 D_sem/D_tex，
+           与 LPIPS 步错开执行，避免显存峰值叠加
 """
 
 import os
@@ -198,7 +189,14 @@ class SD2RefGANSystem(LightningModule):
     # ═══════════════════════════════════════════════════════
 
     def _pred_x0_base(
-        self, latent, sr_latent_cond, t, noise, context, down_intrablock=None
+        self,
+        latent,
+        sr_latent_cond,
+        t,
+        noise,
+        context,
+        down_intrablock=None,
+        return_pixel: bool = True,
     ):
         x_t = self.generator.noise_scheduler.add_noise(latent, noise, t)
         x_input = self.generator.concat_sr_latent(x_t, sr_latent_cond)
@@ -218,6 +216,8 @@ class SD2RefGANSystem(LightningModule):
         pred_x0 = torch.nan_to_num(pred_x0, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
             -20.0, 20.0
         )
+        if not return_pixel:
+            return pred_x0
         return self.generator.decode_latent(pred_x0)
 
     # ═══════════════════════════════════════════════════════
@@ -253,7 +253,14 @@ class SD2RefGANSystem(LightningModule):
     # ═══════════════════════════════════════════════════════
 
     def _adapter_pred_x0(
-        self, lr, ref, sr_latent_precomputed, t, noise, return_conf: bool = False
+        self,
+        lr,
+        ref,
+        sr_latent_precomputed,
+        t,
+        noise,
+        return_conf: bool = False,
+        return_latent: bool = False,
     ):
         """adapter 路径单步 pred_x0。
 
@@ -261,6 +268,7 @@ class SD2RefGANSystem(LightningModule):
             return_conf: True 时额外返回 conf_dtex——raw cos_map 的
                 scale2 (B,1,60,60)，传播前的局部匹配置信，已 detach，
                 供 D_tex 置信加权使用。
+            return_latent: True 时返回 latent 空间的 pred_x0，不做 VAE decode。
 
         Returns:
             pred 或 (pred, conf_dtex)
@@ -268,7 +276,6 @@ class SD2RefGANSystem(LightningModule):
         latent_h, latent_w = sr_latent_precomputed.shape[2:]
         bsz = lr.shape[0]
 
-        # 置信门控需要 cos_maps；D_tex 加权也需要（取 raw 分支）
         need_cos = self.generator.use_confidence_gate or (
             self.dtex_conf_weight and return_conf
         )
@@ -283,8 +290,6 @@ class SD2RefGANSystem(LightningModule):
 
         sem_tokens = None
         if self.generator.use_semantic:
-            # SR 条件分支：与 apply_model 对齐，Phase2/D step 同样让
-            # 语义金字塔看到 SR 已重建的结构（detach 与 UNet 输入一致）
             sem_pyramid = self.generator.global_semantic(
                 ref, sr_latent=sr_latent_precomputed.detach()
             )
@@ -300,13 +305,12 @@ class SD2RefGANSystem(LightningModule):
             noise=noise,
             context=context,
             down_intrablock=down_intrablock,
+            return_pixel=not return_latent,
         )
 
         if return_conf:
             conf_dtex = None
             if cos_maps_raw is not None and len(cos_maps_raw) > 1:
-                # scale2 raw（传播前局部置信，60×60）；
-                # 旧版 adapter 无 raw 分支时 _unpack_adapter_out 已回退为 cos_maps
                 conf_dtex = cos_maps_raw[1].detach().float()
             return pred, conf_dtex
         return pred
@@ -376,8 +380,10 @@ class SD2RefGANSystem(LightningModule):
             )
             logger.info(
                 "G 优化器参数分组: pretrained=%d (lr=%.1e), semantic=%d (lr=%.1e)",
-                len(pretrained_params), self.hparams.g_lr,
-                len(new_semantic_params), self.hparams.g_lr * 5,
+                len(pretrained_params),
+                self.hparams.g_lr,
+                len(new_semantic_params),
+                self.hparams.g_lr * 5,
             )
         else:
             g_opt = torch.optim.AdamW(
@@ -472,12 +478,41 @@ class SD2RefGANSystem(LightningModule):
         self._d_tex_accum_count = 0
         self._g_steps_since_d = 0
 
+        # ★ 修复：参数分组导致 optimizer 组数不匹配 → 丢弃 optimizer 状态
+        opt_states = checkpoint.get("optimizer_states")
+        if opt_states:
+            saved_groups = len(opt_states[0].get("param_groups", []))
+            current_groups = 0
+            try:
+                opts = self.optimizers()
+                opts = opts if isinstance(opts, list) else [opts]
+                g_idx = self._opt_idx.get("g")
+                if g_idx is not None and g_idx < len(opts):
+                    current_groups = len(opts[g_idx].param_groups)
+            except Exception:
+                current_groups = -1  # trainer 未就绪，无法比对
+
+            if current_groups >= 0 and saved_groups != current_groups:
+                logger.warning(
+                    "optimizer param_groups 不匹配（checkpoint=%d, 当前=%d），"
+                    "丢弃 optimizer/lr_scheduler 状态，仅恢复模型权重",
+                    saved_groups,
+                    current_groups,
+                )
+                checkpoint.pop("optimizer_states", None)
+                checkpoint.pop("lr_schedulers", None)
+            else:
+                logger.info(
+                    "optimizer param_groups 匹配（%d 组），正常恢复 optimizer 状态",
+                    saved_groups,
+                )
+
     def load_state_dict(self, state_dict, strict=True):
         skip_prefix = "generator.global_semantic.semantic_pyramid."
-        
+
         # 提取 pyramid 相关 keys
         pyramid_keys = [k for k in state_dict if k.startswith(skip_prefix)]
-        
+
         # 新版 RWKV4 公式：同时存在 key 和 receptance 线性层
         has_key = any("key.weight" in k for k in pyramid_keys)
         has_receptance = any("receptance.weight" in k for k in pyramid_keys)
@@ -489,8 +524,7 @@ class SD2RefGANSystem(LightningModule):
                 len(pyramid_keys),
             )
             state_dict = {
-                k: v for k, v in state_dict.items()
-                if not k.startswith(skip_prefix)
+                k: v for k, v in state_dict.items() if not k.startswith(skip_prefix)
             }
             strict = False
         elif pyramid_keys:
@@ -526,7 +560,7 @@ class SD2RefGANSystem(LightningModule):
 
         result = super().load_state_dict(state_dict, strict=strict)
         missing, unexpected = result.missing_keys, result.unexpected_keys
-        
+
         if missing:
             expected_new = (
                 "semantic_pyramid",
@@ -694,7 +728,6 @@ class SD2RefGANSystem(LightningModule):
 
         lr, ref, hr = self.generator.get_input(batch)
 
-        # ── Phase 1: 扩散 ε-prediction loss ──
         try:
             with torch.amp.autocast(
                 self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
@@ -708,10 +741,10 @@ class SD2RefGANSystem(LightningModule):
             )
             if is_cuda_error:
                 logger.warning(
-                    "[G step] Phase1 CUDA 异常 (batch=%d): %s，跳过并重置",
+                    "[G step] 主扩散前向 CUDA 异常 (batch=%d): %s，跳过并重置",
                     batch_idx,
                     e,
-                    exc_info=True,  # 记录完整 traceback
+                    exc_info=True,
                 )
                 try:
                     torch.cuda.empty_cache()
@@ -719,7 +752,6 @@ class SD2RefGANSystem(LightningModule):
                 except RuntimeError:
                     pass
 
-                # 如果同步失败，说明 CUDA context 已损坏，强制停止当前 step
                 try:
                     torch.cuda.synchronize()
                 except RuntimeError:
@@ -734,10 +766,10 @@ class SD2RefGANSystem(LightningModule):
                     except RuntimeError:
                         pass
                 return None
-            raise  # 非 CUDA 异常直接抛出，不掩盖 bug
+            raise
 
         if torch.isnan(loss) or torch.isinf(loss):
-            logger.warning("[G step] Phase1 loss NaN/Inf, batch=%d", batch_idx)
+            logger.warning("[G step] 主扩散 loss NaN/Inf, batch=%d", batch_idx)
             self._consecutive_nan_g += 1
             if self._check_early_stop(is_g_step=True):
                 return None
@@ -748,19 +780,16 @@ class SD2RefGANSystem(LightningModule):
             return None
         self._consecutive_nan_g = 0
 
-        loss_phase1 = loss / self.accumulate_grad_batches
+        loss_main = loss / self.accumulate_grad_batches
         if self.scaler_g is not None:
-            self.scaler_g.scale(loss_phase1).backward()
+            self.scaler_g.scale(loss_main).backward()
         else:
-            loss_phase1.backward()
+            loss_main.backward()
 
-        # ── Phase 2: 辅助 loss（diff_sr / LPIPS / GAN）──
-        phase2_loss_val = None
-        # 像素/感知 loss：不依赖判别器，系数 > 0 即启用
+        aux_loss_val = None
         aux_loss_enabled = self.sr_model is not None and (
             self.lambda_diff_sr > 0 or self.lambda_lpips > 0
         )
-        # GAN loss：需要显式开关 + 判别器存在
         gan_active = self.gan_enabled and (
             self.lambda_gan_semantic > 0 or self.lambda_gan_texture > 0
         )
@@ -777,42 +806,63 @@ class SD2RefGANSystem(LightningModule):
                         sr_latent = self._get_sr_latent_precomputed(lr, ref)
 
                     t_sr = torch.randint(
-                        self.generator.t_min,
-                        self.generator.t_max + 1,
-                        (bsz,),
-                        device=lr.device,
-                        dtype=torch.long,
+                        100, 401, (bsz,), device=lr.device, dtype=torch.long
                     )
                     noise_sr = torch.randn_like(sr_latent)
 
-                    # ── D_tex 置信加权：取 raw cos_map scale2 ──
                     if self.dtex_conf_weight:
-                        pred_sr_pixel, conf_dtex = self._adapter_pred_x0(
-                            lr, ref, sr_latent, t_sr, noise_sr, return_conf=True
+                        pred_x0_latent, conf_dtex = self._adapter_pred_x0(
+                            lr,
+                            ref,
+                            sr_latent,
+                            t_sr,
+                            noise_sr,
+                            return_conf=True,
+                            return_latent=True,
                         )
                     else:
-                        pred_sr_pixel = self._adapter_pred_x0(
-                            lr, ref, sr_latent, t_sr, noise_sr
+                        pred_x0_latent = self._adapter_pred_x0(
+                            lr,
+                            ref,
+                            sr_latent,
+                            t_sr,
+                            noise_sr,
+                            return_latent=True,
                         )
                         conf_dtex = None
 
-                    phase2_loss = 0.0
+                    aux_loss = 0.0
 
-                    # ── 像素 loss（不依赖判别器）──
                     if self.lambda_diff_sr > 0:
-                        loss_diff_sr = F.mse_loss(pred_sr_pixel, hr)
-                        phase2_loss = phase2_loss + self.lambda_diff_sr * loss_diff_sr
+                        loss_diff_sr = F.mse_loss(
+                            pred_x0_latent, out["hr_latent"].detach()
+                        )
+                        aux_loss = aux_loss + self.lambda_diff_sr * loss_diff_sr
                         self.log("train/G_diff_sr", loss_diff_sr.detach(), on_step=True)
 
-                    # ── 感知 loss（不依赖判别器）──
-                    if self.lambda_lpips > 0:
+                    pred_sr_pixel = None
+                    if self.lambda_lpips > 0 and batch_idx % 4 == 0:
+                        pred_sr_pixel = self.generator.decode_latent(pred_x0_latent)
+                        pred_small = F.interpolate(
+                            pred_sr_pixel,
+                            scale_factor=0.5,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        hr_small = F.interpolate(
+                            hr,
+                            scale_factor=0.5,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
                         loss_lpips_sr = (
-                            self.net_lpips(pred_sr_pixel, hr).mean() * self.lambda_lpips
+                            self.net_lpips(pred_small, hr_small).mean()
+                            * self.lambda_lpips
                         )
                         if not torch.isnan(loss_lpips_sr) and not torch.isinf(
                             loss_lpips_sr
                         ):
-                            phase2_loss = phase2_loss + loss_lpips_sr
+                            aux_loss = aux_loss + loss_lpips_sr
                             self.log(
                                 "train/G_lpips", loss_lpips_sr.detach(), on_step=True
                             )
@@ -822,43 +872,44 @@ class SD2RefGANSystem(LightningModule):
                                 "[G step] LPIPS NaN/Inf (#%d)，跳过", self._nan_g_count
                             )
 
-                    # ── GAN loss（需要 gan_enabled + 判别器）──
-                    if gan_active:
+                    if gan_active and batch_idx % 4 == 2:
+                        if pred_sr_pixel is None:
+                            pred_sr_pixel = self.generator.decode_latent(pred_x0_latent)
+                        i = torch.randint(0, 480 - 256, (1,)).item()
+                        j = torch.randint(0, 480 - 256, (1,)).item()
+                        fake_crop = pred_sr_pixel[:, :, i : i + 256, j : j + 256]
+                        ref_crop = ref[:, :, i : i + 256, j : j + 256]
+                        conf_crop = (
+                            conf_dtex[
+                                :, :, i // 8 : (i + 256) // 8, j // 8 : (j + 256) // 8
+                            ]
+                            if conf_dtex is not None
+                            else None
+                        )
                         with torch.amp.autocast(self.device.type, enabled=False):
                             gan_loss = self.discriminator.compute_g_loss(
-                                pred_sr_pixel.float(),
-                                ref=ref.float(),
+                                fake_crop.float(),
+                                ref=ref_crop.float(),
                                 lambda_semantic=self.lambda_gan_semantic,
                                 lambda_texture=self.lambda_gan_texture,
-                                tex_weight=conf_dtex,
+                                tex_weight=conf_crop,
                             )
                         if not torch.isnan(gan_loss) and not torch.isinf(gan_loss):
-                            phase2_loss = phase2_loss + gan_loss
+                            aux_loss = aux_loss + gan_loss
                             self.log("train/G_gan", gan_loss.detach(), on_step=True)
-                            if conf_dtex is not None:
-                                # 监控可信区占比：健康区间 0.4~0.6（实测 conf 均值），
-                                # 长期 <0.2 说明大部分样本匹配失败，先查数据对齐
-                                self.log(
-                                    "train/D_tex_conf",
-                                    conf_dtex.mean().detach(),
-                                    on_step=True,
-                                )
                         else:
                             self._nan_g_count += 1
                             logger.warning(
                                 "[G step] GAN NaN/Inf (#%d)", self._nan_g_count
                             )
 
-                    if (
-                        isinstance(phase2_loss, torch.Tensor)
-                        and phase2_loss.item() != 0
-                    ):
-                        phase2_loss_val = phase2_loss.detach()
-                        phase2_loss_scaled = phase2_loss / self.accumulate_grad_batches
+                    if isinstance(aux_loss, torch.Tensor) and aux_loss.item() != 0:
+                        aux_loss_val = aux_loss.detach()
+                        aux_loss_scaled = aux_loss / self.accumulate_grad_batches
                         if self.scaler_g is not None:
-                            self.scaler_g.scale(phase2_loss_scaled).backward()
+                            self.scaler_g.scale(aux_loss_scaled).backward()
                         else:
-                            phase2_loss_scaled.backward()
+                            aux_loss_scaled.backward()
 
             except (RuntimeError, TypeError, AttributeError) as e:
                 err_msg = str(e)
@@ -867,7 +918,7 @@ class SD2RefGANSystem(LightningModule):
                 )
                 if is_cuda_error:
                     logger.warning(
-                        "[G step] Phase2 CUDA/设备异常 (batch=%d): %s，跳过 Phase2",
+                        "[G step] 辅助 loss CUDA/设备异常 (batch=%d): %s，跳过",
                         batch_idx,
                         e,
                         exc_info=True,
@@ -884,7 +935,7 @@ class SD2RefGANSystem(LightningModule):
                             pass
                 else:
                     raise
-        # ── 梯度累积 & Optimizer Step（无论是否有 Phase2 都执行）──
+
         self._g_accum_count += 1
 
         if self._g_accum_count >= self.accumulate_grad_batches:
@@ -894,13 +945,11 @@ class SD2RefGANSystem(LightningModule):
                 else None
             )
 
-            # 1. unscale 全部
             if self.scaler_g is not None:
                 self.scaler_g.unscale_(g_opt)
                 if sr_opt is not None:
                     self.scaler_g.unscale_(sr_opt)
 
-            # 2. clip 全部
             self._monitor_grad_norms(g_opt, "G")
             self.clip_gradients(
                 g_opt,
@@ -915,7 +964,6 @@ class SD2RefGANSystem(LightningModule):
                     gradient_clip_algorithm="norm",
                 )
 
-            # 3. step 全部 → 4. update 一次
             if self.scaler_g is not None:
                 self.scaler_g.step(g_opt)
                 if sr_opt is not None:
@@ -926,7 +974,6 @@ class SD2RefGANSystem(LightningModule):
                 if sr_opt is not None:
                     sr_opt.step()
 
-            # 5. zero_grad 全部
             g_opt.zero_grad(set_to_none=True)
             if sr_opt is not None:
                 sr_opt.zero_grad(set_to_none=True)
@@ -939,10 +986,7 @@ class SD2RefGANSystem(LightningModule):
                 self._g_steps_since_d = 0
                 self._unfreeze_discriminator()
 
-        # ── 日志 ──
-        g_total = loss.detach() + (
-            phase2_loss_val if phase2_loss_val is not None else 0.0
-        )
+        g_total = loss.detach() + (aux_loss_val if aux_loss_val is not None else 0.0)
         self.log("train/G_total", g_total, on_step=True, prog_bar=True)
         self.log("train/G_diff_hr", out["loss"].detach(), on_step=True, prog_bar=True)
 

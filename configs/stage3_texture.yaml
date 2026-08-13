@@ -18,7 +18,7 @@ model:
     embed_dim: 192
     in_channels: 3
     upsample_mode: "bilinear"
-    use_self_sim_transfer: true    # ★ 开启
+    use_self_sim_transfer: false    # ★ 开启
     self_sim_topk: 8
     self_sim_init_alpha: 0.3
 
@@ -43,9 +43,9 @@ model:
   cfg_drop_prob: 0.2
   control_scale: 1.0
 
-  use_confidence_gate: true        # ★ 开启
+  use_confidence_gate: false        # ★ 开启
   confidence_alpha: 0.4
-  use_temporal_gate: true          # ★ 开启
+  use_temporal_gate: false          # ★ 开启
   control_scale_min: 0.3
   control_scale_max: 1.5
 
@@ -70,8 +70,8 @@ model:
 
   learning_rate: 0.00001
   weight_decay: 0.001
-  lambda_diff_sr: 0.3              # ★ 开启
-  lambda_lpips: 0.5                # ★ 开启
+  lambda_diff_sr: 0.1              # ★ 开启
+  lambda_lpips: 0.0                # ★ 开启
   lambda_gan: 0.0
   lambda_gan_texture: 0.0
 
@@ -83,7 +83,7 @@ model:
   grad_warn_threshold: 100.0
 
   sample_steps: 20
-  fr_metrics: [psnr, ssim, lpips, dists]
+  fr_metrics: [psnr, ssim, lpips]
   t_start: 300
   guidance_scale: 0.0
   t_stop: 200
