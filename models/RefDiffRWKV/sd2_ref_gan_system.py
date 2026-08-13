@@ -473,22 +473,33 @@ class SD2RefGANSystem(LightningModule):
         self._g_steps_since_d = 0
 
     def load_state_dict(self, state_dict, strict=True):
-        # ★ WKV 公式变更：跳过 semantic_pyramid 权重（如果 checkpoint 中有的话）
         skip_prefix = "generator.global_semantic.semantic_pyramid."
-        skipped = [k for k in state_dict if k.startswith(skip_prefix)]
-        if skipped:
+        
+        # 提取 pyramid 相关 keys
+        pyramid_keys = [k for k in state_dict if k.startswith(skip_prefix)]
+        
+        # 新版 RWKV4 公式：同时存在 key 和 receptance 线性层
+        has_key = any("key.weight" in k for k in pyramid_keys)
+        has_receptance = any("receptance.weight" in k for k in pyramid_keys)
+        is_new_formula = has_key and has_receptance
+
+        if pyramid_keys and not is_new_formula:
             logger.info(
-                "跳过 %d 个 semantic_pyramid 权重（WKV 公式变更，随机初始化重训）",
-                len(skipped),
+                "跳过 %d 个旧版 semantic_pyramid 权重（公式不兼容）",
+                len(pyramid_keys),
             )
             state_dict = {
-                k: v for k, v in state_dict.items() if not k.startswith(skip_prefix)
+                k: v for k, v in state_dict.items()
+                if not k.startswith(skip_prefix)
             }
             strict = False
+        elif pyramid_keys:
+            logger.info(
+                "semantic_pyramid 权重为新公式，正常加载（%d 个 keys）",
+                len(pyramid_keys),
+            )
 
-        # ★ Stage1(use_semantic=False) → Stage2(use_semantic=True) 过渡：
-        # checkpoint 中完全没有 global_semantic / sem_proj 权重，
-        # DINOv2 从预训练加载，pyramid/proj/sr_conditioner 随机初始化
+        # Stage1 → Stage2 过渡
         if self.generator.global_semantic is not None:
             has_semantic_in_ckpt = any(
                 k.startswith("generator.global_semantic.") for k in state_dict
@@ -500,7 +511,7 @@ class SD2RefGANSystem(LightningModule):
                 )
                 strict = False
 
-        # ★ Phase2 从 Phase1 checkpoint 恢复时，discriminator 权重不存在
+        # Phase2 从 Phase1 checkpoint 恢复时 discriminator 不存在
         if self.discriminator is not None:
             disc_keys_in_ckpt = [
                 k for k in state_dict if k.startswith("discriminator.")
@@ -515,7 +526,7 @@ class SD2RefGANSystem(LightningModule):
 
         result = super().load_state_dict(state_dict, strict=strict)
         missing, unexpected = result.missing_keys, result.unexpected_keys
-
+        
         if missing:
             expected_new = (
                 "semantic_pyramid",
