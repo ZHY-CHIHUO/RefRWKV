@@ -72,6 +72,8 @@ class SD2RefGANSystem(LightningModule):
         swap_ratio: float = 0.5,
         dtex_conf_weight: bool = False,
         lambda_sr_noise: float = 1.0,
+        sr_noise_warmdown_start: float = 1.0,
+        sr_noise_warmdown_steps: int = 0,
         gan_crop_size: int = 256,
         train_t_min: int = 0,
         train_t_max: int = 999,
@@ -115,7 +117,15 @@ class SD2RefGANSystem(LightningModule):
         # 高置信的局部匹配区域执法）
         self.dtex_conf_weight = dtex_conf_weight
 
+        if lambda_sr_noise < 0:
+            raise ValueError("lambda_sr_noise must be >= 0")
+        if sr_noise_warmdown_start < 0:
+            raise ValueError("sr_noise_warmdown_start must be >= 0")
+        if sr_noise_warmdown_steps < 0:
+            raise ValueError("sr_noise_warmdown_steps must be >= 0")
         self.lambda_sr_noise = lambda_sr_noise
+        self.sr_noise_warmdown_start = sr_noise_warmdown_start
+        self.sr_noise_warmdown_steps = sr_noise_warmdown_steps
         self.gan_crop_size = gan_crop_size
         assert train_t_min <= train_t_max, (
             f"train_t_min({train_t_min}) 必须 <= train_t_max({train_t_max})"
@@ -144,6 +154,7 @@ class SD2RefGANSystem(LightningModule):
         self._d_tex_accum_count = 0
         self._gd_phase = 0
         self._g_steps_since_d = 0
+        self._g_optimizer_steps = 0
         self._opt_idx: dict = {}
 
         # LPIPS
@@ -435,6 +446,18 @@ class SD2RefGANSystem(LightningModule):
     #  Checkpoint 持久化
     # ═══════════════════════════════════════════════════════
 
+    def _effective_lambda_sr_noise(self) -> float:
+        """按已完成的 G optimizer step 线性退火 SR noise loss 权重。"""
+        if self.sr_noise_warmdown_steps == 0:
+            return self.lambda_sr_noise
+        progress = min(
+            self._g_optimizer_steps / self.sr_noise_warmdown_steps,
+            1.0,
+        )
+        return self.sr_noise_warmdown_start + progress * (
+            self.lambda_sr_noise - self.sr_noise_warmdown_start
+        )
+
     def on_save_checkpoint(self, checkpoint):
         checkpoint.update(
             {
@@ -443,6 +466,7 @@ class SD2RefGANSystem(LightningModule):
                 "d_sem_accum_count": self._d_sem_accum_count,
                 "d_tex_accum_count": self._d_tex_accum_count,
                 "g_steps_since_d": self._g_steps_since_d,
+                "g_optimizer_steps": self._g_optimizer_steps,
             }
         )
 
@@ -458,6 +482,7 @@ class SD2RefGANSystem(LightningModule):
         self._d_sem_accum_count = 0
         self._d_tex_accum_count = 0
         self._g_steps_since_d = 0
+        self._g_optimizer_steps = checkpoint.get("g_optimizer_steps", 0)
 
         # ★ 修复：参数分组导致 optimizer 组数不匹配 → 丢弃 optimizer 状态
         opt_states = checkpoint.get("optimizer_states")
@@ -798,11 +823,12 @@ class SD2RefGANSystem(LightningModule):
                     sr_latent = self._get_sr_latent_precomputed(lr, ref)  # 无梯度
 
                 # 3. 双路径计算
-                if sr_latent is not None and self.lambda_sr_noise > 0:
+                effective_lambda_sr_noise = self._effective_lambda_sr_noise()
+                if sr_latent is not None and effective_lambda_sr_noise > 0:
                     loss_hr, loss_sr = self._compute_dual_path_loss(
                         lr, ref, hr_latent, sr_latent
                     )
-                    loss = loss_hr + self.lambda_sr_noise * loss_sr
+                    loss = loss_hr + effective_lambda_sr_noise * loss_sr
                     self.log("train/G_hr_noise", loss_hr.detach(), on_step=True)
                     self.log("train/G_sr_noise", loss_sr.detach(), on_step=True)
                 else:
@@ -814,6 +840,11 @@ class SD2RefGANSystem(LightningModule):
                     loss_sr = torch.zeros_like(loss)
                     self.log("train/G_hr_noise", loss_hr.detach(), on_step=True)
                     self.log("train/G_sr_noise", loss_sr.detach(), on_step=True)
+                self.log(
+                    "train/lambda_sr_noise_effective",
+                    effective_lambda_sr_noise,
+                    on_step=True,
+                )
 
         except (RuntimeError, TypeError, AttributeError) as e:
             err_msg = str(e)
@@ -1085,6 +1116,10 @@ class SD2RefGANSystem(LightningModule):
                 )
 
             if self.scaler_g is not None:
+                g_found_inf = self.scaler_g._found_inf_per_device(g_opt)
+                g_optimizer_stepped = not any(
+                    found_inf.item() != 0 for found_inf in g_found_inf.values()
+                )
                 self.scaler_g.step(g_opt)
                 if sr_opt is not None:
                     self.scaler_g.step(sr_opt)
@@ -1093,12 +1128,15 @@ class SD2RefGANSystem(LightningModule):
                 g_opt.step()
                 if sr_opt is not None:
                     sr_opt.step()
+                g_optimizer_stepped = True
 
             g_opt.zero_grad(set_to_none=True)
             if sr_opt is not None:
                 sr_opt.zero_grad(set_to_none=True)
 
             self._g_accum_count = 0
+            if g_optimizer_stepped:
+                self._g_optimizer_steps += 1
             self._g_steps_since_d += 1
 
             if self.gan_enabled and self._g_steps_since_d >= self.g_d_ratio:

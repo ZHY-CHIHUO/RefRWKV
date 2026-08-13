@@ -78,7 +78,9 @@ model:
   lambda_lpips: 0.0                # ★ 开启
   lambda_gan: 0.0
   lambda_gan_texture: 0.0
-  lambda_sr_noise: 0.0          # Stage3: 关闭 SR epsilon，改走 pred_x0
+  lambda_sr_noise: 0.0          # Stage3 最终关闭 SR epsilon，改走 pred_x0
+  sr_noise_warmdown_start: 1.0  # 从 Stage2 的 SR epsilon 权重平滑衔接
+  sr_noise_warmdown_steps: 5000 # 按实际 G optimizer step 线性退火至 0
   gan_crop_size: 256
   gan_warmup_steps: 3000
 

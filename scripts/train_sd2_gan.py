@@ -268,17 +268,31 @@ def validate_config(cfg):
     if aux_t_min > aux_t_max:
         raise ValueError(f"aux_t_min({aux_t_min}) 必须 <= aux_t_max({aux_t_max})")
 
+    lambda_sr_noise = mc.get("lambda_sr_noise", 1.0)
+    sr_noise_warmdown_start = mc.get("sr_noise_warmdown_start", 1.0)
+    sr_noise_warmdown_steps = mc.get("sr_noise_warmdown_steps", 0)
+    if lambda_sr_noise < 0:
+        raise ValueError("lambda_sr_noise must be >= 0")
+    if sr_noise_warmdown_start < 0:
+        raise ValueError("sr_noise_warmdown_start must be >= 0")
+    if sr_noise_warmdown_steps < 0:
+        raise ValueError("sr_noise_warmdown_steps must be >= 0")
+
     bs = cfg.get("data", {}).get("batch_size", 1)
     accum = mc.get("accumulate_grad_batches", 8)
     logger.info("有效 batch size: %d × %d = %d", bs, accum, bs * accum)
     logger.info(
         "课程 timestep: train=[%d, %d], aux=[%d, %d], "
-        "lambda_sr_noise=%s, gan_crop=%s, gan_warmup=%s",
+        "lambda_sr_noise=%s, sr_noise_warmdown=(%s -> %s, %s steps), "
+        "gan_crop=%s, gan_warmup=%s",
         train_t_min,
         train_t_max,
         aux_t_min,
         aux_t_max,
-        mc.get("lambda_sr_noise", 1.0),
+        lambda_sr_noise,
+        sr_noise_warmdown_start,
+        lambda_sr_noise,
+        sr_noise_warmdown_steps,
         mc.get("gan_crop_size", 256),
         mc.get("gan_warmup_steps", 3000),
     )
@@ -395,12 +409,16 @@ def build_model(cfg, resume_ckpt_path=None):
     )
     logger.info(
         "System 课程: train_t=[%d, %d], aux_t=[%d, %d], "
-        "lambda_sr_noise=%s, gan_crop_size=%s, gan_warmup_steps=%s",
+        "lambda_sr_noise=%s, sr_noise_warmdown=(%s -> %s, %s steps), "
+        "gan_crop_size=%s, gan_warmup_steps=%s",
         mc.get("train_t_min", 0),
         mc.get("train_t_max", 999),
         mc.get("aux_t_min", 100),
         mc.get("aux_t_max", 400),
         mc.get("lambda_sr_noise", 1.0),
+        mc.get("sr_noise_warmdown_start", 1.0),
+        mc.get("lambda_sr_noise", 1.0),
+        mc.get("sr_noise_warmdown_steps", 0),
         mc.get("gan_crop_size", 256),
         mc.get("gan_warmup_steps", 3000),
     )
@@ -489,6 +507,8 @@ def build_model(cfg, resume_ckpt_path=None):
         swap_ratio=mc.get("swap_ratio", 0.5),
         dtex_conf_weight=mc.get("dtex_conf_weight", False),
         lambda_sr_noise=mc.get("lambda_sr_noise", 1.0),
+        sr_noise_warmdown_start=mc.get("sr_noise_warmdown_start", 1.0),
+        sr_noise_warmdown_steps=mc.get("sr_noise_warmdown_steps", 0),
         gan_crop_size=mc.get("gan_crop_size", 256),
         train_t_min=mc.get("train_t_min", 0),
         train_t_max=mc.get("train_t_max", 999),
