@@ -122,9 +122,12 @@ __global__ void bi_wkv_cuda_forward_kernel(
     }
 
     // ── 第三阶段：最终输出 ──
-    c = c2 - exp(k[_t * C] - o3) * v[_t * C];
-    d = d2 - exp(k[_t * C] - o3);
     o1 = o3;
+    // 空 segment（T 非 32 整数倍时的尾部）不读取 k/v，避免越界
+    if (_tokenLength > 0) {
+        c = c2 - exp(k[_t * C] - o3) * v[_t * C];
+        d = d2 - exp(k[_t * C] - o3);
+    }
     for (int i = _t; i < (_t + _tokenLength); i++) {
         const int ii = i * C;
         scalar_t no = max(o1, u + k[ii]);
@@ -271,8 +274,11 @@ __global__ void bi_wkv_cuda_backward_kernel(
              * exp(So2[i][channel_id] - w * exp_w - no);
         o1 = no;
     }
-    c -= exp(k[_t * C] - o1) * v[_t * C];
-    d -= exp(k[_t * C] - o1);
+    // 空 segment（T 非 32 整数倍时的尾部）不读取 k/v，避免越界
+    if (_tokenLength > 0) {
+        c -= exp(k[_t * C] - o1) * v[_t * C];
+        d -= exp(k[_t * C] - o1);
+    }
 
     scalar_t gw = 0, gu = 0;
     scalar_t gc = 0, gd = 0, ga = 0, gb = 0;

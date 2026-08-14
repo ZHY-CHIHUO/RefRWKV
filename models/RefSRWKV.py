@@ -43,6 +43,7 @@ def _get_wkv_cuda():
 
     cap = torch.cuda.get_device_capability()
     arch = f"compute_{cap[0]}{cap[1]}"
+    sm = f"sm_{cap[0]}{cap[1]}"
     _wkv_cuda = load(
         name="bi_wkv",
         sources=[
@@ -56,6 +57,9 @@ def _get_wkv_cuda():
             "--use_fast_math",
             "-O3",
             "-Xptxas -O3",
+            # 直接生成 SASS（避免驱动运行时 PTX JIT——新架构 + WSL 下的
+            # "CUDA error: unknown error" 常见来源）；PTX 保留兜底。
+            f"-gencode arch={arch},code={sm}",
             f"-gencode arch={arch},code={arch}",
         ],
     )
