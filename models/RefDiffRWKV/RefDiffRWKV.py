@@ -324,7 +324,7 @@ class SelfSimTransfer(nn.Module):
 
 class RefDiffRWKV(nn.Module):
     """
-    单尺度 RWKV Ref 特征编码器（SR 自相似增强版，分分支传播最终版）。
+    单尺度 RWKV Ref 特征编码器（SR 自相似增强，分分支传播）。
 
     设计思路（参考 SR_Ref_Encoder_LCA）：
         1. LR、Ref 分别做 patch embed + 位置编码
@@ -355,7 +355,7 @@ class RefDiffRWKV(nn.Module):
         精确匹配，SelfSimTransfer 无需任何对齐代码。
 
     checkpoint 兼容：
-        use_self_sim_transfer=False（默认）时行为与原版完全一致，
+        use_self_sim_transfer=False（默认）时不启用自相似迁移，
         旧 checkpoint 可 strict 加载；开启后新增的 sim_transfer*
         参数随机初始化，resume 时 strict=False 即可。
     """

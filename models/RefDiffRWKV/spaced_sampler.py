@@ -25,6 +25,9 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from .cond_fn import Guidance
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -260,6 +263,11 @@ class SpacedSampler:
         Args:
             num_steps (int): 目标采样步数（如 50）/ Target sampling steps (e.g., 50)
         """
+        if num_steps < 2 or num_steps > self.original_num_steps:
+            raise ValueError(
+                f"num_steps({num_steps}) 必须在 [2, {self.original_num_steps}] 范围内"
+            )
+
         # 步骤 1-2: 原始扩散参数 / Step 1-2: Original diffusion parameters
         original_betas = make_beta_schedule(
             self.schedule,
@@ -272,7 +280,9 @@ class SpacedSampler:
 
         # 步骤 3: 子采样时间步 / Step 3: Subsample timesteps
         used_timesteps = space_timesteps(self.original_num_steps, str(num_steps))
-        print(f"timesteps used in spaced sampler: {sorted(list(used_timesteps))}")
+        logger.debug(
+            "timesteps used in spaced sampler: %s", sorted(list(used_timesteps))
+        )
 
         # 步骤 4: 重新计算每步 beta / Step 4: Recompute per-step beta
         # 保持边际分布一致: q(x_{S_t}|x_0) 与原始过程相同
@@ -283,7 +293,10 @@ class SpacedSampler:
             if i in used_timesteps:
                 betas.append(1 - alpha_cumprod / last_alpha_cumprod)
                 last_alpha_cumprod = alpha_cumprod
-        assert len(betas) == num_steps
+        if len(betas) != num_steps:
+            raise ValueError(
+                f"采样子采样产生 {len(betas)} 步，期望 {num_steps} 步"
+            )
         betas = np.array(betas, dtype=np.float64)
         self.betas = betas
 

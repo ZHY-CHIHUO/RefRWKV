@@ -1,9 +1,19 @@
 /******************************************************************************
  * Copyright (c) 2025 Shanghai AI Lab.
- * Modified: forward kernel uses shared memory instead of __shfl_sync
- *           (fixed: channel_id 未定义 + 第二阶段段间聚合改用 shared memory 读取)
+ * Bi-WKV forward/backward CUDA 算子：双向空间注意力（公式见下方注释）。
+ * 段并行扫描：第一阶段段内双向扫描，第二阶段段间聚合，第三阶段输出。
  ******************************************************************************/
 
+/*
+ * Bi-WKV bidirectional spatial attention (Vision-RWKV, arXiv:2403.02308v3 Sec 3.2).
+ *   wkv_t = (past + future + exp(u+k_t)*v_t) / (past_den + future_den + exp(u+k_t))
+ *   past   (a/b): a = exp(-w)*a + exp(k_i)*v_i            (forward, i<t)
+ *   future (c/d): c = exp(+w)*c - exp(k_{i+1}+w)*v_{i+1}  (backward, i>t)
+ *
+ * Convention: uses raw token distance |t-i| (paper's /T is absorbed into learnable
+ * w because this project has fixed resolution); adjacent-token -1 offset is implicit
+ * (exp(0)=1). To match the paper exactly, replace w*distance with w*distance/T.
+ */
 #include <torch/extension.h>
 #include <cuda.h>
 // #include <cuda_fp16.h>
@@ -124,7 +134,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
         scalar_t e3 = exp(u + k[ii] - no);
         y[ii] = (c * e1 + a * e2 + e3 * v[ii])/(d * e1 + b * e2 + e3 + EPS);
         // update a, b, c, d
-        const int ii2 = ((i + 1) % T) * C;
+        const int ii2 = ((i + 1) < T ? (i + 1) : (T - 1)) * C;
         no = max(o2 - w, k[ii]);
         e2 = exp(o2 - w - no);
         e3 = exp(k[ii] - no);
@@ -293,7 +303,7 @@ __global__ void bi_wkv_cuda_backward_kernel(
         go1 = gno;
 
         // update a, b, c, d
-        const int ii2 = ((i + 1) % T) * C;
+        const int ii2 = ((i + 1) < T ? (i + 1) : (T - 1)) * C;
         no = max(o2 - w, k[ii]);
         e2 = exp(o2 - w - no);
         e3 = exp(k[ii] - no);
@@ -406,6 +416,8 @@ torch::Tensor bi_wkv_cuda_forward(
             v.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>());
     }));
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "bi_wkv forward kernel launch failed");
     return y;
 }
 
@@ -450,5 +462,7 @@ std::vector<torch::Tensor> bi_wkv_cuda_backward(
             z.data_ptr<scalar_t>(),
             zexp.data_ptr<scalar_t>());
     }));
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "bi_wkv backward kernel launch failed");
     return {gw, gu, gk, gv};
 }

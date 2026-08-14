@@ -3,24 +3,28 @@
 SD2RefGANSystem 训练脚本
 
 用法:
-    python scripts/train_sd2_gan.py --config configs/sd2_ref_gan_config.yaml
-    python scripts/train_sd2_gan.py --config configs/sd2_ref_gan_config.yaml \
+    python scripts/train_sd2_gan.py --config configs/stage1_baseline.yaml
+    python scripts/train_sd2_gan.py --config configs/stage1_baseline.yaml \
         --resume checkpoints/sd2_ref_gan/last.ckpt
 
-本版变更：
-1. 所有路径改为相对路径（相对于项目根目录），本地/服务器共用同一份配置
-2. 脚本启动时自动 cd 到项目根目录
-3. SR 模型加载逻辑：
-   - sr_fixed=True（冻结）：
-     ① sr.ckpt_path 存在 → 从独立 SR checkpoint 加载
-        （第一次训练 resume_ckpt=null 时走这条路）
-     ② 否则 resume_ckpt 存在 → 从训练 checkpoint 提取 sr_model.*
-     ③ 都没有 → ValueError
-   - sr_fixed=False（微调）：只能从 resume_ckpt 加载（SR 状态随训练更新，
-     必须恢复最新权重），不存在 → ValueError
-4. 跨阶段结构变化自动回退：当 checkpoint 的 optimizer 参数组与当前模型
-   不匹配时（典型：Stage1→2 开启 semantic 新增 299 参数），自动回退为
-   仅加载模型权重，optimizer 重新初始化。
+配置:
+    各配置通过 base: 字段引用 configs/base.yaml（递归合并），--overrides
+    支持点分路径覆盖任意字段，便于消融实验。
+
+路径:
+    脚本启动时自动 cd 到项目根目录，所有路径均为相对路径。
+
+SR 模型加载:
+    sr_fixed=True（冻结）:
+      ① sr.ckpt_path 存在 → 从独立 SR checkpoint 加载
+      ② 否则 resume_ckpt 存在 → 从训练 checkpoint 提取 sr_model.*
+      ③ 都没有 → ValueError
+    sr_fixed=False（微调）: 只能从 resume_ckpt 加载（SR 状态随训练更新，
+      必须恢复最新权重），不存在 → ValueError
+
+跨阶段恢复:
+    当 checkpoint 的 optimizer 参数组与当前模型不匹配时（如 Stage1→2 新增
+    semantic 参数），自动回退为仅加载模型权重，optimizer 重新初始化。
 """
 
 import sys
@@ -246,9 +250,78 @@ class BestAllMetricsCallback(Callback):
         self.best_dists = state_dict.get("best_dists", float("inf"))
 
 
-def load_config(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并配置：override 覆盖 base（dict 按 key 递归合并）。"""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path, overrides=None):
+    """加载 YAML 配置。
+
+    - 支持 base: 字段引用公共配置（相对该配置文件所在目录解析）；
+    - 支持命令行 --overrides "a.b=val" 覆盖任意字段（便于消融实验）。
+    """
+    cfg_path = Path(path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    base = cfg.pop("base", None)
+    if base:
+        base_path = Path(base)
+        if not base_path.is_absolute():
+            base_path = cfg_path.parent / base_path
+        base_cfg = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+        cfg = _deep_merge(base_cfg, cfg)
+    for kv in overrides or []:
+        if "=" not in kv:
+            raise ValueError(f"--overrides 项缺少 = : {kv!r}")
+        key, val = kv.split("=", 1)
+        try:
+            val = yaml.safe_load(val)
+        except Exception:
+            pass  # 保持字符串
+        node = cfg
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = val
+    return cfg
+
+
+def log_module_summary(cfg):
+    """打印模块激活摘要：开关与 loss 系数一目了然（消融实验对账用）。"""
+    mc = cfg.get("model", {})
+    r = mc.get("rwkv_cfg", {})
+    rows = [
+        ("SR Prior", mc.get("sr_enabled", False)),
+        ("SR latent 条件", mc.get("use_sr_latent_cond", False)),
+        ("参考图注入", mc.get("use_reference", True)),
+        ("语义金字塔", mc.get("use_semantic", False)),
+        ("SR 条件分支", mc.get("use_sr_condition", False)),
+        ("SelfSim 迁移", r.get("use_self_sim_transfer", False)),
+        ("置信门控", mc.get("use_confidence_gate", False)),
+        ("时序门控", mc.get("use_temporal_gate", False)),
+        ("GAN", mc.get("gan_enabled", False)),
+        ("Swap Test", mc.get("use_swap_test", False)),
+        ("D_tex 置信加权", mc.get("dtex_conf_weight", False)),
+    ]
+    logger.info("=" * 60)
+    logger.info("模块激活摘要（消融对账）")
+    for name, on in rows:
+        logger.info("  [%s] %s", "ON " if on else "OFF", name)
+    logger.info(
+        "  loss: diff_sr=%.2f lpips=%.2f gan_sem=%.2f gan_tex=%.2f sr_noise=%.2f",
+        mc.get("lambda_diff_sr", 0.0),
+        mc.get("lambda_lpips", 0.0),
+        mc.get("lambda_gan", 0.0),
+        mc.get("lambda_gan_texture", 0.0),
+        mc.get("lambda_sr_noise", 0.0),
+    )
+    logger.info("=" * 60)
 
 
 def validate_config(cfg):
@@ -267,6 +340,25 @@ def validate_config(cfg):
     aux_t_max = mc.get("aux_t_max", 400)
     if aux_t_min > aux_t_max:
         raise ValueError(f"aux_t_min({aux_t_min}) 必须 <= aux_t_max({aux_t_max})")
+
+    num_train_timesteps = mc.get("num_train_timesteps", 1000)
+    if train_t_min < 0 or train_t_max >= num_train_timesteps:
+        raise ValueError(
+            f"train_t 范围 [{train_t_min}, {train_t_max}] 必须在 [0, {num_train_timesteps - 1}]"
+        )
+    if aux_t_min < 0 or aux_t_max >= num_train_timesteps:
+        raise ValueError(
+            f"aux_t 范围 [{aux_t_min}, {aux_t_max}] 必须在 [0, {num_train_timesteps - 1}]"
+        )
+    sample_steps = mc.get("sample_steps", 50)
+    if sample_steps < 1:
+        raise ValueError(f"sample_steps({sample_steps}) 必须 >= 1")
+    t_start = mc.get("t_start")
+    if t_start is not None and not (0 <= t_start < num_train_timesteps):
+        raise ValueError(f"t_start({t_start}) 必须在 [0, {num_train_timesteps - 1}]")
+    t_stop = mc.get("t_stop", 200)
+    if not (0 <= t_stop < num_train_timesteps):
+        raise ValueError(f"t_stop({t_stop}) 必须在 [0, {num_train_timesteps - 1}]")
 
     lambda_sr_noise = mc.get("lambda_sr_noise", 1.0)
     sr_noise_warmdown_start = mc.get("sr_noise_warmdown_start", 1.0)
@@ -399,7 +491,7 @@ def build_model(cfg, resume_ckpt_path=None):
 
     rwkv_cfg = mc.get("rwkv_cfg", {"patch_size": 4, "embed_dim": 192})
     logger.info(
-        "v2 开关: use_sr_condition=%s, use_confidence_gate=%s, "
+        "模块开关: use_sr_condition=%s, use_confidence_gate=%s, "
         "self_sim_transfer=%s (topk=%s), dtex_conf_weight=%s",
         mc.get("use_sr_condition", False),
         mc.get("use_confidence_gate", False),
@@ -407,6 +499,7 @@ def build_model(cfg, resume_ckpt_path=None):
         rwkv_cfg.get("self_sim_topk", 8),
         mc.get("dtex_conf_weight", False),
     )
+    logger.info("语义 WKV backend: %s", mc.get("wkv_backend", "torch"))
     logger.info(
         "System 课程: train_t=[%d, %d], aux_t=[%d, %d], "
         "lambda_sr_noise=%s, sr_noise_warmdown=(%s -> %s, %s steps), "
@@ -455,6 +548,8 @@ def build_model(cfg, resume_ckpt_path=None):
         use_temporal_gate=mc.get("use_temporal_gate", False),
         control_scale_min=mc.get("control_scale_min", 0.3),
         control_scale_max=mc.get("control_scale_max", 1.5),
+        wkv_backend=mc.get("wkv_backend", "torch"),
+        use_reference=mc.get("use_reference", True),
     )
 
     discriminator = None
@@ -598,6 +693,7 @@ def train(cfg, resume_ckpt=None):
         logger.warning("autograd 异常检测已开启")
 
     validate_config(cfg)
+    log_module_summary(cfg)
 
     ckpt_dir = oc.get("checkpoint_dir", "checkpoints/sd2_ref_gan")
     log_dir = oc.get("log_dir", "logs/sd2_ref_gan")
@@ -773,9 +869,15 @@ def main():
     parser = argparse.ArgumentParser(description="SD2RefGANSystem 训练")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--overrides",
+        nargs="*",
+        default=None,
+        help="覆盖任意配置字段，如 model.use_semantic=false model.lambda_lpips=0",
+    )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, overrides=args.overrides)
 
     oc = cfg.get("output", {})
     ckpt_dir = oc.get("checkpoint_dir", "checkpoints")
@@ -785,8 +887,10 @@ def main():
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(oc.get("log_dir", "logs"), exist_ok=True)
 
-    # 保存训练配置副本
-    shutil.copy2(args.config, os.path.join(ckpt_dir, "train_config.yaml"))
+    # 保存合并后的完整训练配置副本（自包含，便于复现与审计）
+    merged_cfg_path = os.path.join(ckpt_dir, "train_config.yaml")
+    with open(merged_cfg_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
     best_ckpt, best_score = train(cfg, resume_ckpt=args.resume)
 

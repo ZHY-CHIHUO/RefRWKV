@@ -8,15 +8,13 @@ sd2_ref_generator.py — SD2 Ref-guided Generator (latent ε-prediction)
 3. 借鉴 ControlLDM 的 get_input / p_losses / sample_log / log_images 接口。
 4. UNet conv_in 扩展为 8 通道：前 4 为 noisy_latent，后 4 为 sr_latent（条件）。
 
-本版变更（对接决策链）：
-1. 新增 use_sr_condition：透传给 GlobalSemanticModule，启用 SR latent
-   条件分支（语义金字塔同时看到 ref 与 SR 已重建的结构）。
+功能说明：
+1. use_sr_condition：透传给 GlobalSemanticModule，启用 SR latent 条件分支
+   （语义金字塔同时看到 ref 与 SR 已重建的结构）。
 2. apply_model 从 x_input 后 4 通道切出 sr_latent_cond 喂给语义模块，
-   无需改签名，Phase1 forward / Phase2 _adapter_pred_x0 / 推理
-   _denoise_step 三条路径自动覆盖。
-3. 置信门控改用 scale2 的 cos_map：scale1 窗口大、cos 全图 ~0.92
-   无区分度（已实测）；scale2 窗口 4×4、range 0.40~0.55，有真实
-   匹配信息。门控用传播后置信（借来的区域要放行）。
+   无需改签名，训练与推理各路径自动覆盖。
+3. 置信门控使用 scale2 的 cos_map：scale1 窗口大、cos 全图 ~0.92 无区分度；
+   scale2 窗口 4×4、range 0.40~0.55，有真实匹配信息。门控用传播后置信。
 4. adapter 输出解包兼容三元组 (feats, cos_maps, raw_cos_maps)：
    raw_cos_maps（传播前局部置信）供 gan_system 的 D_tex 加权使用，
    通过 _unpack_adapter_out 静态方法复用。
@@ -107,6 +105,8 @@ class SD2RefGenerator(LightningModule):
         use_temporal_gate: bool = False,
         control_scale_min: float = 0.3,
         control_scale_max: float = 1.5,
+        wkv_backend: str = "torch",
+        use_reference: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["sr_model"])
@@ -132,6 +132,8 @@ class SD2RefGenerator(LightningModule):
         self.use_temporal_gate = use_temporal_gate
         self.control_scale_min = control_scale_min
         self.control_scale_max = control_scale_max
+        self.wkv_backend = wkv_backend
+        self.use_reference = use_reference
 
         # ═══════════════════════════════════════
         #  VAE（冻结）
@@ -183,6 +185,7 @@ class SD2RefGenerator(LightningModule):
             GlobalSemanticModule(
                 dinov2_model_name=dinov2_model_name,
                 use_sr_condition=use_sr_condition,
+                wkv_backend=wkv_backend,
             )
             if self.use_semantic
             else None
@@ -321,13 +324,13 @@ class SD2RefGenerator(LightningModule):
         """解包 adapter 输出为 (feats, cos_maps, raw_cos_maps)。
 
         兼容两种返回约定：
-          - (feats, cos_maps)                旧版 / 无 raw 分支
+          - (feats, cos_maps)                无 raw 分支
           - (feats, cos_maps, raw_cos_maps)  SelfSimTransfer 版
         非元组（仅 feats）时两个 map 均为 None。
 
         cos_maps:     传播后置信（借来的区域被放行），用于注入门控
         raw_cos_maps: 传播前置信（局部 LCA 匹配），用于 D_tex 加权；
-                      旧版无此分支时回退为 cos_maps（语义等价）
+                      未提供 raw 分支时回退为 cos_maps（语义等价）
         """
         if isinstance(out, tuple):
             if len(out) >= 3:
@@ -508,6 +511,11 @@ class SD2RefGenerator(LightningModule):
         """
         bsz = lr.shape[0]
         ref_input = ref if ref_input is None else ref_input
+        if not self.use_reference:
+            # 无参考消融：以 LR 上采样作为中性自参考，adapter 退化为单图特征
+            ref_input = F.interpolate(
+                lr, size=ref.shape[-2:], mode="bilinear", align_corners=False
+            )
 
         need_cos = self.use_confidence_gate or return_conf
         cos_maps = raw_cos_maps = None

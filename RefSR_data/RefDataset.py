@@ -231,7 +231,7 @@ class RefLMDBDataset(Dataset):
     """
     LMDB 版参考超分数据集。
 
-    修复:
+    约定:
     1. crop 对齐：先采 LR 坐标再映射 HR（与 PNG 版一致）
     2. worker 安全：env 不序列化，worker 首次访问时延迟打开
     3. 读取校验：key 缺失 / bytes 长度错误时报错而非崩溃

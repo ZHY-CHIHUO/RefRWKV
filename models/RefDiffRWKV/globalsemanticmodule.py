@@ -4,13 +4,13 @@ GlobalSemantic.py — 全局语义提取模块 (SR 条件版)
 基于 DINOv2 + 双向 RWKV 的金字塔语义聚合器，从参考图像中提取多尺度语义
 特征，注入 UNet 各层编码器/瓶颈层。
 
-本版变更：
-1. 新增 SR latent 条件分支：SR latent (4×60×60) 经 2×2 avg pool + 自适应
-   池化降到 16×16，与 DINOv2 的 256 个 patch token 位置对齐后拼接，
-   使金字塔同时看到 "ref 长什么样" 和 "SR 已经重建到什么程度"，
-   让语义提取聚焦于 SR 无法提供、必须由 ref 补充的信息。
-2. WKV 扫描默认使用纯 PyTorch 分块实现（数值稳定、含 k 与 first/u 的
-   标准 RWKV4 语义），保留 wkv_backend="cuda" 旧 kernel 路径供对照。
+功能说明：
+1. SR latent 条件分支：SR latent (4×60×60) 经 2×2 avg pool + 自适应池化
+   降到 16×16，与 DINOv2 的 256 个 patch token 对齐后拼接，使金字塔同时
+   看到 ref 外观与 SR 已重建的结构。
+2. WKV 扫描默认使用纯 PyTorch 分块实现（wkv_backend="torch"，标准 RWKV4
+   语义、数值稳定）；"cuda" 为单遍双向 kernel，与 torch 数值不等价，需对齐
+   验证后使用。
 3. 数值护栏：输入 nan_to_num + clamp，扫描强制 fp32，decay/k/u clamp。
 
 参考文献 (References):
@@ -125,13 +125,15 @@ def _wkv_scan_torch(
 
 
 def _bi_wkv_scan(decay, first, k, v, backend: str = "torch"):
-    """双向 WKV：正向扫描 + 反向扫描取平均。"""
+    """双向 WKV。
+
+    torch 后端：标准 RWKV-4 因果扫描（正向 + 反向取平均）。
+    cuda 后端：bi_wkv CUDA 算子本身已是「单遍双向」（过去 + 未来 + 当前），
+    因此只调用一次，不能再 flip 取平均（否则会双重双向）。注意：cuda 与
+    torch 的归一化方式不同，二者数值不等价；默认仍用 torch。
+    """
     if backend == "cuda" and _HAS_CUDA_WKV and k.is_cuda:
-        v_fwd = _RUN_CUDA_NATIVE(decay, first, k, v)
-        v_bwd = _RUN_CUDA_NATIVE(
-            decay, first, k.flip(1).contiguous(), v.flip(1).contiguous()
-        ).flip(1)
-        return 0.5 * (v_fwd + v_bwd)
+        return _RUN_CUDA_NATIVE(decay, first, k, v)
 
     v_fwd = _wkv_scan_torch(decay, first, k, v)
     v_bwd = _wkv_scan_torch(decay, first, k.flip(1), v.flip(1)).flip(1)
@@ -183,7 +185,7 @@ class SRLatentConditioner(nn.Module):
 
 
 class RWKV_SemanticAggregator(nn.Module):
-    """双向 RWKV 语义聚合器（结构与参数名与原版一致，WKV 扫描走稳定后端）。"""
+    """双向 RWKV 语义聚合器（结构与参数名保持固定，WKV 扫描走稳定后端）。"""
 
     def __init__(
         self,
@@ -312,11 +314,11 @@ class GlobalSemanticModule(nn.Module):
         降低对 ref 的关注，把提取 capacity 留给 SR 缺失、必须由 ref
         补充的纹理/语义信息。
 
-    参数变化（相对原版）：
-        新增 use_sr_condition / sr_latent_ch / sr_hidden 三个可选参数，
-        其余构造签名、参数名完全不变。use_sr_condition=False 时行为与
-        原版等价，旧 checkpoint 可 strict 加载（新增的 sr_* 参数会
-        出现在 missing keys 中，需 strict=False 或先冻结加载）。
+    参数说明：
+        use_sr_condition / sr_latent_ch / sr_hidden 为可选参数；
+        use_sr_condition=False 时不启用 SR 条件分支，构造签名、参数名
+        与其他模块保持一致，checkpoint 可 strict 加载（新增的 sr_* 参数
+        出现在 missing keys 中时需 strict=False 或先冻结加载）。
     """
 
     IMAGENET_MEAN = (0.485, 0.456, 0.406)

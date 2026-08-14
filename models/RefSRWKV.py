@@ -1,10 +1,9 @@
 # Copyright (c) Shanghai AI Lab. All rights reserved.
 """
-RefSRWKV (Final): Reference-based Super-Resolution with RWKV Backbone.
+RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
 
-架构：2 路 H→W 串联扫描（实验证明最优）
-训练：EMA + 按验证次数的 Plateau + 梯度裁剪 + warmup
-修复：RUN_CUDA 设备检查 / ref_guided_refine 零初始化 / torch.compile 兼容
+架构：2 路空间扫描（H→W 与 W→H 各一次双向 WKV）
+训练：EMA + ReduceLROnPlateau + 梯度裁剪 + warmup
 """
 
 import torch
@@ -22,25 +21,45 @@ _cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 # ═══════════════════════════════════════════════════════════════
 # CUDA WKV
 # ═══════════════════════════════════════════════════════════════
-cap = torch.cuda.get_device_capability()
-arch = f"compute_{cap[0]}{cap[1]}"
+_wkv_cuda = None
+_wkv_load_error = None
 
-wkv_cuda = load(
-    name="bi_wkv",
-    sources=[
-        os.path.join(_cuda_dir, "bi_wkv.cpp"),
-        os.path.join(_cuda_dir, "bi_wkv_kernel.cu"),
-    ],
-    verbose=True,
-    extra_cuda_cflags=[
-        "-res-usage",
-        "--maxrregcount 60",
-        "--use_fast_math",
-        "-O3",
-        "-Xptxas -O3",
-        f"-gencode arch={arch},code={arch}",
-    ],
-)
+
+def _get_wkv_cuda():
+    """按需编译并缓存 Bi-WKV CUDA 扩展（首次真正使用时才编译）。
+
+    原实现于模块 import 时即查询 GPU capability 并触发 JIT 编译，导致：
+      1. 无 CUDA 环境下 import models.RefSRWKV 直接失败；
+      2. 每个 DataLoader worker 都会争抢首次编译。
+    现在改为延迟加载：仅在 WKV 真正在 CUDA 上运行时才编译一次。
+    """
+    global _wkv_cuda, _wkv_load_error
+    if _wkv_cuda is not None:
+        return _wkv_cuda
+    if _wkv_load_error is not None:
+        raise RuntimeError("Bi-WKV CUDA 扩展此前加载失败") from _wkv_load_error
+    if not torch.cuda.is_available():
+        raise RuntimeError("Bi-WKV 需要 CUDA；当前 torch.cuda.is_available()=False")
+
+    cap = torch.cuda.get_device_capability()
+    arch = f"compute_{cap[0]}{cap[1]}"
+    _wkv_cuda = load(
+        name="bi_wkv",
+        sources=[
+            os.path.join(_cuda_dir, "bi_wkv.cpp"),
+            os.path.join(_cuda_dir, "bi_wkv_kernel.cu"),
+        ],
+        verbose=True,
+        extra_cuda_cflags=[
+            "-res-usage",
+            "--maxrregcount 60",
+            "--use_fast_math",
+            "-O3",
+            "-Xptxas -O3",
+            f"-gencode arch={arch},code={arch}",
+        ],
+    )
+    return _wkv_cuda
 
 try:
     _compiler_disable = torch.compiler.disable
@@ -60,7 +79,7 @@ class WKV(torch.autograd.Function):
         u = u.float().contiguous()
         k = k.float().contiguous()
         v = v.float().contiguous()
-        y = wkv_cuda.bi_wkv_forward(w, u, k, v)
+        y = _get_wkv_cuda().bi_wkv_forward(w, u, k, v)
         if half_mode:
             y = y.half()
         elif bf_mode:
@@ -72,7 +91,7 @@ class WKV(torch.autograd.Function):
         w, u, k, v = ctx.saved_tensors
         half_mode = w.dtype == torch.half
         bf_mode = w.dtype == torch.bfloat16
-        gw, gu, gk, gv = wkv_cuda.bi_wkv_backward(
+        gw, gu, gk, gv = _get_wkv_cuda().bi_wkv_backward(
             w.float().contiguous(),
             u.float().contiguous(),
             k.float().contiguous(),

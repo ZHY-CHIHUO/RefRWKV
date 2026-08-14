@@ -2,17 +2,15 @@
 sd2_ref_discriminator.py — 双判别器：语义 D + 纹理一致性 D
 与 SD2RefGenerator 分离，独立 LightningModule
 
-本版变更（D_tex 置信加权，Phase2 专用）：
-1. TextureConsistencyDiscriminator.forward 新增 weight 参数：
-   用局部匹配置信图（raw cos_map，传播前）对各尺度特征差做
-   加权平均池化——只在 ref 局部可信的区域强制"生成图纹理与 ref 一致"，
-   匹配失败区（借来的纹理 / 脑补区）不执法，避免强迫 G 复制错误状态。
-2. weight 语义是 conf 而非 (1-conf)：高 conf = 局部 ref 纹理被注入 =
-   需要 D_tex 监督；低 conf = 纹理来自别处或扩散先验 = D_tex 应放手。
-3. 采用加权平均池化（除以权重和）而非先乘权再全局均值，
-   避免 logit 尺度随可信面积占比漂移；权重全零时 logit=bias、
-   G 侧梯度为 0，自动实现"无可信区域则不执法"。
-4. weight=None（默认）时行为与旧版完全一致，向后兼容。
+D_tex 置信加权：
+1. TextureConsistencyDiscriminator.forward 支持 weight 参数：用局部匹配
+   置信图（raw cos_map，传播前）对各尺度特征差做加权平均池化——只在 ref
+   局部可信的区域强制"生成图纹理与 ref 一致"，匹配失败区不执法。
+2. weight 语义是 conf：高 conf = 局部 ref 纹理被注入 = 需要 D_tex 监督；
+   低 conf = 纹理来自别处或扩散先验 = D_tex 放手。
+3. 采用加权平均池化（除以权重和）而非先乘权再全局均值，避免 logit 尺度
+   随可信面积占比漂移；权重全零时 logit=bias、G 侧梯度为 0。
+4. weight=None 时退化为全局平均池化，向后兼容。
 """
 
 import logging
@@ -338,7 +336,7 @@ class TextureConsistencyDiscriminator(nn.Module):
             image:  (B, 3, H, W) 生成图 / 真图，值域 [-1, 1]
             ref:    (B, 3, H, W) 参考图
             weight: (B, 1, h, w) 可选，局部匹配置信（raw cos_map）。
-                    None 时退化为旧版全局平均池化行为。
+                    None 时退化为全局平均池化行为。
 
         Returns:
             weighted:          (B, 1) 加权融合后的 logit，clamp 到 [-5, 5]

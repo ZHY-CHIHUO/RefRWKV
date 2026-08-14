@@ -113,7 +113,7 @@ class SD2RefGANSystem(LightningModule):
         self.use_swap_test = use_swap_test
         self.swap_ratio = swap_ratio
 
-        # D_tex 置信加权（Phase2 专用；开启后 D_tex 只在 raw cos_map
+        # D_tex 置信加权：开启后 D_tex 只在 raw cos_map
         # 高置信的局部匹配区域执法）
         self.dtex_conf_weight = dtex_conf_weight
 
@@ -157,10 +157,8 @@ class SD2RefGANSystem(LightningModule):
         self._g_optimizer_steps = 0
         self._opt_idx: dict = {}
 
-        # LPIPS
-        self.net_lpips = lpips.LPIPS(net="vgg", verbose=False)
-        for p in self.net_lpips.parameters():
-            p.requires_grad = False
+        # LPIPS（延迟初始化：首次实际使用时才加载 VGG 权重）
+        self.net_lpips = None
 
         # IQA
         self.iqa = None
@@ -182,6 +180,14 @@ class SD2RefGANSystem(LightningModule):
     # ═══════════════════════════════════════════════════════
     #  Discriminator 冻结 / 解冻
     # ═══════════════════════════════════════════════════════
+
+    def _get_lpips(self):
+        """按需初始化并返回 VGG-LPIPS（延迟加载权重）。"""
+        if self.net_lpips is None:
+            self.net_lpips = lpips.LPIPS(net="vgg", verbose=False).to(self.device)
+            for p in self.net_lpips.parameters():
+                p.requires_grad = False
+        return self.net_lpips
 
     def _freeze_discriminator(self):
         if self.discriminator is not None:
@@ -484,7 +490,7 @@ class SD2RefGANSystem(LightningModule):
         self._g_steps_since_d = 0
         self._g_optimizer_steps = checkpoint.get("g_optimizer_steps", 0)
 
-        # ★ 修复：参数分组导致 optimizer 组数不匹配 → 丢弃 optimizer 状态
+        # 参数分组导致 optimizer 组数不匹配时丢弃 optimizer 状态
         opt_states = checkpoint.get("optimizer_states")
         if opt_states:
             saved_groups = len(opt_states[0].get("param_groups", []))
@@ -519,14 +525,14 @@ class SD2RefGANSystem(LightningModule):
         # 提取 pyramid 相关 keys
         pyramid_keys = [k for k in state_dict if k.startswith(skip_prefix)]
 
-        # 新版 RWKV4 公式：同时存在 key 和 receptance 线性层
+        # 当前 WKV4 公式：同时存在 key 和 receptance 线性层
         has_key = any("key.weight" in k for k in pyramid_keys)
         has_receptance = any("receptance.weight" in k for k in pyramid_keys)
         is_new_formula = has_key and has_receptance
 
         if pyramid_keys and not is_new_formula:
             logger.info(
-                "跳过 %d 个旧版 semantic_pyramid 权重（公式不兼容）",
+                "跳过 %d 个不兼容的 semantic_pyramid 权重（WKV 公式不一致）",
                 len(pyramid_keys),
             )
             state_dict = {
@@ -551,7 +557,7 @@ class SD2RefGANSystem(LightningModule):
                 )
                 strict = False
 
-        # Phase2 从 Phase1 checkpoint 恢复时 discriminator 不存在
+        # 跨阶段恢复（如 Stage3→4）时 checkpoint 无 discriminator 权重
         if self.discriminator is not None:
             disc_keys_in_ckpt = [
                 k for k in state_dict if k.startswith("discriminator.")
@@ -802,7 +808,7 @@ class SD2RefGANSystem(LightningModule):
 
         lr, ref, hr = self.generator.get_input(batch)
 
-        # ★ 修复：在 try 块外初始化 sr_latent 和 hr_latent
+        # 在 try 块外初始化 sr_latent 和 hr_latent，供异常路径引用
         sr_latent = None
         hr_latent = None
 
@@ -976,7 +982,7 @@ class SD2RefGANSystem(LightningModule):
                             align_corners=False,
                         )
                         loss_lpips_sr = (
-                            self.net_lpips(pred_small, hr_small).mean()
+                            self._get_lpips()(pred_small, hr_small).mean()
                             * self.lambda_lpips
                         )
                         if not torch.isnan(loss_lpips_sr) and not torch.isinf(
@@ -1086,7 +1092,7 @@ class SD2RefGANSystem(LightningModule):
         self._g_accum_count += 1
 
         if self._g_accum_count >= self.accumulate_grad_batches:
-            # ★ 修复：只有在 SR 模型确实有梯度时才创建 sr_opt
+            # 仅在 SR 模型有可训练参数且需要梯度时创建 sr_opt
             sr_has_grad = (
                 not self.sr_fixed and sr_latent is not None and sr_latent.requires_grad
             )
@@ -1501,7 +1507,7 @@ class SD2RefGANSystem(LightningModule):
                     sr_t = sr_t * 2 - 1
                     hq_t = hq_t * 2 - 1
                     with torch.no_grad():
-                        val_lpips_vgg = self.net_lpips(sr_t, hq_t).mean()
+                        val_lpips_vgg = self._get_lpips()(sr_t, hq_t).mean()
                     self.log("val/lpips", val_lpips_vgg, on_epoch=True, prog_bar=True)
                     self.log("val_lpips", val_lpips_vgg, on_epoch=True)
                 else:

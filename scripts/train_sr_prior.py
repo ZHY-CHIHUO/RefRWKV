@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-RefSRWKV SR Prior 训练脚本（Final）
+RefSRWKV SR Prior 训练脚本
 
 用法:
     # 从头训练
@@ -8,7 +8,7 @@ RefSRWKV SR Prior 训练脚本（Final）
 
     # 断点续训
     python scripts/train_sr_prior.py --config configs/sr_prior.yaml \
-        --resume checkpoints/refrwkv_sr_v2/last.ckpt
+        --resume checkpoints/refrwkv_sr/last.ckpt
 
     # 后台运行
     nohup python scripts/train_sr_prior.py --config configs/sr_prior.yaml \
@@ -213,7 +213,7 @@ def main():
 
     mc = cfg["model"]
     logger.info("=" * 60)
-    logger.info("  RefSRWKV SR Prior 训练 (Final)")
+    logger.info("  RefSRWKV SR Prior 训练")
     logger.info("  数据: %s", cfg["data"]["root"])
     logger.info("  Batch size: %d × accumulate %d = 等效 %d",
                 cfg["data"].get("batch_size", 4),
