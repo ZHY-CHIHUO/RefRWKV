@@ -69,7 +69,7 @@ model:
     scale: 10
     drop_path_rate: 0.1
     hidden_rate: 4
-    ckpt_path: "checkpoints/refrwkv_sr/best.ckpt"
+    ckpt_path: "checkpoints/refrwkv_sr/new.ckpt"   # 本机实际文件；服务器若不同请用 --overrides 改
 
   # ── 门控 ──
   use_confidence_gate: false

@@ -6,10 +6,10 @@ base: base.yaml
 
 model:
   lambda_sr_noise: 0.5          # Stage1: SR 路径半权
-  use_amp: false
+  use_amp: true                 # bf16 混合精度（RTX 5060 Ti/Blackwell 原生支持）
 
 train:
-  precision: "32"
+  precision: "bf16-mixed"       # bf16 加速；SR prior 内部仍强制 fp32
   resume_ckpt: null
   best_save:
     metrics: ["psnr", "ssim"]

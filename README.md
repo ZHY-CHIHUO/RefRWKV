@@ -191,7 +191,7 @@ TensorBoard 指标一览（`logs/sd2_ref_gan/`）：
 
 | 症状 | 可能原因 | 处理 |
 |---|---|---|
-| 启动报 `SR 权重无处加载` | `sr.ckpt_path` 不存在且无 `resume_ckpt` | 检查 `checkpoints/refrwkv_sr/best.ckpt` 或指定 `--resume` |
+| 启动报 `SR 权重无处加载` | `sr.ckpt_path` 不存在且无 `resume_ckpt` | 检查 `checkpoints/refrwkv_sr/` 下实际文件（本机为 new.ckpt），或 `--overrides model.sr.ckpt_path=...` |
 | 首次运行 JIT 编译失败 | CUDA/NVCC 版本与 GPU 不匹配 | Blackwell(sm_120) 需 CUDA >= 12.8 |
 | `semantic_pyramid` 权重跳过 | WKV 公式与 checkpoint 不一致 | 属预期（公式变更），日志会提示 |
 | 训练中断恢复 | — | 重交同一命令，`last.ckpt` 自动断点续训 |
