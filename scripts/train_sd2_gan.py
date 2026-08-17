@@ -29,6 +29,7 @@ SR 模型加载:
 
 import sys
 import argparse
+import re
 import yaml
 import os
 import shutil
@@ -248,6 +249,30 @@ class BestAllMetricsCallback(Callback):
         self.best_ssim = state_dict.get("best_ssim", -float("inf"))
         self.best_lpips = state_dict.get("best_lpips", float("inf"))
         self.best_dists = state_dict.get("best_dists", float("inf"))
+
+
+class ForceSaveLastCallback(Callback):
+    """每个 epoch 结束时强制保存 last.ckpt。
+
+    背景：PL 的 save_last=True 只在 top-k checkpoint 被保存时顺带更新 last.ckpt；
+    当 val_psnr 长期不创新高（如过拟合回落期）时，会出现训练数十小时零落盘，
+    一旦中断只能回退到很久以前的权重。本回调保证每个 epoch 至少落盘一次，
+    中断最多丢失一个 epoch（含完整 optimizer 状态，可断点续训）。
+    """
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        cb = trainer.checkpoint_callback
+        if cb is None:
+            return
+        target = os.path.join(cb.dirpath, "last.ckpt")
+        try:
+            trainer.save_checkpoint(target)
+            logger.info(
+                "ForceSaveLastCallback: epoch %d 结束，强制保存 -> %s",
+                trainer.current_epoch, target,
+            )
+        except Exception as e:
+            logger.warning("ForceSaveLastCallback 保存失败: %s", e)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -615,25 +640,54 @@ def build_model(cfg, resume_ckpt_path=None):
     return system
 
 
+def _fill_monitor(template: str, monitor: str) -> str:
+    """把模板中的 {monitor} / {monitor:.4f} 占位符替换为实际指标名（/ → _），保留格式。
+
+    注意：不能用 str.replace("{monitor}", ...)——"{monitor:.4f}" 中 {monitor} 后跟
+    格式说明符，不构成完整子串；必须用正则匹配可选格式部分。
+    """
+    mon = monitor.replace("/", "_")
+
+    def _sub(m):
+        fmt = m.group(1)
+        return "{" + mon + ((":" + fmt) if fmt else "") + "}"
+
+    return re.sub(r"\{monitor(?::([^}]*))?\}", _sub, template)
+
+
 def build_trainer(cfg, exp_name, checkpoint_dir, log_dir, max_epochs):
     tc = cfg.get("train", {})
     full_ckpt_dir = os.path.join(checkpoint_dir, exp_name)
     os.makedirs(full_ckpt_dir, exist_ok=True)
 
     mc = cfg.get("model", {})
-    lambda_lpips = mc.get("lambda_lpips", 0.0)
-    has_lpips_metric = "lpips" in mc.get("fr_metrics", [])
 
-    if lambda_lpips > 0 and has_lpips_metric:
-        es_monitor = "val/lpips"
-        es_mode = "min"
-    else:
-        es_monitor = "val_psnr"
-        es_mode = "max"
+    # ── 监控指标配置化（权重保存 / EarlyStopping）──
+    # 默认以验证 loss 为准（mode=min）：loss 单调下降 → top-k 持续落盘，
+    # 避免 PSNR 不创新高时长期零落盘。各阶段可在 yaml 的 train.ckpt_monitor 覆盖。
+    ckpt_monitor = tc.get("ckpt_monitor", "val/loss_diff")
+    ckpt_mode = tc.get("ckpt_mode", "min")
+    if ckpt_mode not in ("min", "max"):
+        raise ValueError(
+            f"train.ckpt_mode 必须是 min/max，当前: {ckpt_mode!r}"
+        )
+    es_monitor = tc.get("es_monitor") or ckpt_monitor
+    es_mode = tc.get("es_mode") or ckpt_mode
 
     best_cfg = tc.get("best_save", {})
     best_metrics = best_cfg.get("metrics", ["psnr", "ssim", "lpips"])
     best_min = best_cfg.get("min_improved", 2)
+
+    # filename 模板支持 {monitor} / {monitor:.4f} 占位符（_fill_monitor 处理）
+    ckpt_filename = tc.get(
+        "ckpt_filename", "{epoch:04d}-{step:06d}-{monitor:.4f}"
+    )
+    ckpt_filename = _fill_monitor(ckpt_filename, ckpt_monitor)
+
+    logger.info(
+        "Checkpoint 监控: %s (%s) | EarlyStopping: %s (%s) | filename: %s",
+        ckpt_monitor, ckpt_mode, es_monitor, es_mode, ckpt_filename,
+    )
 
     callbacks = [
         BestAllMetricsCallback(metrics=best_metrics, min_improved=best_min),
@@ -645,25 +699,44 @@ def build_trainer(cfg, exp_name, checkpoint_dir, log_dir, max_epochs):
         ),
         ModelCheckpoint(
             dirpath=full_ckpt_dir,
-            filename="{epoch:04d}-{step:06d}-{val_psnr:.4f}",
-            monitor="val_psnr",
+            filename=ckpt_filename,
+            monitor=ckpt_monitor,
             save_top_k=tc.get("save_top_k", 3),
-            mode="max",
+            mode=ckpt_mode,
             save_last=True,
         ),
+        ForceSaveLastCallback(),  # 每个 epoch 结束强制保存 last.ckpt（防零落盘）
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
-    if lambda_lpips > 0 and has_lpips_metric:
-        callbacks.insert(
-            2,
+    # 附加监控器（yaml: train.extra_checkpoints 列表，任意多个，不写死逻辑）
+    # 每项: {monitor, mode, save_top_k, filename?}；filename 支持 {monitor} 占位符
+    for i, ec in enumerate(tc.get("extra_checkpoints", [])):
+        mon = ec.get("monitor")
+        if not mon:
+            logger.warning("extra_checkpoints[%d] 缺少 monitor，跳过", i)
+            continue
+        mode = ec.get("mode", "min")
+        if mode not in ("min", "max"):
+            raise ValueError(
+                f"extra_checkpoints[{i}].mode 必须是 min/max，当前: {mode!r}"
+            )
+        fn = ec.get(
+            "filename", "{epoch:04d}-{step:06d}-{monitor:.4f}"
+        )
+        fn = _fill_monitor(fn, mon)
+        topk = ec.get("save_top_k", 1)
+        callbacks.append(
             ModelCheckpoint(
                 dirpath=full_ckpt_dir,
-                filename="{epoch:04d}-{step:06d}-{val_lpips:.4f}",
-                monitor="val/lpips",
-                save_top_k=1,
-                mode="min",
-            ),
+                filename=fn,
+                monitor=mon,
+                save_top_k=topk,
+                mode=mode,
+            )
+        )
+        logger.info(
+            "额外监控器[%d]: %s (%s, top_k=%d) -> %s", i, mon, mode, topk, fn,
         )
 
     trainer = pl.Trainer(

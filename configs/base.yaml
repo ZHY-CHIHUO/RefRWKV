@@ -152,6 +152,22 @@ train:
   detect_anomaly: false
   seed: 42
   resume_ckpt: null
+  # ── 监控指标配置（权重保存 / EarlyStopping 都以 loss 为准）──
+  # 默认 val/loss_diff (min)：loss 单调下降 → top-k 持续落盘，不会零落盘。
+  # 可用替代：val_psnr (max) / val/lpips (min) / val/ssim (max)
+  ckpt_monitor: "val/loss_diff"
+  ckpt_mode: "min"
+  ckpt_filename: "{epoch:04d}-{step:06d}-{monitor:.4f}"   # {monitor} 自动替换
+  es_monitor: null                 # null = 跟随 ckpt_monitor
+  es_mode: null                    # null = 跟随 ckpt_mode
+  # 附加权重监控器（任意多个，每个生成一个 ModelCheckpoint）
+  # 每项: monitor / mode(min|max) / save_top_k / filename(可选, 支持 {monitor})
+  # 例: 额外按 LPIPS 保存 top1
+  #   extra_checkpoints:
+  #     - monitor: "val/lpips"
+  #       mode: "min"
+  #       save_top_k: 1
+  extra_checkpoints: []
   best_save:
     metrics: ["psnr", "ssim"]
     min_improved: 2

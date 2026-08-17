@@ -30,6 +30,14 @@ train:
   val_check_interval: 0.25
   early_stopping_patience: 20
   resume_ckpt: "checkpoints/sd2_ref_gan_Stage2/last.ckpt"
+  # 主权重监控默认 val/loss_diff (min，base.yaml)；Stage 3 主线是感知质量，
+  # 额外按 LPIPS 保存 top1，EarlyStopping 也以 LPIPS 为准
+  es_monitor: "val/lpips"
+  es_mode: "min"
+  extra_checkpoints:
+    - monitor: "val/lpips"
+      mode: "min"
+      save_top_k: 1
   best_save:
     metrics: ["psnr", "ssim", "lpips"]
     min_improved: 2

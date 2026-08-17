@@ -31,6 +31,13 @@ model:
 train:
   precision: "32"
   resume_ckpt: "checkpoints/sd2_ref_gan_Stage3/last.ckpt"
+  # 主权重监控默认 val/loss_diff (min)；GAN 阶段感知质量为主线，额外按 LPIPS 保存
+  es_monitor: "val/lpips"
+  es_mode: "min"
+  extra_checkpoints:
+    - monitor: "val/lpips"
+      mode: "min"
+      save_top_k: 1
   best_save:
     metrics: ["psnr", "ssim", "lpips"]
     min_improved: 2

@@ -372,7 +372,11 @@ class SD2RefGANSystem(LightningModule):
             g_opt = torch.optim.AdamW(
                 [
                     {"params": pretrained_params, "lr": self.hparams.g_lr},
-                    {"params": new_semantic_params, "lr": self.hparams.g_lr * 5},
+                    {
+                        "params": new_semantic_params,
+                        "lr": self.hparams.g_lr * 5,
+                        "semantic_group": True,  # 标记，_override_lr_on_resume 据此保留 5× lr
+                    },
                 ],
                 weight_decay=self.hparams.g_weight_decay,
             )
@@ -491,25 +495,28 @@ class SD2RefGANSystem(LightningModule):
         self._g_optimizer_steps = checkpoint.get("g_optimizer_steps", 0)
 
         # 参数分组导致 optimizer 组数不匹配时丢弃 optimizer 状态
+        # 注意：on_load_checkpoint 执行时 optimizer 尚未配置，self.optimizers()
+        # 拿不到参数组；改为按 generator 结构推导 G 优化器应有的组数
+        # （与 scripts/train_sd2_gan.py 预检测逻辑一致）。
         opt_states = checkpoint.get("optimizer_states")
         if opt_states:
             saved_groups = len(opt_states[0].get("param_groups", []))
-            current_groups = 0
-            try:
-                opts = self.optimizers()
-                opts = opts if isinstance(opts, list) else [opts]
-                g_idx = self._opt_idx.get("g")
-                if g_idx is not None and g_idx < len(opts):
-                    current_groups = len(opts[g_idx].param_groups)
-            except Exception:
-                current_groups = -1  # trainer 未就绪，无法比对
+            gen = self.generator
+            has_semantic_group = any(
+                p.requires_grad
+                and any(
+                    k in n for k in ("semantic_pyramid", "sem_proj", "sr_conditioner")
+                )
+                for n, p in gen.named_parameters()
+            )
+            expected_groups = 2 if has_semantic_group else 1
 
-            if current_groups >= 0 and saved_groups != current_groups:
+            if saved_groups != expected_groups:
                 logger.warning(
-                    "optimizer param_groups 不匹配（checkpoint=%d, 当前=%d），"
+                    "optimizer param_groups 不匹配（checkpoint=%d, 预期=%d），"
                     "丢弃 optimizer/lr_scheduler 状态，仅恢复模型权重",
                     saved_groups,
-                    current_groups,
+                    expected_groups,
                 )
                 checkpoint.pop("optimizer_states", None)
                 checkpoint.pop("lr_schedulers", None)
@@ -570,6 +577,23 @@ class SD2RefGANSystem(LightningModule):
                 )
                 strict = False
 
+        # LPIPS 延迟初始化（优化后）：checkpoint 在验证时会写入 net_lpips 权重，
+        # 而新进程加载时 net_lpips 尚未初始化（None），strict 恢复会把这些键判为
+        # unexpected 而崩溃。此处直接丢弃这些键：_get_lpips() 首次验证时会从 lpips
+        # 包重新加载同一份预训练 VGG 权重（同环境同版本），数值等价。
+        if self.net_lpips is None:
+            lpips_keys = [k for k in state_dict if k.startswith("net_lpips.")]
+            if lpips_keys:
+                logger.info(
+                    "丢弃 %d 个 net_lpips 键（LPIPS 延迟初始化未触发，"
+                    "首次验证时由 _get_lpips() 重新加载预训练权重）",
+                    len(lpips_keys),
+                )
+                state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if not k.startswith("net_lpips.")
+                }
+
         result = super().load_state_dict(state_dict, strict=strict)
         missing, unexpected = result.missing_keys, result.unexpected_keys
 
@@ -617,12 +641,17 @@ class SD2RefGANSystem(LightningModule):
             return
         optimizers = opts if isinstance(opts, list) else [opts]
 
-        old_g = None
-        for pg in optimizers[self._opt_idx["g"]].param_groups:
+        # G 优化器：semantic 组（带 semantic_group 标记）保留 5× lr，
+        # 其余组恢复为 g_lr（修复此前把所有组一律压成 g_lr 导致 5× 失效的 bug）
+        for i, pg in enumerate(optimizers[self._opt_idx["g"]].param_groups):
             old_g = pg["lr"]
-            pg["lr"] = self.hparams.g_lr
-        if old_g is not None:
-            logger.info("G LR: %.1e → %.1e", old_g, self.hparams.g_lr)
+            new_lr = self.hparams.g_lr * (5.0 if pg.get("semantic_group") else 1.0)
+            pg["lr"] = new_lr
+            logger.info(
+                "G LR[%d]: %.1e → %.1e%s",
+                i, old_g, new_lr,
+                " (semantic 5×)" if pg.get("semantic_group") else "",
+            )
 
         sr_idx = self._opt_idx.get("sr")
         if sr_idx is not None:
