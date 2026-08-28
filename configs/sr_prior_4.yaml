@@ -27,8 +27,8 @@ data:
   scale: 4
   augment: true                # flip + rot90，HR/LR/Ref 同步
   augment_ref: false           # 跨时相天然域差已足够，不再人工增强
-  ref_gray_prob: 0.0           # 保留真实参考信号
-  batch_size: 1                # 全图单卡友好
+  ref_gray_prob: 0.2           # 保留真实参考信号
+  batch_size: 4                # 全图单卡友好
   val_batch_size: 1
   num_workers: 8
   val_num_workers: 2
@@ -40,7 +40,7 @@ train:
   devices: 1
   precision: "bf16-mixed"
   max_epochs: 200
-  val_check_interval: 0.5      # 全图每 epoch 约 1.9 万步，半 epoch 验一次
+  val_check_interval: 0.25      # 全图每 epoch 约 1.9 万步，半 epoch 验一次
   log_every_n_steps: 20
   early_stopping_patience: 20  # 每 0.5 epoch 验一次 → 约 10 个 epoch 无提升才停
   save_top_k: 3
@@ -48,9 +48,9 @@ train:
   grad_clip_val: 1.0
   grad_clip_algorithm: norm    # "norm" 或 "value"
   seed: 42
-  accumulate_grad_batches: 8   # 1 × 8 = 等效 batch 8，与 ×10 配方对齐
+  accumulate_grad_batches: 2
 
 output:
-  checkpoint_dir: "checkpoints/refrwkv_sr*4"   # 与 ×10 隔离，防误续训
+  checkpoint_dir: "checkpoints/refrwkv_sr_4"   # 与 ×10 隔离，防误续训
   log_dir: "logs/refrwkv_sr"
-  experiment_name: "refrwkv_sr*4"
+  experiment_name: "refrwkv_sr_4"
