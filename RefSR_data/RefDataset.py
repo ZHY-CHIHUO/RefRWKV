@@ -76,7 +76,9 @@ class RefPNGDataset(Dataset):
             ]
         )
 
-        mode_index = {"train": 0, "val": 1, "test": 2}[mode]
+        if mode not in {"train", "val", "test", "test_easy", "test_hard"}:
+            raise ValueError(f"Unknown mode: {mode}")
+        mode_index = {"train": 0, "val": 1}.get(mode, 2)
         num_to_sample = max_samples[mode_index]
 
         if num_to_sample is not None:
@@ -306,7 +308,9 @@ class RefLMDBDataset(Dataset):
         if self.total_samples == 0:
             raise ValueError(f"LMDB is empty: {self._lmdb_path}")
 
-        mode_index = {"train": 0, "val": 1, "test": 2}[mode]
+        if mode not in {"train", "val", "test", "test_easy", "test_hard"}:
+            raise ValueError(f"Unknown mode: {mode}")
+        mode_index = {"train": 0, "val": 1}.get(mode, 2)
         num_to_sample = max_samples[mode_index]
         if num_to_sample is not None:
             if num_to_sample > self.total_samples:
