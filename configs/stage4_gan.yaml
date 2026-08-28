@@ -29,7 +29,7 @@ model:
   use_amp: false
 
 train:
-  precision: "32"
+  precision: "bf16-mixed"
   resume_ckpt: "checkpoints/sd2_ref_gan_Stage3/last.ckpt"
   # 主权重监控默认 val/loss_diff (min)；GAN 阶段感知质量为主线，额外按 LPIPS 保存
   es_monitor: "val/lpips"

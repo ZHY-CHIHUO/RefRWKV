@@ -27,7 +27,6 @@ model:
 
 train:
   precision: "bf16-mixed"
-  val_check_interval: 0.25
   early_stopping_patience: 20
   resume_ckpt: "checkpoints/sd2_ref_gan_Stage2/last.ckpt"
   # 主权重监控默认 val/loss_diff (min，base.yaml)；Stage 3 主线是感知质量，
