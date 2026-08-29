@@ -700,6 +700,7 @@ class LitRefSRWKV(pl.LightningModule):
 
         if self.ssim_weight > 0 or self.fft_weight > 0:
             loss = self.l1_loss(output, hr)
+            self.log("val_l1", loss, on_step=False, on_epoch=True)
             if self.ssim_weight > 0:
                 if self.ssim_loss_fn is not None and self._ssim_backend == 'pyiqa':
                     ssim_val = self.ssim_loss_fn(output, hr)
@@ -709,8 +710,9 @@ class LitRefSRWKV(pl.LightningModule):
                 loss = loss + self.ssim_weight * ssim_loss
                 self.log("val_ssim_loss", ssim_loss, on_step=False, on_epoch=True)
             if self.fft_weight > 0:
-                loss = loss + self.fft_weight * self._fft_loss(output, hr)
-            self.log("val_l1", loss, on_step=False, on_epoch=True)
+                fft_loss = self._fft_loss(output, hr)
+                loss = loss + self.fft_weight * fft_loss
+                self.log("val_fft_loss", fft_loss, on_step=False, on_epoch=True)
         else:
             loss = self.criterion(output, hr)
 
