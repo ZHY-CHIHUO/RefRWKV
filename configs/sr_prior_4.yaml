@@ -1,18 +1,19 @@
 model:
   inp_channels: 3
   out_channels: 3
-  dim: 48 # 16GB 安全，约 28M 参数
+  dim: 48
   num_blocks: [4, 6, 6, 8]
   num_refinement_blocks: 4
   scale: 4
   drop_path_rate: 0.1
   hidden_rate: 4
-  learning_rate: 1.0e-5 # ★ 热启动降 LR（原 1e-4 → 1e-5）
-  warmup_steps: 100
+  learning_rate: 1.0e-4
+  warmup_steps: 500
   grad_clip_norm: 1.0
   ema_decay: 0.999
   use_ema: true
-  ssim_weight: 0.2 # ★ 保守起步（原 0.5 → 0.2），稳定后可加到 0.5
+  ssim_weight: 0.2
+  fft_weight: 0.1
 
 data:
   root: "RefSR_data/HRMS_SCD"
@@ -34,7 +35,7 @@ train:
   precision: bf16-mixed
   max_epochs: 100
   val_check_interval: 0.25
-  accumulate_grad_batches: 2 # ★ 等效 batch=10
+  accumulate_grad_batches: 2
   save_top_k: 3
   early_stopping_patience: 30
 

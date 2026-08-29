@@ -111,6 +111,7 @@ def build_model(cfg):
         ema_decay=mc.get("ema_decay", 0.999),
         use_ema=mc.get("use_ema", True),
         ssim_weight=mc.get("ssim_weight", 0.0),
+        fft_weight=mc.get("fft_weight", 0.0),  # ← 新增
     )
     return lit_model
 
@@ -337,6 +338,7 @@ def main():
         mc.get("warmup_steps", 500),
     )
     logger.info("  SSIM weight: %.2f", mc.get("ssim_weight", 0.0))
+    logger.info("  FFT weight: %.2f", mc.get("fft_weight", 0.0))
     logger.info(
         "  梯度裁剪: %.2f (%s)",
         tc.get("grad_clip_val", 1.0),

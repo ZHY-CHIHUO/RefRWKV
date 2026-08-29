@@ -1,9 +1,6 @@
 # Copyright (c) Shanghai AI Lab. All rights reserved.
 """
 RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
-
-架构：2 路空间扫描（H→W 与 W→H 各一次双向 WKV）
-训练：EMA + CosineAnnealing + 梯度裁剪 + warmup
 """
 
 import torch
@@ -18,21 +15,12 @@ import os
 
 _cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 
-# ═══════════════════════════════════════════════════════════════
-# CUDA WKV
-# ═══════════════════════════════════════════════════════════════
+# ═══ CUDA WKV ═══
 _wkv_cuda = None
 _wkv_load_error = None
 
 
 def _get_wkv_cuda():
-    """按需编译并缓存 Bi-WKV CUDA 扩展（首次真正使用时才编译）。
-
-    原实现于模块 import 时即查询 GPU capability 并触发 JIT 编译，导致：
-      1. 无 CUDA 环境下 import models.RefSRWKV 直接失败；
-      2. 每个 DataLoader worker 都会争抢首次编译。
-    现在改为延迟加载：仅在 WKV 真正在 CUDA 上运行时才编译一次。
-    """
     global _wkv_cuda, _wkv_load_error
     if _wkv_cuda is not None:
         return _wkv_cuda
@@ -52,13 +40,8 @@ def _get_wkv_cuda():
         ],
         verbose=True,
         extra_cuda_cflags=[
-            "-res-usage",
-            "--maxrregcount 60",
-            "--use_fast_math",
-            "-O3",
+            "-res-usage", "--maxrregcount 60", "--use_fast_math", "-O3",
             "-Xptxas -O3",
-            # 直接生成 SASS（避免驱动运行时 PTX JIT——新架构 + WSL 下的
-            # "CUDA error: unknown error" 常见来源）；PTX 保留兜底。
             f"-gencode arch={arch},code={sm}",
             f"-gencode arch={arch},code={arch}",
         ],
@@ -68,7 +51,6 @@ def _get_wkv_cuda():
 try:
     _compiler_disable = torch.compiler.disable
 except AttributeError:
-
     def _compiler_disable(fn=None, **kwargs):
         return fn if fn is not None else (lambda f: f)
 
@@ -96,10 +78,8 @@ class WKV(torch.autograd.Function):
         half_mode = w.dtype == torch.half
         bf_mode = w.dtype == torch.bfloat16
         gw, gu, gk, gv = _get_wkv_cuda().bi_wkv_backward(
-            w.float().contiguous(),
-            u.float().contiguous(),
-            k.float().contiguous(),
-            v.float().contiguous(),
+            w.float().contiguous(), u.float().contiguous(),
+            k.float().contiguous(), v.float().contiguous(),
             gy.float().contiguous(),
         )
         if half_mode:
@@ -119,9 +99,7 @@ def RUN_CUDA(w, u, k, v):
     return WKV.apply(w, u, k, v)
 
 
-# ═══════════════════════════════════════════════════════════════
-# DropPath
-# ═══════════════════════════════════════════════════════════════
+# ═══ DropPath ═══
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
         super().__init__()
@@ -139,9 +117,7 @@ class DropPath(nn.Module):
         return x * random_tensor
 
 
-# ═══════════════════════════════════════════════════════════════
-# OmniShift（4 分支：Identity + 1×1 + 3×3 + 5×5）
-# ═══════════════════════════════════════════════════════════════
+# ═══ OmniShift（残差门控版） ═══
 class OmniShift(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -150,17 +126,15 @@ class OmniShift(nn.Module):
         self.conv3x3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
         self.conv5x5 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim, bias=False)
         self.alpha = nn.Parameter(torch.ones(4) * 0.25)
+        self.gate = nn.Parameter(torch.zeros(1))  # 初始 0 → 等价恒等映射
         self.register_buffer("conv5x5_reparam_weight", torch.zeros(dim, 1, 5, 5))
         self._reparam_done = False
 
     def forward_train(self, x):
         alpha = torch.softmax(self.alpha, dim=0)
-        return (
-            alpha[0] * x
-            + alpha[1] * self.conv1x1(x)
-            + alpha[2] * self.conv3x3(x)
-            + alpha[3] * self.conv5x5(x)
-        )
+        shifted = (alpha[0] * x + alpha[1] * self.conv1x1(x) +
+                   alpha[2] * self.conv3x3(x) + alpha[3] * self.conv5x5(x))
+        return x + torch.tanh(self.gate) * (shifted - x)
 
     def reparam_5x5(self):
         if self._reparam_done:
@@ -185,9 +159,7 @@ class OmniShift(nn.Module):
             return F.conv2d(x, self.conv5x5_reparam_weight, padding=2, groups=self.dim)
 
 
-# ═══════════════════════════════════════════════════════════════
-# VRWKV Blocks（2 路 H→W 串联）
-# ═══════════════════════════════════════════════════════════════
+# ═══ VRWKV Blocks ═══
 class VRWKV_SpatialMix(nn.Module):
     def __init__(self, n_embd, head_dim=64):
         super().__init__()
@@ -279,9 +251,7 @@ class Block(nn.Module):
         return x
 
 
-# ═══════════════════════════════════════════════════════════════
-# Resizing
-# ═══════════════════════════════════════════════════════════════
+# ═══ Resizing ═══
 class Downsample(nn.Module):
     def __init__(self, n_feat, channel_scale=2):
         super().__init__()
@@ -309,9 +279,7 @@ class Upsample(nn.Module):
         return self.body(x)
 
 
-# ═══════════════════════════════════════════════════════════════
-# GatedFusion
-# ═══════════════════════════════════════════════════════════════
+# ═══ GatedFusion（余弦置信度版） ═══
 def _gn_groups(num_channels: int, max_groups: int = 32) -> int:
     for g in range(min(max_groups, num_channels), 0, -1):
         if num_channels % g == 0:
@@ -335,15 +303,17 @@ class GatedFusion(nn.Module):
         nn.init.constant_(self.gate[-2].bias, 0.0)
 
     def forward(self, lr_feat, ref_feat):
+        # 余弦相似度置信度：相似度高 → 参考图可信 → gate 放大
+        sim = F.cosine_similarity(lr_feat, ref_feat, dim=1).unsqueeze(1)
+        conf = torch.sigmoid(sim * 2.0)
+
         fused = self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1))
         fused = self.norm(fused)
-        gate = self.gate(fused)
+        gate = self.gate(fused) * conf
         return lr_feat + gate * fused
 
 
-# ═══════════════════════════════════════════════════════════════
-# RefSRWKV
-# ═══════════════════════════════════════════════════════════════
+# ═══ RefSRWKV ═══
 class RefSRWKV(nn.Module):
     def __init__(
         self,
@@ -361,13 +331,17 @@ class RefSRWKV(nn.Module):
         self.dim = dim
         self.out_channels = out_channels
 
-        # ── LR 编码器 ──
+        # ── LR 编码器（加 dilation 扩大感受野） ──
         self.lr_up = nn.Sequential(
-            # nn.Upsample(scale_factor=2.5, mode="bilinear", align_corners=False),
             nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False),
             nn.GroupNorm(_gn_groups(dim), dim),
             nn.ReLU(inplace=True),
             nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(dim), dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(_gn_groups(dim), dim),
+            nn.ReLU(inplace=True),
         )
 
         # ── Ref 编码器 ──
@@ -389,15 +363,11 @@ class RefSRWKV(nn.Module):
             nn.GroupNorm(_gn_groups(dim * 8), dim * 8),
         )
 
-        # ── 门控融合 ──
+        # ── 门控融合（全部 bias=0，初始 gate=0.5） ──
         self.fuse1 = GatedFusion(dim)
         self.fuse2 = GatedFusion(dim * 2)
         self.fuse3 = GatedFusion(dim * 4)
         self.fuse4 = GatedFusion(dim * 8)
-        nn.init.constant_(self.fuse1.gate[-2].bias, 1.5)
-        nn.init.constant_(self.fuse2.gate[-2].bias, 0.5)
-        nn.init.constant_(self.fuse3.gate[-2].bias, 0.0)
-        nn.init.constant_(self.fuse4.gate[-2].bias, -0.5)
 
         # ── DropPath ──
         dp_rates = [
@@ -407,37 +377,25 @@ class RefSRWKV(nn.Module):
 
         # ── 编码器 ──
         self.encoder_level1 = nn.Sequential(
-            *[
-                Block(dim, hidden_rate, dp_rates[dp_idx + i])
-                for i in range(num_blocks[0])
-            ]
+            *[Block(dim, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[0])]
         )
         dp_idx += num_blocks[0]
         self.down1_2 = Downsample(dim)
 
         self.encoder_level2 = nn.Sequential(
-            *[
-                Block(dim * 2, hidden_rate, dp_rates[dp_idx + i])
-                for i in range(num_blocks[1])
-            ]
+            *[Block(dim * 2, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[1])]
         )
         dp_idx += num_blocks[1]
         self.down2_3 = Downsample(dim * 2)
 
         self.encoder_level3 = nn.Sequential(
-            *[
-                Block(dim * 4, hidden_rate, dp_rates[dp_idx + i])
-                for i in range(num_blocks[2])
-            ]
+            *[Block(dim * 4, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[2])]
         )
         dp_idx += num_blocks[2]
         self.down3_4 = Downsample(dim * 4)
 
         self.latent = nn.Sequential(
-            *[
-                Block(dim * 8, hidden_rate, dp_rates[dp_idx + i])
-                for i in range(num_blocks[3])
-            ]
+            *[Block(dim * 8, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[3])]
         )
 
         # ── 解码器 ──
@@ -477,19 +435,14 @@ class RefSRWKV(nn.Module):
         self.up_final = nn.Sequential(
             nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
             nn.PixelShuffle(2),
+            nn.ReLU(inplace=True),
             nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
             nn.PixelShuffle(2),
+            nn.ReLU(inplace=True),
         )
-        self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=True)
+        self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=False)
 
-        # ── Ref 引导残差 ──
-        self.ref_guided_refine = nn.Conv2d(
-            out_channels * 2, out_channels, 3, padding=1, bias=False
-        )
-
-        # ★ 先全局初始化，再零初始化（顺序不能反）
         self.apply(self._init_weights)
-        nn.init.zeros_(self.ref_guided_refine.weight)
 
     @staticmethod
     def _init_weights(m):
@@ -501,6 +454,14 @@ class RefSRWKV(nn.Module):
             nn.init.zeros_(m.bias)
             nn.init.ones_(m.weight)
 
+    def _match_color(self, ref, target):
+        """通道级颜色对齐：将 ref 的均值和标准差对齐到 target"""
+        ref_mean = ref.mean(dim=[2, 3], keepdim=True)
+        ref_std = ref.std(dim=[2, 3], keepdim=True)
+        tgt_mean = target.mean(dim=[2, 3], keepdim=True)
+        tgt_std = target.std(dim=[2, 3], keepdim=True)
+        return (ref - ref_mean) / (ref_std + 1e-6) * tgt_std + tgt_mean
+
     def _extract_ref_pyramid(self, ref):
         ref_1 = self.ref_to_level1(ref)
         ref_2 = self.ref_down2(ref_1)
@@ -509,48 +470,35 @@ class RefSRWKV(nn.Module):
         return ref_1, ref_2, ref_3, ref_4
 
     def forward(self, lr, ref):
-        # fea = self.lr_up(lr)
-        # ★ 动态计算 Level1 目标尺寸（= Ref 经过 PixelUnshuffle(4) 后的尺寸）
+        # 1. LR bicubic 上采样到 HR
+        lr_hr = F.interpolate(lr, size=ref.shape[2:], mode="bicubic", align_corners=False)
+
+        # 2. 参考图颜色对齐到 lr_hr（消除跨时相色偏）
+        ref_aligned = self._match_color(ref, lr_hr)
+
+        # 3. 下采样到 encoder 输入分辨率
         target_h = ref.shape[2] // 4
         target_w = ref.shape[3] // 4
+        fea = F.interpolate(lr_hr, size=(target_h, target_w), mode="bicubic", align_corners=False)
+        fea = self.lr_up(fea)
 
-        # ★ 将 LR 插值到 Level1 分辨率（自动适配任意 scale）
-        if lr.shape[2] != target_h or lr.shape[3] != target_w:
-            fea = F.interpolate(
-                lr, size=(target_h, target_w), mode="bilinear", align_corners=False
-            )
-        else:
-            fea = lr  # scale=4 时 LR 和 Level1 同尺寸，跳过插值
-
-        fea = self.lr_up(fea)  # 只做卷积特征提取，不做尺寸变换
-        ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref)
+        ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_aligned)
 
         e1 = self.encoder_level1(self.fuse1(fea, ref_1))
         e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
         e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
         latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
 
-        d3 = self.decoder_level3(
-            self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
-        )
-        d2 = self.decoder_level2(
-            self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
-        )
-        d1 = self.decoder_level1(
-            self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
-        )
+        d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1)))
+        d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)))
+        d1 = self.decoder_level1(self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)))
 
         d1 = self.refinement(d1)
         hr_feat = self.up_final(d1)
-        # --- 临时 Debug 保险丝 ---
-        if torch.isnan(hr_feat).any() or torch.isinf(hr_feat).any():
-            print(f"[WARNING] hr_feat contains NaN/Inf! Clamping...")
-            hr_feat = torch.nan_to_num(hr_feat, nan=0.0, posinf=1.0, neginf=-1.0)
-        # -------------------------
-        out = self.output_conv(hr_feat)
+        residual = self.output_conv(hr_feat)
 
-        residual = self.ref_guided_refine(torch.cat([out, ref], dim=1))
-        out = torch.clamp(out + residual, -1.0, 1.0)
+        # 4. 残差相加
+        out = torch.tanh(lr_hr + residual)
         return out
 
     def prepare_for_inference(self):
@@ -562,9 +510,7 @@ class RefSRWKV(nn.Module):
         return self
 
 
-# ═══════════════════════════════════════════════════════════════
-# EMA
-# ═══════════════════════════════════════════════════════════════
+# ═══ EMA ═══
 class EMA:
     def __init__(self, decay: float = 0.999):
         self.decay = decay
@@ -587,7 +533,6 @@ class EMA:
             if param.requires_grad and name in self.shadow:
                 if self.shadow[name].device != param.device:
                     self.shadow[name] = self.shadow[name].to(param.device)
-                # ★ 修复 bf16 精度损失：先将 param 转为 float32 再更新 shadow
                 p_data = param.data.float() if param.data.dtype != torch.float32 else param.data
                 self.shadow[name].mul_(self.decay).add_(p_data, alpha=1.0 - self.decay)
 
@@ -607,11 +552,7 @@ class EMA:
         self.backup = {}
 
     def state_dict(self):
-        return {
-            "decay": self.decay,
-            "shadow": self.shadow,
-            "initialized": self._initialized,
-        }
+        return {"decay": self.decay, "shadow": self.shadow, "initialized": self._initialized}
 
     def load_state_dict(self, sd):
         self.decay = sd["decay"]
@@ -619,9 +560,7 @@ class EMA:
         self._initialized = sd["initialized"]
 
 
-# ═══════════════════════════════════════════════════════════════
-# LitRefSRWKV — 修复版：支持 SSIM loss + CosineAnnealing 调度
-# ═══════════════════════════════════════════════════════════════
+# ═══ LitRefSRWKV（含频域 loss） ═══
 class LitRefSRWKV(pl.LightningModule):
     def __init__(
         self,
@@ -631,7 +570,8 @@ class LitRefSRWKV(pl.LightningModule):
         grad_clip_norm: float = 1.0,
         ema_decay: float = 0.999,
         use_ema: bool = True,
-        ssim_weight: float = 0.0,  # ← 新增：SSIM loss 权重
+        ssim_weight: float = 0.0,
+        fft_weight: float = 0.0,
         loss_fn=None,
         lr_key: str = "lr",
         hr_key: str = "hr",
@@ -640,31 +580,30 @@ class LitRefSRWKV(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["model_sr", "loss_fn"])
         self.model_sr = model_sr
-        
-        # ★ 修复 Bug 1 & 2：根据 ssim_weight 选择 loss 组合策略
+
         self.ssim_weight = ssim_weight
-        if ssim_weight > 0:
-            # 使用 L1 + SSIM 组合 loss
+        self.fft_weight = fft_weight
+        if ssim_weight > 0 or fft_weight > 0:
             self.l1_loss = nn.L1Loss()
-            try:
-                from pyiqa import create_metric as _create_pyiqa_metric
-                self.ssim_loss_fn = _create_pyiqa_metric('ssim', loss_mode=True)
-                self._ssim_backend = 'pyiqa'
-            except Exception:
-                # fallback: 手动实现 SSIM loss（假设输入范围 [-1, 1]）
+            if ssim_weight > 0:
+                try:
+                    from pyiqa import create_metric as _create_pyiqa_metric
+                    self.ssim_loss_fn = _create_pyiqa_metric('ssim', loss_mode=True)
+                    self._ssim_backend = 'pyiqa'
+                except Exception:
+                    self.ssim_loss_fn = None
+                    self._ssim_backend = 'manual'
+            else:
                 self.ssim_loss_fn = None
-                self._ssim_backend = 'manual'
-            self.criterion = None  # 不用单一 criterion
+            self.criterion = None
         else:
             self.criterion = loss_fn or nn.L1Loss()
             self.ssim_loss_fn = None
-            
+
         self.lr_key = lr_key
         self.hr_key = hr_key
         self.ref_key = ref_key
         self.ema = EMA(decay=ema_decay) if use_ema else None
-        self.plateau_scheduler = None
-        self._pending_plateau_state = None
 
     def _unpack_batch(self, batch):
         if isinstance(batch, dict):
@@ -674,66 +613,73 @@ class LitRefSRWKV(pl.LightningModule):
     def forward(self, lr, ref):
         return self.model_sr(lr, ref)
 
-    # ── 训练 ──
+    @staticmethod
+    def _fft_loss(pred, target):
+        """频域感知 loss：增强高频细节"""
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+        return F.l1_loss(pred_fft, target_fft)
+
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
-        
-        # ★ 修复 Bug 2：组合 L1 + SSIM loss
-        if self.ssim_weight > 0 and self.criterion is None:
+
+        if self.ssim_weight > 0 or self.fft_weight > 0:
             l1_loss = self.l1_loss(output, hr)
-            
-            if self._ssim_backend == 'pyiqa' and self.ssim_loss_fn is not None:
-                ssim_val = self.ssim_loss_fn(output, hr)
-                ssim_loss = 1.0 - ssim_val  # pyiqa 返回的是 SSIM 值（越高越好），转为 loss
-            else:
-                # manual SSIM loss fallback
-                ssim_loss = self._manual_ssim_loss(output, hr)
-            
-            loss = l1_loss + self.ssim_weight * ssim_loss
+            loss = l1_loss
+
+            if self.ssim_weight > 0:
+                if self.ssim_loss_fn is not None and self._ssim_backend == 'pyiqa':
+                    ssim_val = self.ssim_loss_fn(output, hr)
+                    ssim_loss = 1.0 - ssim_val
+                else:
+                    ssim_loss = self._manual_ssim_loss(output, hr)
+                loss = loss + self.ssim_weight * ssim_loss
+                self.log("train_ssim_loss", ssim_loss, on_step=True, on_epoch=True)
+
+            if self.fft_weight > 0:
+                fft_loss = self._fft_loss(output, hr)
+                loss = loss + self.fft_weight * fft_loss
+                self.log("train_fft_loss", fft_loss, on_step=True, on_epoch=True)
+
             self.log("train_l1", l1_loss, on_step=True, on_epoch=True)
-            self.log("train_ssim_loss", ssim_loss, on_step=True, on_epoch=True)
         else:
             loss = self.criterion(output, hr)
-        
+
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
-    
+
     @staticmethod
     def _manual_ssim_loss(pred, target):
-        """手动实现 SSIM loss（fallback），假设输入范围 [-1, 1]。"""
         C = pred.shape[1]
-        # 高斯窗口
         window_size = 11
         sigma = 1.5
         coords = torch.arange(window_size, dtype=pred.dtype, device=pred.device)
         g = torch.exp(-((coords - window_size // 2) ** 2) / (2 * sigma ** 2))
         g = g / g.sum()
-        window = g.unsqueeze(0) * g.unsqueeze(1)  # (11, 11)
-        window = window.unsqueeze(0).unsqueeze(0).repeat(C, 1, 1, 1)  # (C, 1, 11, 11)
-        
+        window = g.unsqueeze(0) * g.unsqueeze(1)
+        window = window.unsqueeze(0).unsqueeze(0).repeat(C, 1, 1, 1)
+
         pad = window_size // 2
         mu_pred = F.conv2d(pred, window, padding=pad, groups=C)
         mu_target = F.conv2d(target, window, padding=pad, groups=C)
-        
+
         mu_pred_sq = mu_pred ** 2
         mu_target_sq = mu_target ** 2
         mu_pred_target = mu_pred * mu_target
-        
+
         sigma_pred_sq = F.conv2d(pred ** 2, window, padding=pad, groups=C) - mu_pred_sq
         sigma_target_sq = F.conv2d(target ** 2, window, padding=pad, groups=C) - mu_target_sq
         sigma_pred_target = F.conv2d(pred * target, window, padding=pad, groups=C) - mu_pred_target
-        
-        C1 = 0.01 ** 2
-        C2 = 0.03 ** 2
-        
+
+        C1 = (0.01 * 2.0) ** 2
+        C2 = (0.03 * 2.0) ** 2
+
         ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / \
                    ((mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2))
-        
         return 1.0 - ssim_map.mean()
 
     def on_train_batch_start(self, batch, batch_idx):
-        # ★ 修复 Bug 3：warmup 只在 CosineAnnealing 模式下生效
         if self.global_step < self.hparams.warmup_steps:
             progress = (self.global_step + 1) / self.hparams.warmup_steps
             lr_scale = 1e-3 + (1.0 - 1e-3) * progress
@@ -744,7 +690,6 @@ class LitRefSRWKV(pl.LightningModule):
         if self.ema is not None:
             self.ema.update(self.model_sr)
 
-    # ── 验证 ──
     def on_validation_epoch_start(self):
         if self.ema is not None:
             self.ema.apply_shadow(self.model_sr)
@@ -752,37 +697,36 @@ class LitRefSRWKV(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
-        
-        # ★ 验证也用同样的 loss 计算
-        if self.ssim_weight > 0 and self.criterion is None:
-            l1_loss = self.l1_loss(output, hr)
-            if self._ssim_backend == 'pyiqa' and self.ssim_loss_fn is not None:
-                ssim_val = self.ssim_loss_fn(output, hr)
-                ssim_loss = 1.0 - ssim_val
-            else:
-                ssim_loss = self._manual_ssim_loss(output, hr)
-            loss = l1_loss + self.ssim_weight * ssim_loss
-            self.log("val_l1", l1_loss, on_step=False, on_epoch=True)
-            self.log("val_ssim_loss", ssim_loss, on_step=False, on_epoch=True)
+
+        if self.ssim_weight > 0 or self.fft_weight > 0:
+            loss = self.l1_loss(output, hr)
+            if self.ssim_weight > 0:
+                if self.ssim_loss_fn is not None and self._ssim_backend == 'pyiqa':
+                    ssim_val = self.ssim_loss_fn(output, hr)
+                    ssim_loss = 1.0 - ssim_val
+                else:
+                    ssim_loss = self._manual_ssim_loss(output, hr)
+                loss = loss + self.ssim_weight * ssim_loss
+                self.log("val_ssim_loss", ssim_loss, on_step=False, on_epoch=True)
+            if self.fft_weight > 0:
+                loss = loss + self.fft_weight * self._fft_loss(output, hr)
+            self.log("val_l1", loss, on_step=False, on_epoch=True)
         else:
             loss = self.criterion(output, hr)
-        
+
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # PSNR（值域 [-1,1] → [0,255] 近似）
+
+        # 标准 PSNR [-1,1] 口径，和 bicubic 直接可比
         mse = F.mse_loss(output, hr)
-        psnr = 10 * torch.log10(4.0 / (mse + 1e-8))  # 假设值域 [-1,1]，峰值范围=2，PSNR=10*log10(4/mse)
+        psnr = 10 * torch.log10(4.0 / (mse + 1e-8))
         self.log("val/psnr", psnr, on_step=False, on_epoch=True)
-        
+
         return loss
 
     def on_validation_epoch_end(self):
         if self.ema is not None:
             self.ema.restore(self.model_sr)
-        # ★ 修复 Bug 3：移除 ReduceLROnPlateau 冲突，改用 CosineAnnealing
-        # （scheduler 在 configure_optimizers 中已配置为 step-based）
 
-    # ── 测试 ──
     def on_test_epoch_start(self):
         if self.ema is not None:
             self.ema.apply_shadow(self.model_sr)
@@ -798,12 +742,8 @@ class LitRefSRWKV(pl.LightningModule):
         if self.ema is not None:
             self.ema.restore(self.model_sr)
 
-    # ── 优化器（★ 修复 Bug 3：CosineAnnealing 替代 ReduceLROnPlateau）──
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        
-        # 使用 CosineAnnealingLR 替代 ReduceLROnPlateau，避免与 warmup 冲突
-        # total_steps 由 trainer 自动估算
         scheduler = {
             "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
@@ -815,10 +755,7 @@ class LitRefSRWKV(pl.LightningModule):
         }
         return [optimizer], [scheduler]
 
-    # ── 梯度裁剪 ──
-    def configure_gradient_clipping(
-        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
-    ):
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         clip_val = gradient_clip_val or self.hparams.grad_clip_norm
         if clip_val and clip_val > 0:
             self.clip_gradients(
@@ -827,7 +764,6 @@ class LitRefSRWKV(pl.LightningModule):
                 gradient_clip_algorithm=gradient_clip_algorithm or "norm",
             )
 
-    # ── Checkpoint ──
     def on_save_checkpoint(self, checkpoint):
         if self.ema is not None:
             checkpoint["ema_state_dict"] = self.ema.state_dict()
@@ -839,8 +775,7 @@ class LitRefSRWKV(pl.LightningModule):
     def on_train_start(self):
         total = sum(p.numel() for p in self.parameters())
         ema_info = f" | EMA decay={self.ema.decay}" if self.ema else " | EMA=off"
-        ssim_info = f" | SSIM weight={self.ssim_weight}" if self.ssim_weight > 0 else ""
-        print(
-            f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M"
-            f" | grad_clip={self.hparams.grad_clip_norm}{ema_info}{ssim_info}"
-        )
+        ssim_info = f" | SSIM={self.ssim_weight}" if self.ssim_weight > 0 else ""
+        fft_info = f" | FFT={self.fft_weight}" if self.fft_weight > 0 else ""
+        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M"
+              f" | grad_clip={self.hparams.grad_clip_norm}{ema_info}{ssim_info}{fft_info}")
