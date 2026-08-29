@@ -7,12 +7,12 @@ model:
   scale: 4
   drop_path_rate: 0.1
   hidden_rate: 4
-  learning_rate: 1.0e-4
+  learning_rate: 1.0e-5 # ★ 热启动降 LR（原 1e-4 → 1e-5）
   warmup_steps: 100
   grad_clip_norm: 1.0
   ema_decay: 0.999
   use_ema: true
-  ssim_weight: 0.5 # L1 + 0.5*SSIM
+  ssim_weight: 0.2 # ★ 保守起步（原 0.5 → 0.2），稳定后可加到 0.5
 
 data:
   root: "RefSR_data/HRMS_SCD"
@@ -31,18 +31,14 @@ data:
 
 train:
   devices: 1
-  precision: "bf16-mixed"
+  precision: bf16-mixed
   max_epochs: 100
   val_check_interval: 0.25
-  log_every_n_steps: 20
-  early_stopping_patience: 40
+  accumulate_grad_batches: 2 # ★ 等效 batch=10
   save_top_k: 3
-  grad_clip_val: 1.0
-  grad_clip_algorithm: norm
-  seed: 42
-  accumulate_grad_batches: 2
+  early_stopping_patience: 30
 
 output:
-  checkpoint_dir: "checkpoints/refrwkv_sr_4"
-  log_dir: "logs/refrwkv_sr"
-  experiment_name: "refrwkv_sr_4"
+  checkpoint_dir: checkpoints/refrwkv_sr_4
+  log_dir: logs/refrwkv_sr_4
+  experiment_name: refwkv_sr_4
