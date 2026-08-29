@@ -1,52 +1,44 @@
-# ============================================================
-# RefSRWKV SR Prior ×4 训练配置 — RefSR-HRMS
-# 由 ×10 配置迁移：scale 10→4、数据切换到 HRMS_SCD、
-# 全图训练、关闭 Ref 人工增强、输出目录隔离
-# ============================================================
-
 model:
   inp_channels: 3
   out_channels: 3
-  dim: 48
+  dim: 48 # 16GB 安全，约 28M 参数
   num_blocks: [4, 6, 6, 8]
   num_refinement_blocks: 4
   scale: 4
   drop_path_rate: 0.1
   hidden_rate: 4
-  # ── 优化器 ──
-  learning_rate: 5.0e-5
+  learning_rate: 1.0e-4
   warmup_steps: 100
-  # ── 梯度 / EMA ──
   grad_clip_norm: 1.0
   ema_decay: 0.999
   use_ema: true
+  ssim_weight: 0.5 # L1 + 0.5*SSIM
 
 data:
   root: "RefSR_data/HRMS_SCD"
   patch_size: null
   scale: 4
   augment: true
-  augment_ref: false # 跨时相天然域差已足够，不再人工增强
-  ref_gray_prob: 0.2
-  batch_size: 4
+  augment_ref: false
+  ref_gray_prob: 0.0
+  batch_size: 5
   val_batch_size: 1
   num_workers: 8
   val_num_workers: 2
   prefetch_factor: 4
   pin_memory: true
-  max_samples_val: 300 # 固定 300 张低变化样本做验证（seed=42 可复现）
+  max_samples_val: 300
 
 train:
   devices: 1
   precision: "bf16-mixed"
-  max_epochs: 200
+  max_epochs: 100
   val_check_interval: 0.25
   log_every_n_steps: 20
-  early_stopping_patience: 20
+  early_stopping_patience: 40
   save_top_k: 3
-  # ── 梯度裁剪（Trainer 统一入口）──
   grad_clip_val: 1.0
-  grad_clip_algorithm: norm # "norm" 或 "value"
+  grad_clip_algorithm: norm
   seed: 42
   accumulate_grad_batches: 2
 
