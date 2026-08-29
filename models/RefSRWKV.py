@@ -40,7 +40,10 @@ def _get_wkv_cuda():
         ],
         verbose=True,
         extra_cuda_cflags=[
-            "-res-usage", "--maxrregcount 60", "--use_fast_math", "-O3",
+            "-res-usage",
+            "--maxrregcount 60",
+            "--use_fast_math",
+            "-O3",
             "-Xptxas -O3",
             f"-gencode arch={arch},code={sm}",
             f"-gencode arch={arch},code={arch}",
@@ -48,9 +51,11 @@ def _get_wkv_cuda():
     )
     return _wkv_cuda
 
+
 try:
     _compiler_disable = torch.compiler.disable
 except AttributeError:
+
     def _compiler_disable(fn=None, **kwargs):
         return fn if fn is not None else (lambda f: f)
 
@@ -78,8 +83,10 @@ class WKV(torch.autograd.Function):
         half_mode = w.dtype == torch.half
         bf_mode = w.dtype == torch.bfloat16
         gw, gu, gk, gv = _get_wkv_cuda().bi_wkv_backward(
-            w.float().contiguous(), u.float().contiguous(),
-            k.float().contiguous(), v.float().contiguous(),
+            w.float().contiguous(),
+            u.float().contiguous(),
+            k.float().contiguous(),
+            v.float().contiguous(),
             gy.float().contiguous(),
         )
         if half_mode:
@@ -132,8 +139,12 @@ class OmniShift(nn.Module):
 
     def forward_train(self, x):
         alpha = torch.softmax(self.alpha, dim=0)
-        shifted = (alpha[0] * x + alpha[1] * self.conv1x1(x) +
-                   alpha[2] * self.conv3x3(x) + alpha[3] * self.conv5x5(x))
+        shifted = (
+            alpha[0] * x
+            + alpha[1] * self.conv1x1(x)
+            + alpha[2] * self.conv3x3(x)
+            + alpha[3] * self.conv5x5(x)
+        )
         return x + torch.tanh(self.gate) * (shifted - x)
 
     def reparam_5x5(self):
@@ -377,25 +388,37 @@ class RefSRWKV(nn.Module):
 
         # ── 编码器 ──
         self.encoder_level1 = nn.Sequential(
-            *[Block(dim, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[0])]
+            *[
+                Block(dim, hidden_rate, dp_rates[dp_idx + i])
+                for i in range(num_blocks[0])
+            ]
         )
         dp_idx += num_blocks[0]
         self.down1_2 = Downsample(dim)
 
         self.encoder_level2 = nn.Sequential(
-            *[Block(dim * 2, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[1])]
+            *[
+                Block(dim * 2, hidden_rate, dp_rates[dp_idx + i])
+                for i in range(num_blocks[1])
+            ]
         )
         dp_idx += num_blocks[1]
         self.down2_3 = Downsample(dim * 2)
 
         self.encoder_level3 = nn.Sequential(
-            *[Block(dim * 4, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[2])]
+            *[
+                Block(dim * 4, hidden_rate, dp_rates[dp_idx + i])
+                for i in range(num_blocks[2])
+            ]
         )
         dp_idx += num_blocks[2]
         self.down3_4 = Downsample(dim * 4)
 
         self.latent = nn.Sequential(
-            *[Block(dim * 8, hidden_rate, dp_rates[dp_idx + i]) for i in range(num_blocks[3])]
+            *[
+                Block(dim * 8, hidden_rate, dp_rates[dp_idx + i])
+                for i in range(num_blocks[3])
+            ]
         )
 
         # ── 解码器 ──
@@ -471,7 +494,9 @@ class RefSRWKV(nn.Module):
 
     def forward(self, lr, ref):
         # 1. LR bicubic 上采样到 HR
-        lr_hr = F.interpolate(lr, size=ref.shape[2:], mode="bicubic", align_corners=False)
+        lr_hr = F.interpolate(
+            lr, size=ref.shape[2:], mode="bicubic", align_corners=False
+        )
 
         # 2. 参考图颜色对齐到 lr_hr（消除跨时相色偏）
         ref_aligned = self._match_color(ref, lr_hr)
@@ -479,7 +504,9 @@ class RefSRWKV(nn.Module):
         # 3. 下采样到 encoder 输入分辨率
         target_h = ref.shape[2] // 4
         target_w = ref.shape[3] // 4
-        fea = F.interpolate(lr_hr, size=(target_h, target_w), mode="bicubic", align_corners=False)
+        fea = F.interpolate(
+            lr_hr, size=(target_h, target_w), mode="bicubic", align_corners=False
+        )
         fea = self.lr_up(fea)
 
         ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_aligned)
@@ -489,9 +516,15 @@ class RefSRWKV(nn.Module):
         e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
         latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
 
-        d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1)))
-        d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)))
-        d1 = self.decoder_level1(self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)))
+        d3 = self.decoder_level3(
+            self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
+        )
+        d2 = self.decoder_level2(
+            self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
+        )
+        d1 = self.decoder_level1(
+            self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
+        )
 
         d1 = self.refinement(d1)
         hr_feat = self.up_final(d1)
@@ -533,7 +566,11 @@ class EMA:
             if param.requires_grad and name in self.shadow:
                 if self.shadow[name].device != param.device:
                     self.shadow[name] = self.shadow[name].to(param.device)
-                p_data = param.data.float() if param.data.dtype != torch.float32 else param.data
+                p_data = (
+                    param.data.float()
+                    if param.data.dtype != torch.float32
+                    else param.data
+                )
                 self.shadow[name].mul_(self.decay).add_(p_data, alpha=1.0 - self.decay)
 
     def apply_shadow(self, model: nn.Module):
@@ -552,7 +589,11 @@ class EMA:
         self.backup = {}
 
     def state_dict(self):
-        return {"decay": self.decay, "shadow": self.shadow, "initialized": self._initialized}
+        return {
+            "decay": self.decay,
+            "shadow": self.shadow,
+            "initialized": self._initialized,
+        }
 
     def load_state_dict(self, sd):
         self.decay = sd["decay"]
@@ -588,11 +629,12 @@ class LitRefSRWKV(pl.LightningModule):
             if ssim_weight > 0:
                 try:
                     from pyiqa import create_metric as _create_pyiqa_metric
-                    self.ssim_loss_fn = _create_pyiqa_metric('ssim', loss_mode=True)
-                    self._ssim_backend = 'pyiqa'
+
+                    self.ssim_loss_fn = _create_pyiqa_metric("ssim", loss_mode=True)
+                    self._ssim_backend = "pyiqa"
                 except Exception:
                     self.ssim_loss_fn = None
-                    self._ssim_backend = 'manual'
+                    self._ssim_backend = "manual"
             else:
                 self.ssim_loss_fn = None
             self.criterion = None
@@ -616,8 +658,8 @@ class LitRefSRWKV(pl.LightningModule):
     @staticmethod
     def _fft_loss(pred, target):
         """频域感知 loss：增强高频细节"""
-        pred_fft = torch.fft.rfft2(pred, norm='ortho')
-        target_fft = torch.fft.rfft2(target, norm='ortho')
+        pred_fft = torch.fft.rfft2(pred, norm="ortho")
+        target_fft = torch.fft.rfft2(target, norm="ortho")
         return F.l1_loss(pred_fft, target_fft)
 
     def training_step(self, batch, batch_idx):
@@ -629,7 +671,7 @@ class LitRefSRWKV(pl.LightningModule):
             loss = l1_loss
 
             if self.ssim_weight > 0:
-                if self.ssim_loss_fn is not None and self._ssim_backend == 'pyiqa':
+                if self.ssim_loss_fn is not None and self._ssim_backend == "pyiqa":
                     ssim_val = self.ssim_loss_fn(output, hr)
                     ssim_loss = 1.0 - ssim_val
                 else:
@@ -655,7 +697,7 @@ class LitRefSRWKV(pl.LightningModule):
         window_size = 11
         sigma = 1.5
         coords = torch.arange(window_size, dtype=pred.dtype, device=pred.device)
-        g = torch.exp(-((coords - window_size // 2) ** 2) / (2 * sigma ** 2))
+        g = torch.exp(-((coords - window_size // 2) ** 2) / (2 * sigma**2))
         g = g / g.sum()
         window = g.unsqueeze(0) * g.unsqueeze(1)
         window = window.unsqueeze(0).unsqueeze(0).repeat(C, 1, 1, 1)
@@ -664,19 +706,24 @@ class LitRefSRWKV(pl.LightningModule):
         mu_pred = F.conv2d(pred, window, padding=pad, groups=C)
         mu_target = F.conv2d(target, window, padding=pad, groups=C)
 
-        mu_pred_sq = mu_pred ** 2
-        mu_target_sq = mu_target ** 2
+        mu_pred_sq = mu_pred**2
+        mu_target_sq = mu_target**2
         mu_pred_target = mu_pred * mu_target
 
-        sigma_pred_sq = F.conv2d(pred ** 2, window, padding=pad, groups=C) - mu_pred_sq
-        sigma_target_sq = F.conv2d(target ** 2, window, padding=pad, groups=C) - mu_target_sq
-        sigma_pred_target = F.conv2d(pred * target, window, padding=pad, groups=C) - mu_pred_target
+        sigma_pred_sq = F.conv2d(pred**2, window, padding=pad, groups=C) - mu_pred_sq
+        sigma_target_sq = (
+            F.conv2d(target**2, window, padding=pad, groups=C) - mu_target_sq
+        )
+        sigma_pred_target = (
+            F.conv2d(pred * target, window, padding=pad, groups=C) - mu_pred_target
+        )
 
         C1 = (0.01 * 2.0) ** 2
         C2 = (0.03 * 2.0) ** 2
 
-        ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / \
-                   ((mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2))
+        ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / (
+            (mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2)
+        )
         return 1.0 - ssim_map.mean()
 
     def on_train_batch_start(self, batch, batch_idx):
@@ -702,7 +749,7 @@ class LitRefSRWKV(pl.LightningModule):
             loss = self.l1_loss(output, hr)
             self.log("val_l1", loss, on_step=False, on_epoch=True)
             if self.ssim_weight > 0:
-                if self.ssim_loss_fn is not None and self._ssim_backend == 'pyiqa':
+                if self.ssim_loss_fn is not None and self._ssim_backend == "pyiqa":
                     ssim_val = self.ssim_loss_fn(output, hr)
                     ssim_loss = 1.0 - ssim_val
                 else:
@@ -749,7 +796,11 @@ class LitRefSRWKV(pl.LightningModule):
         scheduler = {
             "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=self.trainer.estimated_stepping_batches if hasattr(self.trainer, 'estimated_stepping_batches') else 100000,
+                T_max=(
+                    self.trainer.estimated_stepping_batches
+                    if hasattr(self.trainer, "estimated_stepping_batches")
+                    else 100000
+                ),
                 eta_min=1e-6,
             ),
             "interval": "step",
@@ -757,7 +808,9 @@ class LitRefSRWKV(pl.LightningModule):
         }
         return [optimizer], [scheduler]
 
-    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
         clip_val = gradient_clip_val or self.hparams.grad_clip_norm
         if clip_val and clip_val > 0:
             self.clip_gradients(
@@ -779,5 +832,7 @@ class LitRefSRWKV(pl.LightningModule):
         ema_info = f" | EMA decay={self.ema.decay}" if self.ema else " | EMA=off"
         ssim_info = f" | SSIM={self.ssim_weight}" if self.ssim_weight > 0 else ""
         fft_info = f" | FFT={self.fft_weight}" if self.fft_weight > 0 else ""
-        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M"
-              f" | grad_clip={self.hparams.grad_clip_norm}{ema_info}{ssim_info}{fft_info}")
+        print(
+            f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M"
+            f" | grad_clip={self.hparams.grad_clip_norm}{ema_info}{ssim_info}{fft_info}"
+        )
