@@ -1,15 +1,15 @@
 # RefRWKV — Reference-Guided Remote Sensing Super-Resolution
 
-基于 RWKV + Stable Diffusion 2.1 的参考引导遥感图像超分辨率重建框架，实现 10 倍超分（LR 48×48 → HR 480×480）。
+基于 RWKV + Stable Diffusion 2.1 的参考引导遥感图像超分辨率重建框架，实现 **4 倍超分**（LR 120×120 → HR 480×480）。
 
 ## 核心链路
 
 ```
-LR (48×48) ──→ RefSRWKV SR Prior ──→ SR image / SR latent ──┐
-Ref (480×480) ──→ RWKV Adapter ──→ 多尺度残差 ─────────────┤
-               ──→ DINOv2 + RWKV Pyramid ──→ 语义 token ────┤
+LR (120×120) ──→ RefSRWKV SR Prior ──→ SR image / SR latent ──┐
+Ref (480×480) ──→ RWKV Adapter ──→ 多尺度残差 ───────────────┤
+               ──→ DINOv2 + RWKV Pyramid ──→ 语义 token ─────┤
                                                               ├──→ SD2 UNet (8ch) ──→ VAE ──→ HR (480×480)
-              SR latent ──→ concat(noisy_latent) ────────────┘
+              SR latent ──→ concat(noisy_latent) ─────────────┘
 ```
 
 ## 架构组件
@@ -40,7 +40,7 @@ Ref (480×480) ──→ RWKV Adapter ──→ 多尺度残差 ─────�
 └── test/{HR,LR,Ref}/*.png
 ```
 
-- HR / Ref：480×480，LR：48×48（10× 下采样），文件名一一对应。
+- HR / Ref：480×480，LR：120×120（**4×** 下采样），文件名一一对应。
 - 值域在数据集内部统一为 `[-1, 1]`。
 - 裁剪先采 LR 整数坐标再乘 scale 映射 HR/Ref，保证严格对齐。
 
@@ -63,7 +63,7 @@ configs/
 ├── stage2_semantic.yaml      # Stage 2 覆盖
 ├── stage3_texture.yaml       # Stage 3 覆盖
 ├── stage4_gan.yaml           # Stage 4 覆盖
-├── sr_prior.yaml             # SR Prior 独立训练
+├── sr_prior_4.yaml           # SR Prior ×4 独立训练
 └── ablation/
     └── b_sd2_noref.yaml      # 消融 B：无参考（示例预置）
 ```
@@ -105,7 +105,7 @@ configs/
 
 | 实验 | 构成 | 命令 |
 |---|---|---|
-| A | 仅 RWKV SR | `python scripts/train_sr_prior.py --config configs/sr_prior.yaml` |
+| A | 仅 RWKV SR | `python scripts/train_sr_prior.py --config configs/sr_prior_4.yaml` |
 | B | +SD2 先验（无参考） | `python scripts/train_sd2_gan.py --config configs/ablation/b_sd2_noref.yaml` |
 | C | +参考图 | `python scripts/train_sd2_gan.py --config configs/stage1_baseline.yaml` |
 | D | +语义金字塔 | `python scripts/train_sd2_gan.py --config configs/stage2_semantic.yaml` |
@@ -197,9 +197,10 @@ TensorBoard 指标一览（`logs/sd2_ref_gan/`）：
 | 训练中断恢复 | — | 重交同一命令，`last.ckpt` 自动断点续训 |
 | Stage 4 `D_tex_conf` 长期 < 0.2 | 数据对齐或参考增强过强 | `ref_aug_probs` 全 0 跑 100 步对比 |
 | Stage 3 LPIPS 上升 | 纹理传播过强 | `self_sim_init_alpha` 降到 0.15 |
+
 ## 已知限制
 
-- 仅支持 10× 超分（48→480），单卡 RTX 4090 24GB。
+- 仅支持 **4×** 超分（120→480），单卡 RTX 4090/4060 16GB。
 - CUDA WKV 算子需要 CUDA/NVCC，不支持纯 CPU 推理（空间 RWKV 路径）。
 - `SelfSimTransfer` 全局 affinity 为 O(N²)，高分辨率下需注意显存（Stage 3/4 开启）。
 - 数据加载器暂不支持断点续训的 epoch 内恢复（中断后重新遍历）。
