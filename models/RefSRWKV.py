@@ -148,16 +148,22 @@ class OmniShift(nn.Module):
         return x + torch.tanh(self.gate) * (shifted - x)
 
     def reparam_5x5(self):
+        """训练前向为 x + tanh(gate)*(shifted - x)，重参数化必须一致：
+        x + g*(shifted(x) - x) == (1-g)*x + g*shifted(x)，
+        各分支均为线性 depthwise 卷积，可精确融合为单个 5x5 卷积。"""
         if self._reparam_done:
             return
-        alpha = torch.softmax(self.alpha, dim=0)
-        identity = torch.zeros(self.dim, 1, 5, 5, device=self.conv1x1.weight.device)
-        identity[:, :, 2, 2] = 1.0
-        w1 = F.pad(self.conv1x1.weight, (2, 2, 2, 2))
-        w3 = F.pad(self.conv3x3.weight, (1, 1, 1, 1))
-        w5 = self.conv5x5.weight
-        combined = alpha[0] * identity + alpha[1] * w1 + alpha[2] * w3 + alpha[3] * w5
-        self.conv5x5_reparam_weight.copy_(combined)
+        with torch.no_grad():
+            g = torch.tanh(self.gate)
+            alpha = torch.softmax(self.alpha, dim=0)
+            identity = torch.zeros(self.dim, 1, 5, 5, device=self.conv1x1.weight.device)
+            identity[:, :, 2, 2] = 1.0
+            w1 = F.pad(self.conv1x1.weight, (2, 2, 2, 2))
+            w3 = F.pad(self.conv3x3.weight, (1, 1, 1, 1))
+            w5 = self.conv5x5.weight
+            shifted = alpha[0]*identity + alpha[1]*w1 + alpha[2]*w3 + alpha[3]*w5
+            combined = (1.0 - g)*identity + g*shifted
+            self.conv5x5_reparam_weight.copy_(combined)
         self._reparam_done = True
 
     def forward(self, x):
