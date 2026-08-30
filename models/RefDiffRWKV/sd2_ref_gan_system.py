@@ -469,6 +469,33 @@ class SD2RefGANSystem(LightningModule):
         )
 
     def on_save_checkpoint(self, checkpoint):
+        # ── SR/扩散解耦：先把 SR 权重从主 state_dict 拆出 ──
+        sd = checkpoint.get("state_dict", {})
+        sr_keys = [k for k in sd if "sr_model." in k]
+
+        if sr_keys:
+            if getattr(self, "sr_fixed", True):
+                # 冻结模式：SR 训练中不变，主 checkpoint 不存，
+                # 加载时由 build_sr_model 从 sr.ckpt_path 重建
+                for k in sr_keys:
+                    del sd[k]
+                logger.info(
+                    "解耦保存：主 checkpoint 剔除 %d 个 SR 键（sr_fixed）",
+                    len(sr_keys),
+                )
+            else:
+                # 微调模式：SR 单独落盘 sr_model.ckpt（每次保存覆盖，即 SR 的 last 版）
+                sr_sd = {k: sd.pop(k) for k in sr_keys}
+                cb = self.trainer.checkpoint_callback if self.trainer else None
+                dirpath = cb.dirpath if cb else "."
+                os.makedirs(dirpath, exist_ok=True)
+                sr_path = os.path.join(dirpath, "sr_model.ckpt")
+                torch.save(sr_sd, sr_path)
+                logger.info(
+                    "解耦保存：SR 权重(%d 键) -> %s", len(sr_sd), sr_path
+                )
+
+        # ── 原有逻辑：GAN 相位计数器 ──
         checkpoint.update(
             {
                 "gd_phase": self._gd_phase,
@@ -480,53 +507,23 @@ class SD2RefGANSystem(LightningModule):
             }
         )
 
-    def on_load_checkpoint(self, checkpoint):
-        # 强制归零：checkpoint 不保存 .grad，非边界恢复会导致提前 step
-        saved_g = checkpoint.get("g_accum_count", 0)
-        if saved_g != 0:
-            logger.warning(
-                "从非累积边界恢复 (g_accum=%d)，梯度已丢失，计数器归零", saved_g
-            )
-        self._gd_phase = 0
-        self._g_accum_count = 0
-        self._d_sem_accum_count = 0
-        self._d_tex_accum_count = 0
-        self._g_steps_since_d = 0
-        self._g_optimizer_steps = checkpoint.get("g_optimizer_steps", 0)
-
-        # 参数分组导致 optimizer 组数不匹配时丢弃 optimizer 状态
-        # 注意：on_load_checkpoint 执行时 optimizer 尚未配置，self.optimizers()
-        # 拿不到参数组；改为按 generator 结构推导 G 优化器应有的组数
-        # （与 scripts/train_sd2_gan.py 预检测逻辑一致）。
-        opt_states = checkpoint.get("optimizer_states")
-        if opt_states:
-            saved_groups = len(opt_states[0].get("param_groups", []))
-            gen = self.generator
-            has_semantic_group = any(
-                p.requires_grad
-                and any(
-                    k in n for k in ("semantic_pyramid", "sem_proj", "sr_conditioner")
-                )
-                for n, p in gen.named_parameters()
-            )
-            expected_groups = 2 if has_semantic_group else 1
-
-            if saved_groups != expected_groups:
-                logger.warning(
-                    "optimizer param_groups 不匹配（checkpoint=%d, 预期=%d），"
-                    "丢弃 optimizer/lr_scheduler 状态，仅恢复模型权重",
-                    saved_groups,
-                    expected_groups,
-                )
-                checkpoint.pop("optimizer_states", None)
-                checkpoint.pop("lr_schedulers", None)
-            else:
-                logger.info(
-                    "optimizer param_groups 匹配（%d 组），正常恢复 optimizer 状态",
-                    saved_groups,
-                )
-
     def load_state_dict(self, state_dict, strict=True):
+        # ── SR/扩散解耦：SR 权重一律不从主 checkpoint 加载 ──
+        # 冻结模式：SR 已由 build_sr_model 从 sr.ckpt_path 装好，此处缺键不覆盖
+        # 现有值（strict=False 下 missing keys 不会清零已加载权重）；
+        # 微调模式：SR 从同目录 sr_model.ckpt 加载。
+        # 同时兼容仍含 SR 键的旧版 checkpoint（自动过滤 + info 日志）。
+        n_sr_keys = sum(1 for k in state_dict if "sr_model." in k)
+        if n_sr_keys:
+            logger.info(
+                "解耦加载：忽略主 checkpoint 中 %d 个 sr_model 键"
+                "（SR 由独立文件提供）",
+                n_sr_keys,
+            )
+            state_dict = {
+                k: v for k, v in state_dict.items() if "sr_model." not in k
+            }
+
         skip_prefix = "generator.global_semantic.semantic_pyramid."
 
         # 提取 pyramid 相关 keys
@@ -604,6 +601,7 @@ class SD2RefGANSystem(LightningModule):
                 "sim_transfer",
                 "global_semantic",
                 "sem_proj",
+                "sr_model",          # ← 新增：解耦后 SR 键必然 missing，属预期
             )
             non_disc = [
                 k
@@ -624,7 +622,7 @@ class SD2RefGANSystem(LightningModule):
             if expected_missing:
                 logger.info(
                     "load_state_dict: %d 个预期内新增参数随机初始化 "
-                    "(global_semantic / sem_proj / pyramid / sr_conditioner)",
+                    "(global_semantic / sem_proj / pyramid / sr_conditioner / sr_model)",
                     len(expected_missing),
                 )
         if unexpected:
@@ -634,6 +632,52 @@ class SD2RefGANSystem(LightningModule):
         if not missing and not unexpected:
             logger.info("load_state_dict: all keys matched")
         return result
+
+    def on_load_checkpoint(self, checkpoint):
+        # 强制归零：checkpoint 不保存 .grad，非边界恢复会导致提前 step
+        saved_g = checkpoint.get("g_accum_count", 0)
+        if saved_g != 0:
+            logger.warning(
+                "从非累积边界恢复 (g_accum=%d)，梯度已丢失，计数器归零", saved_g
+            )
+        self._gd_phase = 0
+        self._g_accum_count = 0
+        self._d_sem_accum_count = 0
+        self._d_tex_accum_count = 0
+        self._g_steps_since_d = 0
+        self._g_optimizer_steps = checkpoint.get("g_optimizer_steps", 0)
+
+        # 参数分组导致 optimizer 组数不匹配时丢弃 optimizer 状态
+        # 注意：on_load_checkpoint 执行时 optimizer 尚未配置，self.optimizers()
+        # 拿不到参数组；改为按 generator 结构推导 G 优化器应有的组数
+        # （与 scripts/train_sd2_gan.py 预检测逻辑一致）。
+        opt_states = checkpoint.get("optimizer_states")
+        if opt_states:
+            saved_groups = len(opt_states[0].get("param_groups", []))
+            gen = self.generator
+            has_semantic_group = any(
+                p.requires_grad
+                and any(
+                    k in n for k in ("semantic_pyramid", "sem_proj", "sr_conditioner")
+                )
+                for n, p in gen.named_parameters()
+            )
+            expected_groups = 2 if has_semantic_group else 1
+
+            if saved_groups != expected_groups:
+                logger.warning(
+                    "optimizer param_groups 不匹配（checkpoint=%d, 预期=%d），"
+                    "丢弃 optimizer/lr_scheduler 状态，仅恢复模型权重",
+                    saved_groups,
+                    expected_groups,
+                )
+                checkpoint.pop("optimizer_states", None)
+                checkpoint.pop("lr_schedulers", None)
+            else:
+                logger.info(
+                    "optimizer param_groups 匹配（%d 组），正常恢复 optimizer 状态",
+                    saved_groups,
+                )
 
     def _override_lr_on_resume(self):
         opts = self.optimizers()

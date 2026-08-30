@@ -613,6 +613,7 @@ class LitRefSRWKV(pl.LightningModule):
         use_ema: bool = True,
         ssim_weight: float = 0.0,
         fft_weight: float = 0.0,
+        ref_drop_prob: float = 0.0,
         loss_fn=None,
         lr_key: str = "lr",
         hr_key: str = "hr",
@@ -652,6 +653,23 @@ class LitRefSRWKV(pl.LightningModule):
             return batch[self.lr_key], batch[self.hr_key], batch[self.ref_key]
         return batch[0], batch[1], batch[2]
 
+    def _apply_ref_dropout(self, ref):
+        """Reference dropout（Phase A 核心）：以 ref_drop_prob 概率把参考图
+        替换为 batch 内无关参考。
+
+        无关参考 → 余弦相似度低 → GatedFusion 门控趋于关闭 → 该样本退化为
+        纯超分路径，从而强制主干学会不依赖参考图。
+
+        仅训练时调用；验证/测试不经过这里，始终用真实参考。
+        batch < 2 时无法 shuffle，直接跳过（调试时的安全兜底）。
+        """
+        p = self.hparams.ref_drop_prob
+        if p <= 0 or not self.training or ref.size(0) < 2:
+            return ref
+        drop = (torch.rand(ref.size(0), 1, 1, 1, device=ref.device) < p).float()
+        shuffled = ref[torch.randperm(ref.size(0), device=ref.device)]
+        return drop * shuffled + (1.0 - drop) * ref
+
     def forward(self, lr, ref):
         return self.model_sr(lr, ref)
 
@@ -664,6 +682,10 @@ class LitRefSRWKV(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
+
+        # ── Reference dropout：以 ref_drop_prob 概率替换为无关参考 ──
+        ref = self._apply_ref_dropout(ref)
+
         output = self(lr, ref)
 
         if self.ssim_weight > 0 or self.fft_weight > 0:

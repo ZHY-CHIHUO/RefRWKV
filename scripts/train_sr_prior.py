@@ -86,7 +86,6 @@ def build_dataloaders(cfg):
     )
     return train_loader, val_loader
 
-
 def build_model(cfg):
     mc = cfg["model"]
     model = RefSRWKV(
@@ -111,7 +110,8 @@ def build_model(cfg):
         ema_decay=mc.get("ema_decay", 0.999),
         use_ema=mc.get("use_ema", True),
         ssim_weight=mc.get("ssim_weight", 0.0),
-        fft_weight=mc.get("fft_weight", 0.0),  # ← 新增
+        fft_weight=mc.get("fft_weight", 0.0),
+        ref_drop_prob=mc.get("ref_drop_prob", 0.0),   # ← 新增，唯一改动
     )
     return lit_model
 
@@ -339,6 +339,7 @@ def main():
     )
     logger.info("  SSIM weight: %.2f", mc.get("ssim_weight", 0.0))
     logger.info("  FFT weight: %.2f", mc.get("fft_weight", 0.0))
+    logger.info("  Ref dropout: %.2f", mc.get("ref_drop_prob", 0.0))
     logger.info(
         "  梯度裁剪: %.2f (%s)",
         tc.get("grad_clip_val", 1.0),
