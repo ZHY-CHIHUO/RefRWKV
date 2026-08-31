@@ -118,8 +118,18 @@ def validate_config(cfg):
     _require_int(mc.get("num_refinement_blocks", 4), "model.num_refinement_blocks", minimum=0)
     _require_number(mc.get("drop_path_rate", 0.1), "model.drop_path_rate", minimum=0.0, maximum=1.0, maximum_inclusive=False)
     _require_number(mc.get("hidden_rate", 4), "model.hidden_rate", minimum=1e-12)
-    _require_number(mc.get("learning_rate", 1e-4), "model.learning_rate", minimum=1e-12)
-    _require_int(mc.get("warmup_steps", 500), "model.warmup_steps", minimum=0)
+    learning_rate = mc.get("learning_rate", 1e-4)
+    _require_number(learning_rate, "model.learning_rate", minimum=1e-12)
+    lr_scheduler = str(mc.get("lr_scheduler", "plateau")).lower()
+    if lr_scheduler not in {"plateau", "cosine"}:
+        raise ValueError("model.lr_scheduler 只能是 plateau 或 cosine")
+    _require_int(mc.get("lr_patience", 1), "model.lr_patience", minimum=0)
+    _require_number(mc.get("lr_factor", 0.5), "model.lr_factor", minimum=1e-12, maximum=1.0, maximum_inclusive=False)
+    lr_min = mc.get("lr_min", 1e-6)
+    _require_number(lr_min, "model.lr_min", minimum=0.0)
+    if float(lr_min) > float(learning_rate):
+        raise ValueError("model.lr_min 不能大于 model.learning_rate")
+    _require_int(mc.get("warmup_steps", 0), "model.warmup_steps", minimum=0)
     _require_number(mc.get("grad_clip_norm", 1.0), "model.grad_clip_norm", minimum=0.0)
     _require_number(mc.get("ema_decay", 0.999), "model.ema_decay", minimum=0.0, maximum=1.0, maximum_inclusive=False)
     _require_number(mc.get("ssim_weight", 0.0), "model.ssim_weight", minimum=0.0)
@@ -280,7 +290,11 @@ def build_model(cfg):
     return LitRefSRWKV(
         model_sr=model,
         learning_rate=mc.get("learning_rate", 1e-4),
-        warmup_steps=mc.get("warmup_steps", 500),
+        lr_scheduler=mc.get("lr_scheduler", "plateau"),
+        lr_patience=mc.get("lr_patience", 1),
+        lr_factor=mc.get("lr_factor", 0.5),
+        lr_min=mc.get("lr_min", 1e-6),
+        warmup_steps=mc.get("warmup_steps", 0),
         grad_clip_norm=mc.get("grad_clip_norm", 1.0),
         ema_decay=mc.get("ema_decay", 0.999),
         use_ema=mc.get("use_ema", True),
@@ -341,11 +355,15 @@ def _find_tensor_mapping(value):
     return None
 
 
-def _load_state_dict(path: str) -> dict:
-    state_dict = _find_tensor_mapping(_load_raw_checkpoint(path))
+def _extract_state_dict(checkpoint, source: str) -> dict:
+    state_dict = _find_tensor_mapping(checkpoint)
     if not state_dict:
-        raise ValueError(f"checkpoint 中没有找到 tensor state_dict: {path}")
+        raise ValueError(f"checkpoint 中没有找到 tensor state_dict: {source}")
     return state_dict
+
+
+def _load_state_dict(path: str) -> dict:
+    return _extract_state_dict(_load_raw_checkpoint(path), path)
 
 
 def _normalise_state_dict(state_dict):
@@ -365,9 +383,19 @@ def _normalise_state_dict(state_dict):
 
 def check_resume_compatible(ckpt_path: str, lit_model):
     try:
-        state_dict = _normalise_state_dict(_load_state_dict(ckpt_path))
+        checkpoint = _load_raw_checkpoint(ckpt_path)
+        state_dict = _normalise_state_dict(_extract_state_dict(checkpoint, ckpt_path))
     except Exception as exc:
         return False, f"checkpoint 读取失败: {exc}"
+    if isinstance(checkpoint, dict) and checkpoint.get("lr_schedulers"):
+        hparams = checkpoint.get("hyper_parameters", {})
+        saved_scheduler = str(hparams.get("lr_scheduler", "cosine")).lower()
+        current_scheduler = str(getattr(lit_model.hparams, "lr_scheduler", "plateau")).lower()
+        if saved_scheduler != current_scheduler:
+            return False, (
+                f"学习率调度器不兼容: checkpoint={saved_scheduler}, "
+                f"当前配置={current_scheduler}；请使用 --load_weights 重新开始优化器状态"
+            )
     reference = _normalise_state_dict({key: value for key, value in lit_model.state_dict().items() if torch.is_tensor(value)})
     overlap = sorted(set(state_dict).intersection(reference))
     if not overlap:
@@ -525,7 +553,17 @@ def main():
     logger.info("  RefSRWKV SR Prior 训练 (Fixed HR/4 Internal Resolution)")
     logger.info("  数据: %s (patch_size=%d, scale=%d)", cfg["data"]["root"], cfg["data"].get("patch_size", 480), cfg["data"].get("scale", 4))
     logger.info("  Batch size: %d × accumulate %d = 等效 %d", cfg["data"].get("batch_size", 4), tc.get("accumulate_grad_batches", 1), cfg["data"].get("batch_size", 4) * tc.get("accumulate_grad_batches", 1))
-    logger.info("  LR: %.1e | warmup: %d 步", mc.get("learning_rate", 1e-4), mc.get("warmup_steps", 500))
+    scheduler_name = str(mc.get("lr_scheduler", "plateau")).lower()
+    if scheduler_name == "plateau":
+        logger.info(
+            "  LR: %.1e | plateau: patience=%d epoch(s), factor=%.3g, min=%.1e",
+            mc.get("learning_rate", 1e-4),
+            mc.get("lr_patience", 1),
+            mc.get("lr_factor", 0.5),
+            mc.get("lr_min", 1e-6),
+        )
+    else:
+        logger.info("  LR: %.1e | cosine warmup: %d 步", mc.get("learning_rate", 1e-4), mc.get("warmup_steps", 0))
     logger.info("  SSIM weight: %.2f | FFT weight: %.2f | Ref dropout: %.2f", mc.get("ssim_weight", 0.0), mc.get("fft_weight", 0.0), mc.get("ref_drop_prob", 0.0))
     logger.info("  EMA: %s", "on (decay=%.4f)" % mc.get("ema_decay", 0.999) if mc.get("use_ema", True) else "off")
     if explicit_weights is not None:

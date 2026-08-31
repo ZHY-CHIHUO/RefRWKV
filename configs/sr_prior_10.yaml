@@ -1,6 +1,6 @@
 # ============================================================
 # RefSRWKV SR Prior 训练配置
-# （EMA + 梯度裁剪 + SequentialLR warmup）
+# （EMA + 梯度裁剪 + 验证指标驱动的学习率衰减）
 # ============================================================
 
 model:
@@ -14,7 +14,10 @@ model:
   hidden_rate: 4
   # ── 优化器 ──
   learning_rate: 5.0e-5
-  warmup_steps: 100
+  lr_scheduler: plateau
+  lr_patience: 1 # 容忍 1 个无改善 epoch，第 2 个触发衰减
+  lr_factor: 0.5
+  lr_min: 1.0e-6
   # ── 梯度 / EMA ──
   grad_clip_norm: 1.0        # LitRefSRWKV 内部的 fallback 值
   ema_decay: 0.999            # EMA 衰减率

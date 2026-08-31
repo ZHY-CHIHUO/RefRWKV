@@ -82,7 +82,7 @@ conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_10
 
 两个配置均使用 BF16 混合精度与梯度累积。RTX 5060 Ti（16 GiB）已完成上述配置的单次 batch=4 前向、反向与优化器更新。
 
-训练模块由 L1 损失与可选 SSIM、FFT 损失组成；EMA 仅在真实优化器更新后更新，并在验证和测试期间临时应用。`warmup_steps=0` 时直接使用余弦调度，正数 warmup 使用 PyTorch 原生调度器。
+训练模块由 L1 损失与可选 SSIM、FFT 损失组成；EMA 仅在真实优化器更新后更新，并在验证和测试期间临时应用。默认学习率调度器为 `ReduceLROnPlateau`，监控 `val_loss`：`lr_patience` 表示可容忍的无改善训练 epoch 数，超过该数后学习率乘以 `lr_factor`，最低不小于 `lr_min`。这使训练不依赖预先估计的总轮数；`max_epochs` 仅作为安全上限，实际结束由 early stopping 控制。
 
 ### Checkpoint
 

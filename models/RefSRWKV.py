@@ -543,12 +543,40 @@ class EMA:
         self.backup, self._applied = {}, False
 
 class LitRefSRWKV(pl.LightningModule):
-    def __init__(self, model_sr: RefSRWKV, learning_rate: float = 1e-4, warmup_steps: int = 500, grad_clip_norm: float = 1.0, ema_decay: float = 0.999, use_ema: bool = True, ssim_weight: float = 0.0, fft_weight: float = 0.0, ref_drop_prob: float = 0.0, loss_fn=None, lr_key: str = "lr", hr_key: str = "hr", ref_key: str = "ref"):
+    def __init__(
+        self,
+        model_sr: RefSRWKV,
+        learning_rate: float = 1e-4,
+        lr_scheduler: str = "plateau",
+        lr_patience: int = 1,
+        lr_factor: float = 0.5,
+        lr_min: float = 1e-6,
+        warmup_steps: int = 0,
+        grad_clip_norm: float = 1.0,
+        ema_decay: float = 0.999,
+        use_ema: bool = True,
+        ssim_weight: float = 0.0,
+        fft_weight: float = 0.0,
+        ref_drop_prob: float = 0.0,
+        loss_fn=None,
+        lr_key: str = "lr",
+        hr_key: str = "hr",
+        ref_key: str = "ref",
+    ):
         super().__init__()
         if not isinstance(model_sr, nn.Module):
             raise TypeError("model_sr 必须是 torch.nn.Module 实例")
         if not float(learning_rate) > 0:
             raise ValueError("learning_rate 必须为正数")
+        lr_scheduler = str(lr_scheduler).lower()
+        if lr_scheduler not in {"plateau", "cosine"}:
+            raise ValueError("lr_scheduler 只能是 plateau 或 cosine")
+        if not isinstance(lr_patience, int) or lr_patience < 0:
+            raise ValueError("lr_patience 必须为非负整数")
+        if not 0.0 < float(lr_factor) < 1.0:
+            raise ValueError("lr_factor 必须位于 (0, 1)")
+        if not 0.0 <= float(lr_min) <= float(learning_rate):
+            raise ValueError("lr_min 必须位于 [0, learning_rate]")
         if not isinstance(warmup_steps, int) or warmup_steps < 0:
             raise ValueError("warmup_steps 必须为非负整数")
         if grad_clip_norm is not None and float(grad_clip_norm) < 0:
@@ -749,6 +777,23 @@ class LitRefSRWKV(pl.LightningModule):
             raise RuntimeError("没有可训练参数")
         learning_rate = float(self.hparams.learning_rate)
         optimizer = torch.optim.Adam(parameters, lr=learning_rate)
+        scheduler_name = str(self.hparams.lr_scheduler).lower()
+        if scheduler_name == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=float(self.hparams.lr_factor),
+                patience=int(self.hparams.lr_patience),
+                min_lr=float(self.hparams.lr_min),
+            )
+            return [optimizer], [{
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+                "strict": True,
+            }]
+
         warmup_steps = int(self.hparams.warmup_steps)
         try:
             max_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0))
@@ -792,4 +837,10 @@ class LitRefSRWKV(pl.LightningModule):
         if self.ema:
             self.ema._lazy_init(self.model_sr)
             self._ema_last_step = int(self.global_step)
-        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {sum(p.numel() for p in self.model_sr.parameters()) / 1e6:.2f}M | grad_clip={self.hparams.grad_clip_norm} | EMA={'on' if self.ema else 'off'} | SSIM={self.ssim_weight} | FFT={self.fft_weight}")
+        scheduler_name = str(self.hparams.lr_scheduler).lower()
+        scheduler_text = (
+            f"plateau(patience={self.hparams.lr_patience}, factor={self.hparams.lr_factor}, min={self.hparams.lr_min})"
+            if scheduler_name == "plateau"
+            else f"cosine(warmup={self.hparams.warmup_steps})"
+        )
+        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {sum(p.numel() for p in self.model_sr.parameters()) / 1e6:.2f}M | lr_scheduler={scheduler_text} | grad_clip={self.hparams.grad_clip_norm} | EMA={'on' if self.ema else 'off'} | SSIM={self.ssim_weight} | FFT={self.fft_weight}")
