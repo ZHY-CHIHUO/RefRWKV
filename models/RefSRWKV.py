@@ -176,51 +176,165 @@ class OmniShift(nn.Module):
             return F.conv2d(x, self.conv5x5_reparam_weight, padding=2, groups=self.dim)
 
 
-# ═══ VRWKV Blocks ═══
+# ═══ VRWKV Blocks — 窗口化 WKV v2（9×9 + 移位 3×2 + 分组 + 门控 + 掩码）═══
 class VRWKV_SpatialMix(nn.Module):
-    def __init__(self, n_embd, head_dim=64):
+    """
+    窗口化 RWKV 空间混合 v2。
+
+    特性：
+      • 9×9 窗口 + 循环移位（每 3 层: 0→3→6 像素）
+      • P2: 通道分组 WKV（num_groups 组，每组独立 decay/first）
+      • P3: SE 通道注意力门控（AvgPool→FC→Sigmoid）
+      • 掩码: 循环移位后遮蔽跨窗口污染区域（类 SwinIR attn_mask）
+    """
+
+    def __init__(self, n_embd, head_dim=64, window_size=9, shift_size=3,
+                 num_groups=4):
         super().__init__()
+        assert n_embd % num_groups == 0, f"n_embd({n_embd}) 必须被 num_groups({num_groups}) 整除"
         self.n_embd = n_embd
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.num_groups = num_groups          # ← P2: 通道分组数
+        self.group_dim = n_embd // num_groups
         self.recurrence = 2
         attn_sz = n_embd
+
+        # ── 投影层 ──
         self.omni_shift = OmniShift(dim=n_embd)
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
         self.value = nn.Linear(n_embd, attn_sz, bias=False)
         self.receptance = nn.Linear(n_embd, attn_sz, bias=False)
         self.output = nn.Linear(attn_sz, n_embd, bias=False)
         self.register_buffer("scale", torch.tensor(n_embd**0.5))
-        with torch.no_grad():
-            self.spatial_decay = nn.Parameter(torch.zeros(self.recurrence, self.n_embd))
-            self.spatial_first = nn.Parameter(torch.zeros(self.recurrence, self.n_embd))
 
+        # ── P2: 分组 WKV 参数（每组独立的 decay / first）──
+        with torch.no_grad():
+            self.spatial_decay = nn.Parameter(
+                torch.zeros(self.recurrence, num_groups, self.group_dim)
+            )
+            self.spatial_first = nn.Parameter(
+                torch.zeros(self.recurrence, num_groups, self.group_dim)
+            )
+
+        # ── P3: SE 通道门控 ──
+        mid_ch = max(n_embd // 4, 8)
+        self.channel_gate = nn.Sequential(
+            nn.Conv2d(n_embd, mid_ch, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, n_embd, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    # ═══════════════════ 全局投影 ═══════════════════
     def jit_func(self, x, resolution):
+        """omni_shift(5×5 reparam conv) + K/V/R 线性变换（不变）。"""
         h, w = resolution
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         x = self.omni_shift(x)
         x = rearrange(x, "b c h w -> b (h w) c")
-        k = self.key(x)
-        v = self.value(x)
-        r = self.receptance(x)
-        sr = torch.sigmoid(r)
-        return sr, k, v
+        return self.key(x), self.value(x), torch.sigmoid(self.receptance(x))
 
-    def forward(self, x, resolution):
-        B, T, C = x.size()
-        sr, k, v = self.jit_func(x, resolution)
+    # ═══════════════════ 分组窗口内 WKV ═══════════════════
+    def _window_wkv_grouped(self, k, v, sr):
+        """
+        分组 RWKV：将 C 拆成 G 组，每组独立递归。
+        输入: (B*nWin, ws*ws, C)
+        输出: (B*nWin, ws*ws, C)
+        """
+        Bn, L, C = k.shape
+        G = self.num_groups
+        gd = self.group_dim
+        ws = self.window_size
         s = self.scale
+
+        # (Bn, L, C) → (Bn, L, G, gd)
+        k_g = k.view(Bn, L, G, gd)
+        v_g = v.view(Bn, L, G, gd)
+        sr_g = sr.view(Bn, L, G, gd)
+
+        out_g = torch.zeros_like(v_g)
         for j in range(self.recurrence):
+            decay_j = self.spatial_decay[j] / s     # (G, gd)
+            first_j = self.spatial_first[j] / s      # (G, gd)
             if j % 2 == 0:
-                v = RUN_CUDA(self.spatial_decay[j] / s, self.spatial_first[j] / s, k, v)
+                # 行优先扫描
+                for g in range(G):
+                    out_g[:, :, g, :] = RUN_CUDA(
+                        decay_j[g], first_j[g],
+                        k_g[:, :, g, :], v_g[:, :, g, :]
+                    )
+                    # 下一次迭代用上一次的输出作为新的 v
+                    v_g = out_g.clone() if j < self.recurrence - 1 else out_g
             else:
-                h, w = resolution
-                k = rearrange(k, "b (h w) c -> b (w h) c", h=h, w=w)
-                v = rearrange(v, "b (h w) c -> b (w h) c", h=h, w=w)
-                v = RUN_CUDA(self.spatial_decay[j] / s, self.spatial_first[j] / s, k, v)
-                k = rearrange(k, "b (w h) c -> b (h w) c", h=h, w=w)
-                v = rearrange(v, "b (w h) c -> b (h w) c", h=h, w=w)
-        x = sr * v
-        x = self.output(x)
-        return x
+                # 列优先扫描（转置 H↔W）
+                k_t = rearrange(k_g, "b (h w) g c -> b (w h) g c", h=ws, w=ws)
+                v_t = rearrange(v_g, "b (h w) g c -> b (w h) g c", h=ws, w=ws)
+                for g in range(G):
+                    out_g[:, :, g, :] = RUN_CUDA(
+                        decay_j[g], first_j[g],
+                        k_t[:, :, g, :], v_t[:, :, g, :]
+                    )
+                # 还原形状供下一轮使用
+                out_g = rearrange(out_g, "b (w h) g c -> b (h w) g c", h=ws, w=ws)
+                v_g = out_g.clone()
+
+        return (sr_g * out_g).view(Bn, L, C)
+
+    # ═══════════════════ 主 forward ═══════════════════
+    def forward(self, x, resolution, layer_idx=0):
+        B, T, C = x.size()
+        h, w = resolution
+        ws = self.window_size
+        ss = self.shift_size
+
+        # ── Step 1: 全局投影 ──
+        sr, k, v = self.jit_func(x, resolution)
+
+        # ── Step 2: 本层移位量（每 3 层循环: 0 → 3 → 6）──
+        shift_amt = (layer_idx % 3) * ss
+
+        # ── Step 3: 重塑为空间网格 ──
+        k = rearrange(k, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
+        v = rearrange(v, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
+        sr = rearrange(sr, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
+
+        # ── Step 4: padding 到 window 整倍数 + 额外 shift_amt 边界 ──
+        #    用 padding 模拟移位（无回绕），替代 torch.roll + 掩码
+        pad_h = (ws - h % ws) % ws + shift_amt      # 下侧多 pad shift_amt 行
+        pad_w = (ws - w % ws) % ws + shift_amt      # 右侧多 pad shift_amt 列
+        if pad_h or pad_w:
+            k = F.pad(k, (0, 0, 0, pad_w, 0, pad_h))
+            v = F.pad(v, (0, 0, 0, pad_w, 0, pad_h))
+            sr = F.pad(sr, (0, 0, 0, pad_w, 0, pad_h))
+
+        Hp, Wp = h + pad_h, w + pad_w
+
+        # ── Step 5: 窗口划分（padding 后直接切，无需 roll）──
+        k = rearrange(k, "b (nh ws) (nw ws) c -> (b nh nw) (ws ws) c", ws=ws)
+        v = rearrange(v, "b (nh ws) (nw ws) c -> (b nh nw) (ws ws) c", ws=ws)
+        sr = rearrange(sr, "b (nh ws) (nw ws) c -> (b nh nw) (ws ws) c", ws=ws)
+
+        # ── Step 6: 分组窗口内 WKV（P2）──
+        out = self._window_wkv_grouped(k, v, sr)
+
+        # ── Step 7: 反向窗口合并 ──
+        out = rearrange(out, "(b nh nw) (ws ws) c -> b (nh ws) (nw ws) c",
+                        nh=Hp // ws, nw=Wp // ws, ws=ws)
+
+        # ── Step 8: 裁剪回原始尺寸（等效反向移位 + 去窗口 padding）──
+        if shift_amt > 0 or ((ws - h % ws) % ws) > 0 or ((ws - w % ws) % ws) > 0:
+            out = out[:h, :w, :]
+
+        # ── Step 9: P3 通道注意力门控 ──
+        # out: (B, h, w, C) → gate: (B, C, h, w) → scale
+        gate_in = out.permute(0, 3, 1, 2)              # (B, C, h, w)
+        gate = self.channel_gate(gate_in)               # (B, C, h, w) ∈ [0,1]
+        out = out * gate.permute(0, 2, 3, 1)            # (B, h, w, C)
+
+        # ── Step 10: 输出投影 ──
+        out = rearrange(out, "b hh ww c -> b (hh ww) c")
+        return self.output(out)
 
 
 class VRWKV_ChannelMix(nn.Module):
@@ -246,8 +360,9 @@ class VRWKV_ChannelMix(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_embd, hidden_rate=4, drop_path=0.0):
+    def __init__(self, n_embd, hidden_rate=4, drop_path=0.0, layer_idx=0):
         super().__init__()
+        self.layer_idx = layer_idx
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
         self.att = VRWKV_SpatialMix(n_embd)
@@ -260,7 +375,7 @@ class Block(nn.Module):
         b, c, h, w = x.shape
         resolution = (h, w)
         x = rearrange(x, "b c h w -> b (h w) c")
-        x = x + self.drop_path(self.gamma1 * self.att(self.ln1(x), resolution))
+        x = x + self.drop_path(self.gamma1 * self.att(self.ln1(x), resolution, self.layer_idx))
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         x = rearrange(x, "b c h w -> b (h w) c")
         x = x + self.drop_path(self.gamma2 * self.ffn(self.ln2(x), resolution))
@@ -392,50 +507,60 @@ class RefSRWKV(nn.Module):
         ]
         dp_idx = 0
 
-        # ── 编码器 ──
+        # ── 编码器（全局层索引，用于窗口移位调度）──
+        global_layer_idx = 0
         self.encoder_level1 = nn.Sequential(
             *[
-                Block(dim, hidden_rate, dp_rates[dp_idx + i])
+                Block(dim, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
                 for i in range(num_blocks[0])
             ]
         )
+        global_layer_idx += num_blocks[0]
         dp_idx += num_blocks[0]
         self.down1_2 = Downsample(dim)
 
         self.encoder_level2 = nn.Sequential(
             *[
-                Block(dim * 2, hidden_rate, dp_rates[dp_idx + i])
+                Block(dim * 2, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
                 for i in range(num_blocks[1])
             ]
         )
+        global_layer_idx += num_blocks[1]
         dp_idx += num_blocks[1]
         self.down2_3 = Downsample(dim * 2)
 
         self.encoder_level3 = nn.Sequential(
             *[
-                Block(dim * 4, hidden_rate, dp_rates[dp_idx + i])
+                Block(dim * 4, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
                 for i in range(num_blocks[2])
             ]
         )
+        global_layer_idx += num_blocks[2]
         dp_idx += num_blocks[2]
         self.down3_4 = Downsample(dim * 4)
 
         self.latent = nn.Sequential(
             *[
-                Block(dim * 8, hidden_rate, dp_rates[dp_idx + i])
+                Block(dim * 8, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
                 for i in range(num_blocks[3])
             ]
         )
+        global_layer_idx += num_blocks[3]
+        dp_idx += num_blocks[3]
 
-        # ── 解码器 ──
+        # ── 解码器（层索引继续递增）──
         self.up4_3 = Upsample(dim * 8)
         self.reduce_chan_level3 = nn.Sequential(
             nn.Conv2d(dim * 8, dim * 4, 1, bias=False),
             nn.GroupNorm(_gn_groups(dim * 4), dim * 4),
         )
         self.decoder_level3 = nn.Sequential(
-            *[Block(dim * 4, hidden_rate) for _ in range(num_blocks[2])]
+            *[
+                Block(dim * 4, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
+                for i in range(num_blocks[2])
+            ]
         )
+        global_layer_idx += num_blocks[2]
 
         self.up3_2 = Upsample(dim * 4)
         self.reduce_chan_level2 = nn.Sequential(
@@ -443,8 +568,12 @@ class RefSRWKV(nn.Module):
             nn.GroupNorm(_gn_groups(dim * 2), dim * 2),
         )
         self.decoder_level2 = nn.Sequential(
-            *[Block(dim * 2, hidden_rate) for _ in range(num_blocks[1])]
+            *[
+                Block(dim * 2, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
+                for i in range(num_blocks[1])
+            ]
         )
+        global_layer_idx += num_blocks[1]
 
         self.up2_1 = Upsample(dim * 2)
         self.reduce_chan_level1 = nn.Sequential(
@@ -452,12 +581,19 @@ class RefSRWKV(nn.Module):
             nn.GroupNorm(_gn_groups(dim), dim),
         )
         self.decoder_level1 = nn.Sequential(
-            *[Block(dim, hidden_rate) for _ in range(num_blocks[0])]
+            *[
+                Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
+                for i in range(num_blocks[0])
+            ]
         )
+        global_layer_idx += num_blocks[0]
 
-        # ── 精修 ──
+        # ── 精修（层索引继续）──
         self.refinement = nn.Sequential(
-            *[Block(dim, hidden_rate) for _ in range(num_refinement_blocks)]
+            *[
+                Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
+                for i in range(num_refinement_blocks)
+            ]
         )
 
         # ── 上采样输出 ──
