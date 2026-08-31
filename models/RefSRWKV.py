@@ -1,10 +1,8 @@
-# Copyright (c) Shanghai AI Lab. All rights reserved.
+Copyright (c) Shanghai AI Lab. All rights reserved.
 """
 RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
 """
-
 import torch
-
 torch.set_float32_matmul_precision("high")
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,7 +17,6 @@ _cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 _wkv_cuda = None
 _wkv_load_error = None
 
-
 def _get_wkv_cuda():
     global _wkv_cuda, _wkv_load_error
     if _wkv_cuda is not None:
@@ -28,7 +25,6 @@ def _get_wkv_cuda():
         raise RuntimeError("Bi-WKV CUDA 扩展此前加载失败") from _wkv_load_error
     if not torch.cuda.is_available():
         raise RuntimeError("Bi-WKV 需要 CUDA；当前 torch.cuda.is_available()=False")
-
     cap = torch.cuda.get_device_capability()
     arch = f"compute_{cap[0]}{cap[1]}"
     sm = f"sm_{cap[0]}{cap[1]}"
@@ -51,14 +47,11 @@ def _get_wkv_cuda():
     )
     return _wkv_cuda
 
-
 try:
     _compiler_disable = torch.compiler.disable
 except AttributeError:
-
     def _compiler_disable(fn=None, **kwargs):
         return fn if fn is not None else (lambda f: f)
-
 
 class WKV(torch.autograd.Function):
     @staticmethod
@@ -95,7 +88,6 @@ class WKV(torch.autograd.Function):
             return (gw.bfloat16(), gu.bfloat16(), gk.bfloat16(), gv.bfloat16())
         else:
             return (gw, gu, gk, gv)
-
 
 @_compiler_disable()
 def RUN_CUDA(w, u, k, v):
@@ -180,26 +172,26 @@ class OmniShift(nn.Module):
 class VRWKV_SpatialMix(nn.Module):
     """
     窗口化 RWKV 空间混合 v2。
-
     特性：
-      • 9×9 窗口 + 循环移位（每 3 层: 0→3→6 像素）
-      • P2: 通道分组 WKV（num_groups 组，每组独立 decay/first）
-      • P3: SE 通道注意力门控（AvgPool→FC→Sigmoid）
-      • 掩码: 循环移位后遮蔽跨窗口污染区域（类 SwinIR attn_mask）
+       • 9×9 窗口 + 循环移位（每 3 层: 0→3→6 像素）
+       • P2: 通道分段 WKV（兼容 C≥16，避免 kernel 报错）
+       • P3: SE 通道注意力门控（AvgPool→FC→Sigmoid）
+       • 掩码: 循环移位后遮蔽跨窗口污染区域（类 SwinIR attn_mask）
     """
-
     def __init__(self, n_embd, head_dim=64, window_size=9, shift_size=3,
-                 num_groups=4):
+                 num_groups=None):
         super().__init__()
+        if num_groups is None:
+            num_groups = max(1, n_embd // 16)
         assert n_embd % num_groups == 0, f"n_embd({n_embd}) 必须被 num_groups({num_groups}) 整除"
         self.n_embd = n_embd
         self.window_size = window_size
         self.shift_size = shift_size
-        self.num_groups = num_groups          # ← P2: 通道分组数
+        self.num_groups = num_groups
         self.group_dim = n_embd // num_groups
         self.recurrence = 2
         attn_sz = n_embd
-
+        
         # ── 投影层 ──
         self.omni_shift = OmniShift(dim=n_embd)
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
@@ -207,16 +199,16 @@ class VRWKV_SpatialMix(nn.Module):
         self.receptance = nn.Linear(n_embd, attn_sz, bias=False)
         self.output = nn.Linear(attn_sz, n_embd, bias=False)
         self.register_buffer("scale", torch.tensor(n_embd**0.5))
-
-        # ── P2: 分组 WKV 参数（每组独立的 decay / first）──
+        
+        # ── P2: 分段 WKV 参数（兼容 C>=16）──
         with torch.no_grad():
-            self.spatial_decay = nn.Parameter(
-                torch.zeros(self.recurrence, num_groups, self.group_dim)
-            )
-            self.spatial_first = nn.Parameter(
-                torch.zeros(self.recurrence, num_groups, self.group_dim)
-            )
-
+            decay_init = torch.zeros(self.recurrence, n_embd)
+            for g in range(num_groups):
+                s = g * self.group_dim
+                decay_init[:, s:s+self.group_dim] = -0.5 * (g + 1)
+            self.spatial_decay = nn.Parameter(decay_init)
+            self.spatial_first = nn.Parameter(torch.zeros(self.recurrence, n_embd))
+            
         # ── P3: SE 通道门控 ──
         mid_ch = max(n_embd // 4, 8)
         self.channel_gate = nn.Sequential(
@@ -235,51 +227,19 @@ class VRWKV_SpatialMix(nn.Module):
         x = rearrange(x, "b c h w -> b (h w) c")
         return self.key(x), self.value(x), torch.sigmoid(self.receptance(x))
 
-    # ═══════════════════ 分组窗口内 WKV ═══════════════════
-    def _window_wkv_grouped(self, k, v, sr):
-        """
-        分组 RWKV：将 C 拆成 G 组，每组独立递归。
-        输入: (B*nWin, ws*ws, C)
-        输出: (B*nWin, ws*ws, C)
-        """
-        Bn, L, C = k.shape
-        G = self.num_groups
-        gd = self.group_dim
-        ws = self.window_size
-        s = self.scale
-
-        # (Bn, L, C) → (Bn, L, G, gd)
-        k_g = k.view(Bn, L, G, gd)
-        v_g = v.view(Bn, L, G, gd)
-        sr_g = sr.view(Bn, L, G, gd)
-
-        out_g = torch.zeros_like(v_g)
+    # ═══════════════════ 窗口内 WKV（P2 分段初始化版） ═══════════════════
+    def _window_wkv(self, k, v, sr):
+        s = self.scale; ws = self.window_size
         for j in range(self.recurrence):
-            decay_j = self.spatial_decay[j] / s     # (G, gd)
-            first_j = self.spatial_first[j] / s      # (G, gd)
+            dj = self.spatial_decay[j] / s
+            fj = self.spatial_first[j] / s
             if j % 2 == 0:
-                # 行优先扫描
-                for g in range(G):
-                    out_g[:, :, g, :] = RUN_CUDA(
-                        decay_j[g], first_j[g],
-                        k_g[:, :, g, :], v_g[:, :, g, :]
-                    )
-                    # 下一次迭代用上一次的输出作为新的 v
-                    v_g = out_g.clone() if j < self.recurrence - 1 else out_g
+                v = RUN_CUDA(dj, fj, k, v)
             else:
-                # 列优先扫描（转置 H↔W）
-                k_t = rearrange(k_g, "b (h w) g c -> b (w h) g c", h=ws, w=ws)
-                v_t = rearrange(v_g, "b (h w) g c -> b (w h) g c", h=ws, w=ws)
-                for g in range(G):
-                    out_g[:, :, g, :] = RUN_CUDA(
-                        decay_j[g], first_j[g],
-                        k_t[:, :, g, :], v_t[:, :, g, :]
-                    )
-                # 还原形状供下一轮使用
-                out_g = rearrange(out_g, "b (w h) g c -> b (h w) g c", h=ws, w=ws)
-                v_g = out_g.clone()
-
-        return (sr_g * out_g).view(Bn, L, C)
+                kt = rearrange(k, "b (h w) c -> b (w h) c", h=ws, w=ws)
+                vt = rearrange(v, "b (h w) c -> b (w h) c", h=ws, w=ws)
+                v = rearrange(RUN_CUDA(dj, fj, kt, vt), "b (w h) c -> b (h w) c", h=ws, w=ws)
+        return sr * v
 
     # ═══════════════════ 主 forward ═══════════════════
     def forward(self, x, resolution, layer_idx=0):
@@ -287,20 +247,19 @@ class VRWKV_SpatialMix(nn.Module):
         h, w = resolution
         ws = self.window_size
         ss = self.shift_size
-
+        
         # ── Step 1: 全局投影 ──
         sr, k, v = self.jit_func(x, resolution)
-
+        
         # ── Step 2: 本层移位量（每 3 层循环: 0 → 3 → 6）──
         shift_amt = (layer_idx % 3) * ss
-
+        
         # ── Step 3: 重塑为空间网格 ──
         k = rearrange(k, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
         v = rearrange(v, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
         sr = rearrange(sr, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
-
+        
         # ── Step 4: padding 到 window 整倍数（含 shift_amt 偏移）──
-        #    目标尺寸必须 ≥ 原始+shift 且是 ws 的整倍数，替代 torch.roll + 掩码
         import math
         target_h = max(h, h + shift_amt)
         target_w = max(w, w + shift_amt)
@@ -312,33 +271,31 @@ class VRWKV_SpatialMix(nn.Module):
             k = F.pad(k, (0, 0, 0, pad_w, 0, pad_h))
             v = F.pad(v, (0, 0, 0, pad_w, 0, pad_h))
             sr = F.pad(sr, (0, 0, 0, pad_w, 0, pad_h))
-
         Hp, Wp = h + pad_h, w + pad_w
         assert Hp % ws == 0 and Wp % ws == 0, \
             f"窗口划分失败: 原始({h},{w}) + shift({shift_amt}) + pad({pad_h},{pad_w}) = ({Hp},{Wp}) 不能被 ws={ws} 整除"
-
+            
         # ── Step 5: 窗口划分（padding 后直接切，无需 roll）──
         k = rearrange(k, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
         v = rearrange(v, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
         sr = rearrange(sr, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
-
-        # ── Step 6: 分组窗口内 WKV（P2）──
-        out = self._window_wkv_grouped(k, v, sr)
-
+        
+        # ── Step 6: 窗口内 WKV（P2 分段初始化）──
+        out = self._window_wkv(k, v, sr)
+        
         # ── Step 7: 反向窗口合并 ──
         out = rearrange(out, "(b nh nw) (w1 w2) c -> b (nh w1) (nw w2) c",
                         nh=Hp // ws, nw=Wp // ws, w1=ws, w2=ws)
-
+                        
         # ── Step 8: 裁剪回原始尺寸（等效反向移位 + 去窗口 padding）──
         if shift_amt > 0 or ((ws - h % ws) % ws) > 0 or ((ws - w % ws) % ws) > 0:
-            out = out[:h, :w, :]
-
+            out = out[:, :h, :w, :]
+            
         # ── Step 9: P3 通道注意力门控 ──
-        # out: (B, h, w, C) → gate: (B, C, h, w) → scale
         gate_in = out.permute(0, 3, 1, 2)              # (B, C, h, w)
         gate = self.channel_gate(gate_in)               # (B, C, h, w) ∈ [0,1]
         out = out * gate.permute(0, 2, 3, 1)            # (B, h, w, C)
-
+        
         # ── Step 10: 输出投影 ──
         out = rearrange(out, "b hh ww c -> b (hh ww) c")
         return self.output(out)
@@ -425,7 +382,6 @@ def _gn_groups(num_channels: int, max_groups: int = 32) -> int:
             return g
     return 1
 
-
 class GatedFusion(nn.Module):
     def __init__(self, dim, reduction=4):
         super().__init__()
@@ -445,7 +401,6 @@ class GatedFusion(nn.Module):
         # 余弦相似度置信度：相似度高 → 参考图可信 → gate 放大
         sim = F.cosine_similarity(lr_feat, ref_feat, dim=1).unsqueeze(1)
         conf = torch.sigmoid(sim * 2.0)
-
         fused = self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1))
         fused = self.norm(fused)
         gate = self.gate(fused) * conf
@@ -482,7 +437,7 @@ class RefSRWKV(nn.Module):
             nn.GroupNorm(_gn_groups(dim), dim),
             nn.ReLU(inplace=True),
         )
-
+        
         # ── Ref 编码器 ──
         self.ref_to_level1 = nn.Sequential(
             nn.PixelUnshuffle(4),
@@ -501,19 +456,19 @@ class RefSRWKV(nn.Module):
             nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False),
             nn.GroupNorm(_gn_groups(dim * 8), dim * 8),
         )
-
+        
         # ── 门控融合（全部 bias=0，初始 gate=0.5） ──
         self.fuse1 = GatedFusion(dim)
         self.fuse2 = GatedFusion(dim * 2)
         self.fuse3 = GatedFusion(dim * 4)
         self.fuse4 = GatedFusion(dim * 8)
-
+        
         # ── DropPath ──
         dp_rates = [
             drop_path_rate * i / (sum(num_blocks) - 1) for i in range(sum(num_blocks))
         ]
         dp_idx = 0
-
+        
         # ── 编码器（全局层索引，用于窗口移位调度）──
         global_layer_idx = 0
         self.encoder_level1 = nn.Sequential(
@@ -524,8 +479,8 @@ class RefSRWKV(nn.Module):
         )
         global_layer_idx += num_blocks[0]
         dp_idx += num_blocks[0]
+        
         self.down1_2 = Downsample(dim)
-
         self.encoder_level2 = nn.Sequential(
             *[
                 Block(dim * 2, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
@@ -534,8 +489,8 @@ class RefSRWKV(nn.Module):
         )
         global_layer_idx += num_blocks[1]
         dp_idx += num_blocks[1]
+        
         self.down2_3 = Downsample(dim * 2)
-
         self.encoder_level3 = nn.Sequential(
             *[
                 Block(dim * 4, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
@@ -544,8 +499,8 @@ class RefSRWKV(nn.Module):
         )
         global_layer_idx += num_blocks[2]
         dp_idx += num_blocks[2]
+        
         self.down3_4 = Downsample(dim * 4)
-
         self.latent = nn.Sequential(
             *[
                 Block(dim * 8, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
@@ -554,7 +509,7 @@ class RefSRWKV(nn.Module):
         )
         global_layer_idx += num_blocks[3]
         dp_idx += num_blocks[3]
-
+        
         # ── 解码器（层索引继续递增）──
         self.up4_3 = Upsample(dim * 8)
         self.reduce_chan_level3 = nn.Sequential(
@@ -568,7 +523,7 @@ class RefSRWKV(nn.Module):
             ]
         )
         global_layer_idx += num_blocks[2]
-
+        
         self.up3_2 = Upsample(dim * 4)
         self.reduce_chan_level2 = nn.Sequential(
             nn.Conv2d(dim * 4, dim * 2, 1, bias=False),
@@ -581,7 +536,7 @@ class RefSRWKV(nn.Module):
             ]
         )
         global_layer_idx += num_blocks[1]
-
+        
         self.up2_1 = Upsample(dim * 2)
         self.reduce_chan_level1 = nn.Sequential(
             nn.Conv2d(dim * 2, dim, 1, bias=False),
@@ -594,7 +549,7 @@ class RefSRWKV(nn.Module):
             ]
         )
         global_layer_idx += num_blocks[0]
-
+        
         # ── 精修（层索引继续）──
         self.refinement = nn.Sequential(
             *[
@@ -602,7 +557,7 @@ class RefSRWKV(nn.Module):
                 for i in range(num_refinement_blocks)
             ]
         )
-
+        
         # ── 上采样输出 ──
         self.up_final = nn.Sequential(
             nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
@@ -613,7 +568,7 @@ class RefSRWKV(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=False)
-
+        
         self.apply(self._init_weights)
 
     @staticmethod
@@ -646,10 +601,8 @@ class RefSRWKV(nn.Module):
         lr_hr = F.interpolate(
             lr, size=ref.shape[2:], mode="bicubic", align_corners=False
         )
-
         # 2. 参考图颜色对齐到 lr_hr（消除跨时相色偏）
         ref_aligned = self._match_color(ref, lr_hr)
-
         # 3. 下采样到 encoder 输入分辨率
         target_h = ref.shape[2] // 4
         target_w = ref.shape[3] // 4
@@ -657,14 +610,13 @@ class RefSRWKV(nn.Module):
             lr_hr, size=(target_h, target_w), mode="bicubic", align_corners=False
         )
         fea = self.lr_up(fea)
-
         ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_aligned)
-
+        
         e1 = self.encoder_level1(self.fuse1(fea, ref_1))
         e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
         e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
         latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
-
+        
         d3 = self.decoder_level3(
             self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
         )
@@ -674,11 +626,10 @@ class RefSRWKV(nn.Module):
         d1 = self.decoder_level1(
             self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
         )
-
         d1 = self.refinement(d1)
         hr_feat = self.up_final(d1)
         residual = self.output_conv(hr_feat)
-
+        
         # 4. 残差相加
         out = torch.tanh(lr_hr + residual)
         return out
@@ -771,15 +722,14 @@ class LitRefSRWKV(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["model_sr", "loss_fn"])
         self.model_sr = model_sr
-
         self.ssim_weight = ssim_weight
         self.fft_weight = fft_weight
+        
         if ssim_weight > 0 or fft_weight > 0:
             self.l1_loss = nn.L1Loss()
             if ssim_weight > 0:
                 try:
                     from pyiqa import create_metric as _create_pyiqa_metric
-
                     self.ssim_loss_fn = _create_pyiqa_metric("ssim", loss_mode=True)
                     self._ssim_backend = "pyiqa"
                 except Exception:
@@ -791,7 +741,7 @@ class LitRefSRWKV(pl.LightningModule):
         else:
             self.criterion = loss_fn or nn.L1Loss()
             self.ssim_loss_fn = None
-
+            
         self.lr_key = lr_key
         self.hr_key = hr_key
         self.ref_key = ref_key
@@ -805,10 +755,8 @@ class LitRefSRWKV(pl.LightningModule):
     def _apply_ref_dropout(self, ref):
         """Reference dropout（Phase A 核心）：以 ref_drop_prob 概率把参考图
         替换为 batch 内无关参考。
-
         无关参考 → 余弦相似度低 → GatedFusion 门控趋于关闭 → 该样本退化为
         纯超分路径，从而强制主干学会不依赖参考图。
-
         仅训练时调用；验证/测试不经过这里，始终用真实参考。
         batch < 2 时无法 shuffle，直接跳过（调试时的安全兜底）。
         """
@@ -831,16 +779,13 @@ class LitRefSRWKV(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-
         # ── Reference dropout：以 ref_drop_prob 概率替换为无关参考 ──
         ref = self._apply_ref_dropout(ref)
-
         output = self(lr, ref)
-
+        
         if self.ssim_weight > 0 or self.fft_weight > 0:
             l1_loss = self.l1_loss(output, hr)
             loss = l1_loss
-
             if self.ssim_weight > 0:
                 if self.ssim_loss_fn is not None and self._ssim_backend == "pyiqa":
                     ssim_val = self.ssim_loss_fn(output, hr)
@@ -849,16 +794,14 @@ class LitRefSRWKV(pl.LightningModule):
                     ssim_loss = self._manual_ssim_loss(output, hr)
                 loss = loss + self.ssim_weight * ssim_loss
                 self.log("train_ssim_loss", ssim_loss, on_step=True, on_epoch=True)
-
             if self.fft_weight > 0:
                 fft_loss = self._fft_loss(output, hr)
                 loss = loss + self.fft_weight * fft_loss
                 self.log("train_fft_loss", fft_loss, on_step=True, on_epoch=True)
-
             self.log("train_l1", l1_loss, on_step=True, on_epoch=True)
         else:
             loss = self.criterion(output, hr)
-
+            
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
@@ -872,15 +815,12 @@ class LitRefSRWKV(pl.LightningModule):
         g = g / g.sum()
         window = g.unsqueeze(0) * g.unsqueeze(1)
         window = window.unsqueeze(0).unsqueeze(0).repeat(C, 1, 1, 1)
-
         pad = window_size // 2
         mu_pred = F.conv2d(pred, window, padding=pad, groups=C)
         mu_target = F.conv2d(target, window, padding=pad, groups=C)
-
         mu_pred_sq = mu_pred**2
         mu_target_sq = mu_target**2
         mu_pred_target = mu_pred * mu_target
-
         sigma_pred_sq = F.conv2d(pred**2, window, padding=pad, groups=C) - mu_pred_sq
         sigma_target_sq = (
             F.conv2d(target**2, window, padding=pad, groups=C) - mu_target_sq
@@ -888,10 +828,8 @@ class LitRefSRWKV(pl.LightningModule):
         sigma_pred_target = (
             F.conv2d(pred * target, window, padding=pad, groups=C) - mu_pred_target
         )
-
         C1 = (0.01 * 2.0) ** 2
         C2 = (0.03 * 2.0) ** 2
-
         ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / (
             (mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2)
         )
@@ -915,7 +853,6 @@ class LitRefSRWKV(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
         output = self(lr, ref)
-
         if self.ssim_weight > 0 or self.fft_weight > 0:
             loss = self.l1_loss(output, hr)
             self.log("val_l1", loss, on_step=False, on_epoch=True)
@@ -933,14 +870,11 @@ class LitRefSRWKV(pl.LightningModule):
                 self.log("val_fft_loss", fft_loss, on_step=False, on_epoch=True)
         else:
             loss = self.criterion(output, hr)
-
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-
         # 标准 PSNR [-1,1] 口径，和 bicubic 直接可比
         mse = F.mse_loss(output, hr)
         psnr = 10 * torch.log10(4.0 / (mse + 1e-8))
         self.log("val/psnr", psnr, on_step=False, on_epoch=True)
-
         return loss
 
     def on_validation_epoch_end(self):
