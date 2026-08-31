@@ -1,11 +1,6 @@
 # Copyright (c) Shanghai AI Lab. All rights reserved.
 """
 RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
-采用固定内部分辨率（Fixed Internal Resolution）架构：
-  - 编解码器始终在 internal_size 上运行，不受输入物理尺寸和 scale 影响
-  - 通过 PixelUnshuffle 对参考图进行无损空间折叠，与 LR 特征完美对齐
-  - 8×8 窗口注意力 + 循环移位 + 智能 Padding
-  - 通道分段初始化以适配底层 CUDA WKV 算子
 """
 import torch
 torch.set_float32_matmul_precision("high")
