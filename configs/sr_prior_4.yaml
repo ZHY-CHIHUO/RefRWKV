@@ -18,12 +18,12 @@ model:
 
 data:
   root: "RefSR_data/HRMS_SCD"
-  patch_size: 128
+  patch_size: 512
   scale: 4
   augment: true
   augment_ref: false
   ref_gray_prob: 0.0
-  batch_size: 16
+  batch_size: 4
   val_batch_size: 1
   num_workers: 8
   val_num_workers: 2

@@ -10,6 +10,7 @@ from einops import rearrange
 import pytorch_lightning as pl
 from torch.utils.cpp_extension import load
 import os
+import math
 
 _cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 
@@ -125,7 +126,7 @@ class OmniShift(nn.Module):
         self.conv3x3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
         self.conv5x5 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim, bias=False)
         self.alpha = nn.Parameter(torch.ones(4) * 0.25)
-        self.gate = nn.Parameter(torch.zeros(1))  # 初始 0 → 等价恒等映射
+        self.gate = nn.Parameter(torch.zeros(1))
         self.register_buffer("conv5x5_reparam_weight", torch.zeros(dim, 1, 5, 5))
         self._reparam_done = False
 
@@ -140,9 +141,6 @@ class OmniShift(nn.Module):
         return x + torch.tanh(self.gate) * (shifted - x)
 
     def reparam_5x5(self):
-        """训练前向为 x + tanh(gate)*(shifted - x)，重参数化必须一致：
-        x + g*(shifted(x) - x) == (1-g)*x + g*shifted(x)，
-        各分支均为线性 depthwise 卷积，可精确融合为单个 5x5 卷积。"""
         if self._reparam_done:
             return
         with torch.no_grad():
@@ -168,22 +166,16 @@ class OmniShift(nn.Module):
             return F.conv2d(x, self.conv5x5_reparam_weight, padding=2, groups=self.dim)
 
 
-# ═══ VRWKV Blocks — 窗口化 WKV v2（9×9 + 移位 3×2 + 分组 + 门控 + 掩码）═══
+# ═══ VRWKV Blocks — 窗口化 WKV v2 ═══
 class VRWKV_SpatialMix(nn.Module):
-    """
-    窗口化 RWKV 空间混合 v2。
-    特性：
-       • 9×9 窗口 + 循环移位（每 3 层: 0→3→6 像素）
-       • P2: 通道分段 WKV（兼容 C≥16，避免 kernel 报错）
-       • P3: SE 通道注意力门控（AvgPool→FC→Sigmoid）
-       • 掩码: 循环移位后遮蔽跨窗口污染区域（类 SwinIR attn_mask）
-    """
-    def __init__(self, n_embd, head_dim=64, window_size=9, shift_size=3,
+    def __init__(self, n_embd, head_dim=64, window_size=8, shift_size=3,
                  num_groups=None):
         super().__init__()
         if num_groups is None:
             num_groups = max(1, n_embd // 16)
         assert n_embd % num_groups == 0, f"n_embd({n_embd}) 必须被 num_groups({num_groups}) 整除"
+        assert n_embd % 16 == 0, f"n_embd({n_embd}) 必须是 16 的倍数，否则底层 CUDA kernel 会报错"
+        
         self.n_embd = n_embd
         self.window_size = window_size
         self.shift_size = shift_size
@@ -192,7 +184,6 @@ class VRWKV_SpatialMix(nn.Module):
         self.recurrence = 2
         attn_sz = n_embd
         
-        # ── 投影层 ──
         self.omni_shift = OmniShift(dim=n_embd)
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
         self.value = nn.Linear(n_embd, attn_sz, bias=False)
@@ -200,7 +191,6 @@ class VRWKV_SpatialMix(nn.Module):
         self.output = nn.Linear(attn_sz, n_embd, bias=False)
         self.register_buffer("scale", torch.tensor(n_embd**0.5))
         
-        # ── P2: 分段 WKV 参数（兼容 C>=16）──
         with torch.no_grad():
             decay_init = torch.zeros(self.recurrence, n_embd)
             for g in range(num_groups):
@@ -209,7 +199,6 @@ class VRWKV_SpatialMix(nn.Module):
             self.spatial_decay = nn.Parameter(decay_init)
             self.spatial_first = nn.Parameter(torch.zeros(self.recurrence, n_embd))
             
-        # ── P3: SE 通道门控 ──
         mid_ch = max(n_embd // 4, 8)
         self.channel_gate = nn.Sequential(
             nn.Conv2d(n_embd, mid_ch, kernel_size=1, bias=True),
@@ -218,16 +207,13 @@ class VRWKV_SpatialMix(nn.Module):
             nn.Sigmoid(),
         )
 
-    # ═══════════════════ 全局投影 ═══════════════════
     def jit_func(self, x, resolution):
-        """omni_shift(5×5 reparam conv) + K/V/R 线性变换（不变）。"""
         h, w = resolution
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         x = self.omni_shift(x)
         x = rearrange(x, "b c h w -> b (h w) c")
         return self.key(x), self.value(x), torch.sigmoid(self.receptance(x))
 
-    # ═══════════════════ 窗口内 WKV（P2 分段初始化版） ═══════════════════
     def _window_wkv(self, k, v, sr):
         s = self.scale; ws = self.window_size
         for j in range(self.recurrence):
@@ -241,62 +227,47 @@ class VRWKV_SpatialMix(nn.Module):
                 v = rearrange(RUN_CUDA(dj, fj, kt, vt), "b (w h) c -> b (h w) c", h=ws, w=ws)
         return sr * v
 
-    # ═══════════════════ 主 forward ═══════════════════
     def forward(self, x, resolution, layer_idx=0):
         B, T, C = x.size()
         h, w = resolution
         ws = self.window_size
         ss = self.shift_size
         
-        # ── Step 1: 全局投影 ──
         sr, k, v = self.jit_func(x, resolution)
-        
-        # ── Step 2: 本层移位量（每 3 层循环: 0 → 3 → 6）──
         shift_amt = (layer_idx % 3) * ss
         
-        # ── Step 3: 重塑为空间网格 ──
         k = rearrange(k, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
         v = rearrange(v, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
         sr = rearrange(sr, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
         
-        # ── Step 4: padding 到 window 整倍数（含 shift_amt 偏移）──
-        import math
+        # 智能 Padding
         target_h = max(h, h + shift_amt)
         target_w = max(w, w + shift_amt)
-        target_h = int(math.ceil(target_h / ws)) * ws
-        target_w = int(math.ceil(target_w / ws)) * ws
-        pad_h = target_h - h
-        pad_w = target_w - w
+        pad_h = (ws - target_h % ws) % ws
+        pad_w = (ws - target_w % ws) % ws
+        
         if pad_h > 0 or pad_w > 0:
             k = F.pad(k, (0, 0, 0, pad_w, 0, pad_h))
             v = F.pad(v, (0, 0, 0, pad_w, 0, pad_h))
             sr = F.pad(sr, (0, 0, 0, pad_w, 0, pad_h))
         Hp, Wp = h + pad_h, w + pad_w
-        assert Hp % ws == 0 and Wp % ws == 0, \
-            f"窗口划分失败: 原始({h},{w}) + shift({shift_amt}) + pad({pad_h},{pad_w}) = ({Hp},{Wp}) 不能被 ws={ws} 整除"
             
-        # ── Step 5: 窗口划分（padding 后直接切，无需 roll）──
         k = rearrange(k, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
         v = rearrange(v, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
         sr = rearrange(sr, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
         
-        # ── Step 6: 窗口内 WKV（P2 分段初始化）──
         out = self._window_wkv(k, v, sr)
         
-        # ── Step 7: 反向窗口合并 ──
         out = rearrange(out, "(b nh nw) (w1 w2) c -> b (nh w1) (nw w2) c",
                         nh=Hp // ws, nw=Wp // ws, w1=ws, w2=ws)
                         
-        # ── Step 8: 裁剪回原始尺寸（等效反向移位 + 去窗口 padding）──
-        if shift_amt > 0 or ((ws - h % ws) % ws) > 0 or ((ws - w % ws) % ws) > 0:
+        if pad_h > 0 or pad_w > 0:
             out = out[:, :h, :w, :]
             
-        # ── Step 9: P3 通道注意力门控 ──
-        gate_in = out.permute(0, 3, 1, 2)              # (B, C, h, w)
-        gate = self.channel_gate(gate_in)               # (B, C, h, w) ∈ [0,1]
-        out = out * gate.permute(0, 2, 3, 1)            # (B, h, w, C)
+        gate_in = out.permute(0, 3, 1, 2)
+        gate = self.channel_gate(gate_in)
+        out = out * gate.permute(0, 2, 3, 1)
         
-        # ── Step 10: 输出投影 ──
         out = rearrange(out, "b hh ww c -> b (hh ww) c")
         return self.output(out)
 
@@ -398,7 +369,6 @@ class GatedFusion(nn.Module):
         nn.init.constant_(self.gate[-2].bias, 0.0)
 
     def forward(self, lr_feat, ref_feat):
-        # 余弦相似度置信度：相似度高 → 参考图可信 → gate 放大
         sim = F.cosine_similarity(lr_feat, ref_feat, dim=1).unsqueeze(1)
         conf = torch.sigmoid(sim * 2.0)
         fused = self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1))
@@ -416,7 +386,7 @@ class RefSRWKV(nn.Module):
         dim: int = 48,
         num_blocks: tuple = (4, 6, 6, 8),
         num_refinement_blocks: int = 4,
-        scale: int = 10,
+        scale: int = 4,  # 支持任意整数 Scale (2, 3, 4, 8, 10 等)
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
     ):
@@ -425,7 +395,6 @@ class RefSRWKV(nn.Module):
         self.dim = dim
         self.out_channels = out_channels
 
-        # ── LR 编码器（加 dilation 扩大感受野） ──
         self.lr_up = nn.Sequential(
             nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False),
             nn.GroupNorm(_gn_groups(dim), dim),
@@ -438,10 +407,10 @@ class RefSRWKV(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        # ── Ref 编码器 ──
+        # ── Ref 编码器（动态适配 Scale） ──
         self.ref_to_level1 = nn.Sequential(
-            nn.PixelUnshuffle(4),
-            nn.Conv2d(out_channels * 16, dim, 1, bias=False),
+            nn.PixelUnshuffle(scale),
+            nn.Conv2d(out_channels * (scale ** 2), dim, 1, bias=False),
             nn.GroupNorm(_gn_groups(dim), dim),
         )
         self.ref_down2 = nn.Sequential(
@@ -457,118 +426,85 @@ class RefSRWKV(nn.Module):
             nn.GroupNorm(_gn_groups(dim * 8), dim * 8),
         )
         
-        # ── 门控融合（全部 bias=0，初始 gate=0.5） ──
         self.fuse1 = GatedFusion(dim)
         self.fuse2 = GatedFusion(dim * 2)
         self.fuse3 = GatedFusion(dim * 4)
         self.fuse4 = GatedFusion(dim * 8)
         
-        # ── DropPath ──
         dp_rates = [
             drop_path_rate * i / (sum(num_blocks) - 1) for i in range(sum(num_blocks))
         ]
         dp_idx = 0
         
-        # ── 编码器（全局层索引，用于窗口移位调度）──
         global_layer_idx = 0
         self.encoder_level1 = nn.Sequential(
-            *[
-                Block(dim, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
-                for i in range(num_blocks[0])
-            ]
+            *[Block(dim, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[0])]
         )
-        global_layer_idx += num_blocks[0]
-        dp_idx += num_blocks[0]
+        global_layer_idx += num_blocks[0]; dp_idx += num_blocks[0]
         
         self.down1_2 = Downsample(dim)
         self.encoder_level2 = nn.Sequential(
-            *[
-                Block(dim * 2, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
-                for i in range(num_blocks[1])
-            ]
+            *[Block(dim * 2, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[1])]
         )
-        global_layer_idx += num_blocks[1]
-        dp_idx += num_blocks[1]
+        global_layer_idx += num_blocks[1]; dp_idx += num_blocks[1]
         
         self.down2_3 = Downsample(dim * 2)
         self.encoder_level3 = nn.Sequential(
-            *[
-                Block(dim * 4, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
-                for i in range(num_blocks[2])
-            ]
+            *[Block(dim * 4, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[2])]
         )
-        global_layer_idx += num_blocks[2]
-        dp_idx += num_blocks[2]
+        global_layer_idx += num_blocks[2]; dp_idx += num_blocks[2]
         
         self.down3_4 = Downsample(dim * 4)
         self.latent = nn.Sequential(
-            *[
-                Block(dim * 8, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i)
-                for i in range(num_blocks[3])
-            ]
+            *[Block(dim * 8, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[3])]
         )
-        global_layer_idx += num_blocks[3]
-        dp_idx += num_blocks[3]
+        global_layer_idx += num_blocks[3]; dp_idx += num_blocks[3]
         
-        # ── 解码器（层索引继续递增）──
         self.up4_3 = Upsample(dim * 8)
-        self.reduce_chan_level3 = nn.Sequential(
-            nn.Conv2d(dim * 8, dim * 4, 1, bias=False),
-            nn.GroupNorm(_gn_groups(dim * 4), dim * 4),
-        )
+        self.reduce_chan_level3 = nn.Sequential(nn.Conv2d(dim * 8, dim * 4, 1, bias=False), nn.GroupNorm(_gn_groups(dim * 4), dim * 4))
         self.decoder_level3 = nn.Sequential(
-            *[
-                Block(dim * 4, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
-                for i in range(num_blocks[2])
-            ]
+            *[Block(dim * 4, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_blocks[2])]
         )
         global_layer_idx += num_blocks[2]
         
         self.up3_2 = Upsample(dim * 4)
-        self.reduce_chan_level2 = nn.Sequential(
-            nn.Conv2d(dim * 4, dim * 2, 1, bias=False),
-            nn.GroupNorm(_gn_groups(dim * 2), dim * 2),
-        )
+        self.reduce_chan_level2 = nn.Sequential(nn.Conv2d(dim * 4, dim * 2, 1, bias=False), nn.GroupNorm(_gn_groups(dim * 2), dim * 2))
         self.decoder_level2 = nn.Sequential(
-            *[
-                Block(dim * 2, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
-                for i in range(num_blocks[1])
-            ]
+            *[Block(dim * 2, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_blocks[1])]
         )
         global_layer_idx += num_blocks[1]
         
         self.up2_1 = Upsample(dim * 2)
-        self.reduce_chan_level1 = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1, bias=False),
-            nn.GroupNorm(_gn_groups(dim), dim),
-        )
+        self.reduce_chan_level1 = nn.Sequential(nn.Conv2d(dim * 2, dim, 1, bias=False), nn.GroupNorm(_gn_groups(dim), dim))
         self.decoder_level1 = nn.Sequential(
-            *[
-                Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
-                for i in range(num_blocks[0])
-            ]
+            *[Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_blocks[0])]
         )
         global_layer_idx += num_blocks[0]
         
-        # ── 精修（层索引继续）──
         self.refinement = nn.Sequential(
-            *[
-                Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i)
-                for i in range(num_refinement_blocks)
-            ]
+            *[Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_refinement_blocks)]
         )
         
-        # ── 上采样输出 ──
-        self.up_final = nn.Sequential(
-            nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
-            nn.PixelShuffle(2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
-            nn.PixelShuffle(2),
-            nn.ReLU(inplace=True),
-        )
+        # ── 上采样输出（动态适配 Scale） ──
+        up_layers = []
+        remaining_scale = scale
+        while remaining_scale % 2 == 0 and remaining_scale > 1:
+            up_layers.extend([
+                nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
+                nn.PixelShuffle(2),
+                nn.ReLU(inplace=True)
+            ])
+            remaining_scale //= 2
+        
+        if remaining_scale > 1:
+            up_layers.extend([
+                nn.Upsample(scale_factor=remaining_scale, mode='bicubic', align_corners=False),
+                nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+                nn.ReLU(inplace=True)
+            ])
+        self.up_final = nn.Sequential(*up_layers)
+        
         self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=False)
-        
         self.apply(self._init_weights)
 
     @staticmethod
@@ -582,7 +518,6 @@ class RefSRWKV(nn.Module):
             nn.init.ones_(m.weight)
 
     def _match_color(self, ref, target):
-        """通道级颜色对齐：将 ref 的均值和标准差对齐到 target"""
         ref_mean = ref.mean(dim=[2, 3], keepdim=True)
         ref_std = ref.std(dim=[2, 3], keepdim=True)
         tgt_mean = target.mean(dim=[2, 3], keepdim=True)
@@ -597,40 +532,31 @@ class RefSRWKV(nn.Module):
         return ref_1, ref_2, ref_3, ref_4
 
     def forward(self, lr, ref):
-        # 1. LR bicubic 上采样到 HR
-        lr_hr = F.interpolate(
-            lr, size=ref.shape[2:], mode="bicubic", align_corners=False
-        )
+        # 1. LR bicubic 上采样到 HR（用于最终的残差相加兜底）
+        lr_hr = F.interpolate(lr, size=ref.shape[2:], mode="bicubic", align_corners=False)
+        
         # 2. 参考图颜色对齐到 lr_hr（消除跨时相色偏）
         ref_aligned = self._match_color(ref, lr_hr)
-        # 3. 下采样到 encoder 输入分辨率
-        target_h = ref.shape[2] // 4
-        target_w = ref.shape[3] // 4
-        fea = F.interpolate(
-            lr_hr, size=(target_h, target_w), mode="bicubic", align_corners=False
-        )
-        fea = self.lr_up(fea)
+        
+        # 3. 提取 Ref 金字塔（此时 ref_1 尺寸完美等于 lr 原始尺寸）
         ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_aligned)
+        
+        # 4. 直接送入 lr_up，无需任何 F.interpolate，保留 100% 原始高频信息！
+        fea = self.lr_up(lr) 
         
         e1 = self.encoder_level1(self.fuse1(fea, ref_1))
         e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
         e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
         latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
         
-        d3 = self.decoder_level3(
-            self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
-        )
-        d2 = self.decoder_level2(
-            self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
-        )
-        d1 = self.decoder_level1(
-            self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
-        )
+        d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1)))
+        d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)))
+        d1 = self.decoder_level1(self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)))
         d1 = self.refinement(d1)
+        
         hr_feat = self.up_final(d1)
         residual = self.output_conv(hr_feat)
         
-        # 4. 残差相加
         out = torch.tanh(lr_hr + residual)
         return out
 
@@ -652,8 +578,7 @@ class EMA:
         self._initialized = False
 
     def _lazy_init(self, model: nn.Module):
-        if self._initialized:
-            return
+        if self._initialized: return
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
@@ -666,11 +591,7 @@ class EMA:
             if param.requires_grad and name in self.shadow:
                 if self.shadow[name].device != param.device:
                     self.shadow[name] = self.shadow[name].to(param.device)
-                p_data = (
-                    param.data.float()
-                    if param.data.dtype != torch.float32
-                    else param.data
-                )
+                p_data = param.data.float() if param.data.dtype != torch.float32 else param.data
                 self.shadow[name].mul_(self.decay).add_(p_data, alpha=1.0 - self.decay)
 
     def apply_shadow(self, model: nn.Module):
@@ -685,15 +606,12 @@ class EMA:
     def restore(self, model: nn.Module):
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
+                # ★ 修复：确保 backup 张量与 param 在同一设备
+                param.data.copy_(self.backup[name].to(param.device))
         self.backup = {}
 
     def state_dict(self):
-        return {
-            "decay": self.decay,
-            "shadow": self.shadow,
-            "initialized": self._initialized,
-        }
+        return {"decay": self.decay, "shadow": self.shadow, "initialized": self._initialized}
 
     def load_state_dict(self, sd):
         self.decay = sd["decay"]
@@ -704,20 +622,10 @@ class EMA:
 # ═══ LitRefSRWKV（含频域 loss） ═══
 class LitRefSRWKV(pl.LightningModule):
     def __init__(
-        self,
-        model_sr: RefSRWKV,
-        learning_rate: float = 1e-4,
-        warmup_steps: int = 500,
-        grad_clip_norm: float = 1.0,
-        ema_decay: float = 0.999,
-        use_ema: bool = True,
-        ssim_weight: float = 0.0,
-        fft_weight: float = 0.0,
-        ref_drop_prob: float = 0.0,
-        loss_fn=None,
-        lr_key: str = "lr",
-        hr_key: str = "hr",
-        ref_key: str = "ref",
+        self, model_sr: RefSRWKV, learning_rate: float = 1e-4, warmup_steps: int = 500,
+        grad_clip_norm: float = 1.0, ema_decay: float = 0.999, use_ema: bool = True,
+        ssim_weight: float = 0.0, fft_weight: float = 0.0, ref_drop_prob: float = 0.0,
+        loss_fn=None, lr_key: str = "lr", hr_key: str = "hr", ref_key: str = "ref",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model_sr", "loss_fn"])
@@ -753,13 +661,6 @@ class LitRefSRWKV(pl.LightningModule):
         return batch[0], batch[1], batch[2]
 
     def _apply_ref_dropout(self, ref):
-        """Reference dropout（Phase A 核心）：以 ref_drop_prob 概率把参考图
-        替换为 batch 内无关参考。
-        无关参考 → 余弦相似度低 → GatedFusion 门控趋于关闭 → 该样本退化为
-        纯超分路径，从而强制主干学会不依赖参考图。
-        仅训练时调用；验证/测试不经过这里，始终用真实参考。
-        batch < 2 时无法 shuffle，直接跳过（调试时的安全兜底）。
-        """
         p = self.hparams.ref_drop_prob
         if p <= 0 or not self.training or ref.size(0) < 2:
             return ref
@@ -772,14 +673,12 @@ class LitRefSRWKV(pl.LightningModule):
 
     @staticmethod
     def _fft_loss(pred, target):
-        """频域感知 loss：增强高频细节"""
         pred_fft = torch.fft.rfft2(pred, norm="ortho")
         target_fft = torch.fft.rfft2(target, norm="ortho")
         return F.l1_loss(pred_fft, target_fft)
 
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-        # ── Reference dropout：以 ref_drop_prob 概率替换为无关参考 ──
         ref = self._apply_ref_dropout(ref)
         output = self(lr, ref)
         
@@ -788,8 +687,7 @@ class LitRefSRWKV(pl.LightningModule):
             loss = l1_loss
             if self.ssim_weight > 0:
                 if self.ssim_loss_fn is not None and self._ssim_backend == "pyiqa":
-                    ssim_val = self.ssim_loss_fn(output, hr)
-                    ssim_loss = 1.0 - ssim_val
+                    ssim_loss = 1.0 - self.ssim_loss_fn(output, hr)
                 else:
                     ssim_loss = self._manual_ssim_loss(output, hr)
                 loss = loss + self.ssim_weight * ssim_loss
@@ -822,12 +720,8 @@ class LitRefSRWKV(pl.LightningModule):
         mu_target_sq = mu_target**2
         mu_pred_target = mu_pred * mu_target
         sigma_pred_sq = F.conv2d(pred**2, window, padding=pad, groups=C) - mu_pred_sq
-        sigma_target_sq = (
-            F.conv2d(target**2, window, padding=pad, groups=C) - mu_target_sq
-        )
-        sigma_pred_target = (
-            F.conv2d(pred * target, window, padding=pad, groups=C) - mu_pred_target
-        )
+        sigma_target_sq = F.conv2d(target**2, window, padding=pad, groups=C) - mu_target_sq
+        sigma_pred_target = F.conv2d(pred * target, window, padding=pad, groups=C) - mu_pred_target
         C1 = (0.01 * 2.0) ** 2
         C2 = (0.03 * 2.0) ** 2
         ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / (
@@ -858,8 +752,7 @@ class LitRefSRWKV(pl.LightningModule):
             self.log("val_l1", loss, on_step=False, on_epoch=True)
             if self.ssim_weight > 0:
                 if self.ssim_loss_fn is not None and self._ssim_backend == "pyiqa":
-                    ssim_val = self.ssim_loss_fn(output, hr)
-                    ssim_loss = 1.0 - ssim_val
+                    ssim_loss = 1.0 - self.ssim_loss_fn(output, hr)
                 else:
                     ssim_loss = self._manual_ssim_loss(output, hr)
                 loss = loss + self.ssim_weight * ssim_loss
@@ -871,7 +764,6 @@ class LitRefSRWKV(pl.LightningModule):
         else:
             loss = self.criterion(output, hr)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        # 标准 PSNR [-1,1] 口径，和 bicubic 直接可比
         mse = F.mse_loss(output, hr)
         psnr = 10 * torch.log10(4.0 / (mse + 1e-8))
         self.log("val/psnr", psnr, on_step=False, on_epoch=True)
@@ -901,11 +793,7 @@ class LitRefSRWKV(pl.LightningModule):
         scheduler = {
             "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=(
-                    self.trainer.estimated_stepping_batches
-                    if hasattr(self.trainer, "estimated_stepping_batches")
-                    else 100000
-                ),
+                T_max=(self.trainer.estimated_stepping_batches if hasattr(self.trainer, "estimated_stepping_batches") else 100000),
                 eta_min=1e-6,
             ),
             "interval": "step",
@@ -913,16 +801,10 @@ class LitRefSRWKV(pl.LightningModule):
         }
         return [optimizer], [scheduler]
 
-    def configure_gradient_clipping(
-        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
-    ):
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         clip_val = gradient_clip_val or self.hparams.grad_clip_norm
         if clip_val and clip_val > 0:
-            self.clip_gradients(
-                optimizer,
-                gradient_clip_val=clip_val,
-                gradient_clip_algorithm=gradient_clip_algorithm or "norm",
-            )
+            self.clip_gradients(optimizer, gradient_clip_val=clip_val, gradient_clip_algorithm=gradient_clip_algorithm or "norm")
 
     def on_save_checkpoint(self, checkpoint):
         if self.ema is not None:
@@ -937,7 +819,4 @@ class LitRefSRWKV(pl.LightningModule):
         ema_info = f" | EMA decay={self.ema.decay}" if self.ema else " | EMA=off"
         ssim_info = f" | SSIM={self.ssim_weight}" if self.ssim_weight > 0 else ""
         fft_info = f" | FFT={self.fft_weight}" if self.fft_weight > 0 else ""
-        print(
-            f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M"
-            f" | grad_clip={self.hparams.grad_clip_norm}{ema_info}{ssim_info}{fft_info}"
-        )
+        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {total / 1e6:.2f}M | grad_clip={self.hparams.grad_clip_norm}{ema_info}{ssim_info}{fft_info}")
