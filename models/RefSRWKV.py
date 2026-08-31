@@ -299,10 +299,10 @@ class VRWKV_SpatialMix(nn.Module):
         v = rearrange(v, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
         sr = rearrange(sr, "b (hh ww) c -> b hh ww c", hh=h, ww=w)
 
-        # ── Step 4: padding 到 window 整倍数 + 额外 shift_amt 边界 ──
-        #    用 padding 模拟移位（无回绕），替代 torch.roll + 掩码
-        pad_h = (ws - h % ws) % ws + shift_amt      # 下侧多 pad shift_amt 行
-        pad_w = (ws - w % ws) % ws + shift_amt      # 右侧多 pad shift_amt 列
+        # ── Step 4: padding 到 window 整倍数（含 shift_amt 偏移）──
+        #    目标尺寸必须 ≥ 原始+shift 且是 ws 的整倍数，替代 torch.roll + 掩码
+        pad_h = (((h + shift_amt + ws - 1) // ws) * ws) - h
+        pad_w = (((w + shift_amt + ws - 1) // ws) * ws) - w
         if pad_h or pad_w:
             k = F.pad(k, (0, 0, 0, pad_w, 0, pad_h))
             v = F.pad(v, (0, 0, 0, pad_w, 0, pad_h))
