@@ -2,7 +2,6 @@
 """
 RefSRWKV SR Prior 训练脚本
 """
-
 import argparse
 import os
 import sys
@@ -33,11 +32,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("train_sr_prior")
 
-
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
 
 def build_dataloaders(cfg):
     dc = cfg["data"]
@@ -88,6 +85,12 @@ def build_dataloaders(cfg):
 
 def build_model(cfg):
     mc = cfg["model"]
+    dc = cfg["data"]
+    
+    # 自动获取数据裁剪尺寸与网络内部计算尺寸
+    hr_size = dc.get("patch_size", 480)
+    internal_size = mc.get("internal_size", 128)
+    
     model = RefSRWKV(
         inp_channels=mc.get("inp_channels", 3),
         out_channels=mc.get("out_channels", 3),
@@ -95,12 +98,14 @@ def build_model(cfg):
         num_blocks=tuple(mc.get("num_blocks", [4, 6, 6, 8])),
         num_refinement_blocks=mc.get("num_refinement_blocks", 4),
         scale=mc.get("scale", 10),
+        hr_size=hr_size,
+        internal_size=internal_size,
         drop_path_rate=mc.get("drop_path_rate", 0.1),
         hidden_rate=mc.get("hidden_rate", 4),
     )
 
     total = sum(p.numel() for p in model.parameters()) / 1e6
-    logger.info("RefSRWKV 参数量: %.2fM", total)
+    logger.info("RefSRWKV 参数量: %.2fM (HR=%d, Internal=%d)", total, hr_size, internal_size)
 
     lit_model = LitRefSRWKV(
         model_sr=model,
@@ -111,13 +116,11 @@ def build_model(cfg):
         use_ema=mc.get("use_ema", True),
         ssim_weight=mc.get("ssim_weight", 0.0),
         fft_weight=mc.get("fft_weight", 0.0),
-        ref_drop_prob=mc.get("ref_drop_prob", 0.0),   # ← 新增，唯一改动
+        ref_drop_prob=mc.get("ref_drop_prob", 0.0),
     )
     return lit_model
 
-
 _CKPT_PREFIXES = ("generator.sr_model.", "sr_model.", "model_sr.", "model.", "module.")
-
 
 def _strip_prefix(key: str) -> str:
     for pre in _CKPT_PREFIXES:
@@ -125,12 +128,10 @@ def _strip_prefix(key: str) -> str:
             return key[len(pre) :]
     return key
 
-
 def _load_state_dict(path: str) -> dict:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     return {k: v for k, v in sd.items() if torch.is_tensor(v)}
-
 
 def check_resume_compatible(ckpt_path: str, lit_model):
     try:
@@ -170,7 +171,6 @@ def check_resume_compatible(ckpt_path: str, lit_model):
 
     return True, f"结构一致（{len(overlap)} 个张量全部匹配）"
 
-
 def load_weights_filtered(lit_model, ckpt_path: str):
     sd = _load_state_dict(ckpt_path)
     ref = {k: v for k, v in lit_model.state_dict().items() if torch.is_tensor(v)}
@@ -199,7 +199,6 @@ def load_weights_filtered(lit_model, ckpt_path: str):
     if len(matched) == 0:
         raise SystemExit(f"热启动失败: checkpoint 没有匹配到任何参数（{ckpt_path}）")
 
-
 class ForceSaveLastCallback(Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         cb = trainer.checkpoint_callback
@@ -215,7 +214,6 @@ class ForceSaveLastCallback(Callback):
             )
         except Exception as e:
             logger.warning("ForceSaveLastCallback 保存失败: %s", e)
-
 
 def main():
     parser = argparse.ArgumentParser(description="RefSRWKV SR Prior 训练")
@@ -361,7 +359,6 @@ def main():
 
     trainer.fit(lit_model, train_loader, val_loader, ckpt_path=resume_ckpt)
     logger.info("训练完成！最佳模型: %s", trainer.checkpoint_callback.best_model_path)
-
 
 if __name__ == "__main__":
     main()
