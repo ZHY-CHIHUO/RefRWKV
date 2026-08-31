@@ -301,14 +301,21 @@ class VRWKV_SpatialMix(nn.Module):
 
         # ── Step 4: padding 到 window 整倍数（含 shift_amt 偏移）──
         #    目标尺寸必须 ≥ 原始+shift 且是 ws 的整倍数，替代 torch.roll + 掩码
-        pad_h = (((h + shift_amt + ws - 1) // ws) * ws) - h
-        pad_w = (((w + shift_amt + ws - 1) // ws) * ws) - w
-        if pad_h or pad_w:
+        import math
+        target_h = max(h, h + shift_amt)
+        target_w = max(w, w + shift_amt)
+        target_h = int(math.ceil(target_h / ws)) * ws
+        target_w = int(math.ceil(target_w / ws)) * ws
+        pad_h = target_h - h
+        pad_w = target_w - w
+        if pad_h > 0 or pad_w > 0:
             k = F.pad(k, (0, 0, 0, pad_w, 0, pad_h))
             v = F.pad(v, (0, 0, 0, pad_w, 0, pad_h))
             sr = F.pad(sr, (0, 0, 0, pad_w, 0, pad_h))
 
         Hp, Wp = h + pad_h, w + pad_w
+        assert Hp % ws == 0 and Wp % ws == 0, \
+            f"窗口划分失败: 原始({h},{w}) + shift({shift_amt}) + pad({pad_h},{pad_w}) = ({Hp},{Wp}) 不能被 ws={ws} 整除"
 
         # ── Step 5: 窗口划分（padding 后直接切，无需 roll）──
         k = rearrange(k, "b (nh ws) (nw ws) c -> (b nh nw) (ws ws) c", ws=ws)
