@@ -47,3 +47,4 @@ results/
 # ===== 系统 =====
 .DS_Store
 Thumbs.db
+!scripts/eval_four_settings.py
