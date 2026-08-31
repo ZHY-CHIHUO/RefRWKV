@@ -318,16 +318,16 @@ class VRWKV_SpatialMix(nn.Module):
             f"窗口划分失败: 原始({h},{w}) + shift({shift_amt}) + pad({pad_h},{pad_w}) = ({Hp},{Wp}) 不能被 ws={ws} 整除"
 
         # ── Step 5: 窗口划分（padding 后直接切，无需 roll）──
-        k = rearrange(k, "b (nh ws) (nw ws) c -> (b nh nw) (ws ws) c", ws=ws)
-        v = rearrange(v, "b (nh ws) (nw ws) c -> (b nh nw) (ws ws) c", ws=ws)
-        sr = rearrange(sr, "b (nh ws) (nw ws) c -> (b nh nw) (ws ws) c", ws=ws)
+        k = rearrange(k, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
+        v = rearrange(v, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
+        sr = rearrange(sr, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
 
         # ── Step 6: 分组窗口内 WKV（P2）──
         out = self._window_wkv_grouped(k, v, sr)
 
         # ── Step 7: 反向窗口合并 ──
-        out = rearrange(out, "(b nh nw) (ws ws) c -> b (nh ws) (nw ws) c",
-                        nh=Hp // ws, nw=Wp // ws, ws=ws)
+        out = rearrange(out, "(b nh nw) (w1 w2) c -> b (nh w1) (nw w2) c",
+                        nh=Hp // ws, nw=Wp // ws, w1=ws, w2=ws)
 
         # ── Step 8: 裁剪回原始尺寸（等效反向移位 + 去窗口 padding）──
         if shift_amt > 0 or ((ws - h % ws) % ws) > 0 or ((ws - w % ws) % ws) > 0:
