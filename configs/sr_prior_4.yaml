@@ -12,9 +12,9 @@ model:
   grad_clip_norm: 1.0
   ema_decay: 0.999
   use_ema: true
-  ssim_weight: 0.0
+  ssim_weight: 0.3
   fft_weight: 0.2
-  ref_drop_prob: 0.5
+  ref_drop_prob: 0.2
 
 data:
   root: "RefSR_data/HRMS_SCD"
@@ -23,7 +23,7 @@ data:
   augment: true
   augment_ref: false
   ref_gray_prob: 0.0
-  batch_size: 8
+  batch_size: 4
   val_batch_size: 1
   num_workers: 8
   val_num_workers: 2
@@ -36,7 +36,7 @@ train:
   precision: bf16-mixed
   max_epochs: 80
   val_check_interval: 0.5
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2
   save_top_k: 3
   early_stopping_patience: 80
 
