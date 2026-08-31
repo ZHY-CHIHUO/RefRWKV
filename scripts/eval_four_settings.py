@@ -1,30 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-RefSRWKV 四设定评测（修复版）
-=============================
-设定: bicubic / no_ref / real_ref / perfect_ref  ×  test_easy / test_hard
-
-为什么有这个版本（16.6 dB 异常根因）:
-1. EMA shadow 只存 parameter 不存 buffer。加载时 missing=132 全部是 buffer
-   （88 个 OmniShift.conv5x5_reparam_weight + 44 个 SpatialMix.scale），无害。
-   本脚本分类校验：buffer 缺失放行；若有任何真实 parameter 缺失会直接中止，
-   不再静默产出假指标。
-2. 10b39af 之前的旧代码 reparam_5x5 漏乘 gate 因子，而 eval 模式下 OmniShift
-   会自动走重参数化路径 → 输出全毁（训练 val 走训练前向，不受影响）。
-   本脚本统一把 OmniShift 的评测前向绑定为 forward_train，绕过重参数化，
-   在任意代码版本下结果都正确（代价是该算子约 3 倍耗时，评测可接受）。
-3. 训练 val 口径 = HR patch 128 随机裁剪；加 --patch 128 可同口径对比。
-
-用法（WSL）:
-    cp /mnt/c/Users/ZHY/Desktop/RefRWKV/scripts/eval_four_settings.py ~/PROJECT/RefRWKV/
-    cd ~/PROJECT/RefRWKV
-    python3 eval_four_settings.py                      # 全图 × 两个 split × 各500张
-    python3 eval_four_settings.py --patch 128          # 与训练 val 同口径（随机裁剪）
-    python3 eval_four_settings.py --n 100              # 快测
-    python3 eval_four_settings.py --raw                # 原始权重（默认 EMA）
-    python3 eval_four_settings.py --splits test_easy   # 只测一个 split
-"""
+"""RefSRWKV 四设定评测：bicubic、无参考、真实参考、理想参考。"""
 import argparse
 import os
 import sys
@@ -37,23 +13,12 @@ import torch.nn.functional as F
 sys.path.insert(0, os.getcwd())
 
 from models.RefSRWKV import RefSRWKV
-try:
-    from models.RefSRWKV import OmniShift
-except ImportError:  # 极老版本没有该类名导出
-    OmniShift = None
 from RefSR_data.RefDataset import RefPNGDataset
 
 PREFIXES = ("model_sr.", "model.", "generator.sr_model.", "sr_model.", "module.")
 # EMA shadow 不含 buffer，这些键缺失属正常
 BUFFER_SUFFIXES = ("conv5x5_reparam_weight", ".scale")
 SETTINGS = ["bicubic", "no_ref", "real_ref", "perfect_ref"]
-
-
-def is_omnishift(m):
-    if OmniShift is not None and isinstance(m, OmniShift):
-        return True
-    return type(m).__name__ == "OmniShift"
-
 
 def strip_prefix(sd):
     out = {}
@@ -94,45 +59,6 @@ def load_weights(model, ckpt_path, use_ema):
         print(f"        示例: {real_miss[:10]}")
         sys.exit(1)
 
-
-def reparam_selfcheck(model):
-    """诊断：训练前向 vs 重参数化前向是否一致（检测旧代码 reparam 漏 gate）。"""
-    torch.manual_seed(0)
-    checked, bad, max_err = 0, 0, 0.0
-    with torch.no_grad():
-        for m in model.modules():
-            if is_omnishift(m) and hasattr(m, "forward_train"):
-                x = torch.randn(1, m.dim, 16, 16)
-                y_train = m.forward_train(x)
-                m._reparam_done = False
-                m.reparam_5x5()
-                y_rep = F.conv2d(x, m.conv5x5_reparam_weight, padding=2, groups=m.dim)
-                err = (y_train - y_rep).abs().max().item()
-                max_err = max(max_err, err)
-                checked += 1
-                if err > 1e-4:
-                    bad += 1
-    if checked == 0:
-        print("[selfcheck] 未找到 OmniShift 模块，跳过")
-        return
-    if bad == 0:
-        print(f"[selfcheck] reparam 一致性 OK（{checked} 个模块，max_err={max_err:.2e}）"
-              " → 代码已是 10b39af 修复版")
-    else:
-        print(f"[selfcheck] reparam 不一致：{bad}/{checked} 个模块，max_err={max_err:.4f}"
-              " → 当前代码是 10b39af 之前的旧版（重参数化漏乘 gate）")
-
-
-def bind_train_forward(model):
-    """把 OmniShift 的评测前向统一绑定为训练前向，绕过重参数化路径。"""
-    n = 0
-    for m in model.modules():
-        if is_omnishift(m) and hasattr(m, "forward_train"):
-            m.forward = m.forward_train
-            n += 1
-    print(f"[fix] 已将 {n} 个 OmniShift 绑定为训练前向（绕过重参数化，结果与代码版本无关）")
-
-
 @torch.no_grad()
 def run_split(model, split, args, device):
     ds = RefPNGDataset(data_dir=args.data, mode=split, scale=args.scale,
@@ -172,19 +98,20 @@ def main():
     ap.add_argument("--splits", nargs="+", default=["test_easy", "test_hard"])
     ap.add_argument("--n", type=int, default=500)
     ap.add_argument("--scale", type=int, default=4)
+    ap.add_argument("--hr_size", type=int, default=512,
+                    help="SR checkpoint 训练时的 HR patch 边长；sr_prior_10 使用 480")
     ap.add_argument("--patch", type=int, default=None,
-                    help="HR patch 边长；训练 val 口径用 128。默认 None=全图")
+                    help="评测时的 HR 裁剪边长；默认 None 表示全图")
     ap.add_argument("--raw", action="store_true", help="用原始权重而非 EMA")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = RefSRWKV(inp_channels=3, out_channels=3, dim=48,
                      num_blocks=(4, 6, 6, 8), num_refinement_blocks=4,
-                     scale=args.scale, drop_path_rate=0.1, hidden_rate=4)
+                     scale=args.scale, hr_size=args.hr_size,
+                     drop_path_rate=0.1, hidden_rate=4)
     load_weights(model, args.ckpt, use_ema=not args.raw)
-    reparam_selfcheck(model)
-    bind_train_forward(model)
-    model.eval().to(device)
+    model.prepare_for_inference().to(device)
 
     results = {}
     for split in args.splits:
@@ -196,10 +123,5 @@ def main():
         print(f"  {sp}: bicubic {b:.2f} | no_ref {r['no_ref']:.2f} ({r['no_ref'] - b:+.2f}) "
               f"| real_ref {r['real_ref']:.2f} ({r['real_ref'] - b:+.2f}) "
               f"| perfect_ref {r['perfect_ref']:.2f} ({r['perfect_ref'] - b:+.2f})")
-    print("\n旧锚点（修复前消融）: test_easy 23.15/23.09/23.21/23.53 | "
-          "test_hard 23.05/22.95/23.08/23.42")
-    print("Phase A 验收线: no_ref 设定 test_easy >= 23.65 dB（bicubic + 0.5）")
-
-
 if __name__ == "__main__":
     main()

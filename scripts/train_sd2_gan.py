@@ -105,6 +105,7 @@ def build_sr_model(cfg: dict, resume_ckpt_path: Optional[str] = None):
 
     sr_cfg = mc.get("sr", {})
     sr_fixed = mc.get("sr_fixed", True)
+    sr_hr_size = sr_cfg.get("hr_size", cfg.get("data", {}).get("patch_size", 480))
 
     model = RefSRWKV(
         inp_channels=sr_cfg.get("inp_channels", 3),
@@ -113,6 +114,7 @@ def build_sr_model(cfg: dict, resume_ckpt_path: Optional[str] = None):
         num_blocks=tuple(sr_cfg.get("num_blocks", [4, 6, 6, 8])),
         num_refinement_blocks=sr_cfg.get("num_refinement_blocks", 4),
         scale=sr_cfg.get("scale", 10),
+        hr_size=sr_hr_size,
         drop_path_rate=sr_cfg.get("drop_path_rate", 0.1),
         hidden_rate=sr_cfg.get("hidden_rate", 4),
     )
