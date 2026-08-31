@@ -5,7 +5,6 @@ model:
   num_blocks: [4, 6, 6, 8]
   num_refinement_blocks: 4
   scale: 4
-  internal_size: 128 # 网络内部计算尺寸 (512 / 128 = 4，自动推导 PixelUnshuffle(4))
   drop_path_rate: 0.1
   hidden_rate: 4
   learning_rate: 1.0e-4

@@ -89,7 +89,6 @@ def build_model(cfg):
     
     # 自动获取数据裁剪尺寸与网络内部计算尺寸
     hr_size = dc.get("patch_size", 480)
-    internal_size = mc.get("internal_size", 128)
     
     model = RefSRWKV(
         inp_channels=mc.get("inp_channels", 3),
@@ -99,13 +98,12 @@ def build_model(cfg):
         num_refinement_blocks=mc.get("num_refinement_blocks", 4),
         scale=mc.get("scale", 10),
         hr_size=hr_size,
-        internal_size=internal_size,
         drop_path_rate=mc.get("drop_path_rate", 0.1),
         hidden_rate=mc.get("hidden_rate", 4),
     )
 
     total = sum(p.numel() for p in model.parameters()) / 1e6
-    logger.info("RefSRWKV 参数量: %.2fM (HR=%d, Internal=%d)", total, hr_size, internal_size)
+    logger.info("RefSRWKV 参数量: %.2fM (HR=%d)", total, hr_size)
 
     lit_model = LitRefSRWKV(
         model_sr=model,

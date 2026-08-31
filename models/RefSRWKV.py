@@ -370,7 +370,6 @@ class RefSRWKV(nn.Module):
         num_refinement_blocks: int = 4,
         scale: int = 4,
         hr_size: int = 480,
-        internal_size: int = 128,
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
     ):
@@ -378,12 +377,12 @@ class RefSRWKV(nn.Module):
         self.scale = scale
         self.dim = dim
         self.out_channels = out_channels
-        self.internal_size = internal_size
         
-        # 自动推导参考图无损降采样因子
-        assert hr_size % internal_size == 0, \
-            f"HR尺寸({hr_size}) 必须能被 internal_size({internal_size}) 整除"
-        self.ref_down_factor = hr_size // internal_size
+        # ★ 核心自动化逻辑：绑定 PixelUnshuffle(4) 黄金法则
+        self.ref_down_factor = 4  
+        assert hr_size % self.ref_down_factor == 0, \
+            f"HR尺寸({hr_size}) 必须能被 {self.ref_down_factor} 整除"
+        self.internal_size = hr_size // self.ref_down_factor
 
         # LR 特征提取
         self.lr_up = nn.Sequential(
