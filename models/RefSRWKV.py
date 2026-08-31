@@ -1,4 +1,4 @@
-Copyright (c) Shanghai AI Lab. All rights reserved.
+# Copyright (c) Shanghai AI Lab. All rights reserved.
 """
 RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
 """
