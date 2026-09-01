@@ -1,12 +1,6 @@
 # Copyright (c) Shanghai AI Lab. All rights reserved.
 """
 RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
-终极生产版：
-  - 自动推导 internal_size (hr_size // 4)，绑定 PixelUnshuffle(4) 黄金法则
-  - 8×8 窗口注意力 + 循环移位 + 智能 Padding
-  - 通道分段初始化以适配底层 CUDA WKV 算子
-  - 修复 GatedFusion 置信度映射，防止参考图信息被过度抑制
-  - 修复 EMA 验证期污染与学习率调度冲突
 """
 import torch
 try:
