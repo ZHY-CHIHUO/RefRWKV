@@ -91,9 +91,10 @@ model:
   num_blocks: [4, 6, 6, 8]
   learning_rate: 1.0e-4    # 从头训练（热启动用 1e-5）
   lr_scheduler: plateau     # 监控 val_loss 的自适应衰减
-  lr_patience: 1            # 容忍 1 个无改善 epoch
+  lr_patience: 2            # 容忍 2 次验证无有效改善，第 3 次触发
   lr_factor: 0.5            # 触发后学习率乘以该系数
   lr_min: 1.0e-6            # 学习率下限
+  lr_threshold: 1.0e-4      # val_loss 绝对下降需超过此数值才算改善
   ssim_weight: 0.2          # SSIM 结构相似度损失权重
   fft_weight: 0.1           # 频域 L1 损失权重（增强高频细节）
 

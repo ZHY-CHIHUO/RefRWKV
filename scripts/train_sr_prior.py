@@ -123,12 +123,13 @@ def validate_config(cfg):
     lr_scheduler = str(mc.get("lr_scheduler", "plateau")).lower()
     if lr_scheduler not in {"plateau", "cosine"}:
         raise ValueError("model.lr_scheduler 只能是 plateau 或 cosine")
-    _require_int(mc.get("lr_patience", 1), "model.lr_patience", minimum=0)
+    _require_int(mc.get("lr_patience", 2), "model.lr_patience", minimum=0)
     _require_number(mc.get("lr_factor", 0.5), "model.lr_factor", minimum=1e-12, maximum=1.0, maximum_inclusive=False)
     lr_min = mc.get("lr_min", 1e-6)
     _require_number(lr_min, "model.lr_min", minimum=0.0)
     if float(lr_min) > float(learning_rate):
         raise ValueError("model.lr_min 不能大于 model.learning_rate")
+    _require_number(mc.get("lr_threshold", 1e-4), "model.lr_threshold", minimum=0.0)
     _require_int(mc.get("warmup_steps", 0), "model.warmup_steps", minimum=0)
     _require_number(mc.get("grad_clip_norm", 1.0), "model.grad_clip_norm", minimum=0.0)
     _require_number(mc.get("ema_decay", 0.999), "model.ema_decay", minimum=0.0, maximum=1.0, maximum_inclusive=False)
@@ -291,9 +292,10 @@ def build_model(cfg):
         model_sr=model,
         learning_rate=mc.get("learning_rate", 1e-4),
         lr_scheduler=mc.get("lr_scheduler", "plateau"),
-        lr_patience=mc.get("lr_patience", 1),
+        lr_patience=mc.get("lr_patience", 2),
         lr_factor=mc.get("lr_factor", 0.5),
         lr_min=mc.get("lr_min", 1e-6),
+        lr_threshold=mc.get("lr_threshold", 1e-4),
         warmup_steps=mc.get("warmup_steps", 0),
         grad_clip_norm=mc.get("grad_clip_norm", 1.0),
         ema_decay=mc.get("ema_decay", 0.999),
@@ -388,7 +390,9 @@ def check_resume_compatible(ckpt_path: str, lit_model):
     except Exception as exc:
         return False, f"checkpoint 读取失败: {exc}"
     if isinstance(checkpoint, dict) and checkpoint.get("lr_schedulers"):
-        hparams = checkpoint.get("hyper_parameters", {})
+        hparams = checkpoint.get("hyper_parameters") or {}
+        if not hasattr(hparams, "get"):
+            hparams = {}
         saved_scheduler = str(hparams.get("lr_scheduler", "cosine")).lower()
         current_scheduler = str(getattr(lit_model.hparams, "lr_scheduler", "plateau")).lower()
         if saved_scheduler != current_scheduler:
@@ -396,6 +400,26 @@ def check_resume_compatible(ckpt_path: str, lit_model):
                 f"学习率调度器不兼容: checkpoint={saved_scheduler}, "
                 f"当前配置={current_scheduler}；请使用 --load_weights 重新开始优化器状态"
             )
+        if saved_scheduler == "plateau":
+            # A plateau state is resumable only when its update unit is
+            # explicitly recorded as validation.
+            scheduler_states = checkpoint.get("lr_schedulers")
+            scheduler_state = (
+                scheduler_states[0]
+                if isinstance(scheduler_states, (list, tuple)) and scheduler_states
+                else {}
+            )
+            validation_updates = checkpoint.get("plateau_step_unit") == "validation"
+            validation_updates = validation_updates or (
+                "lr_threshold" in hparams
+                and isinstance(scheduler_state, dict)
+                and scheduler_state.get("threshold_mode") == "abs"
+            )
+            if not validation_updates:
+                return False, (
+                    "checkpoint 使用按 epoch 更新的 plateau 状态，无法恢复验证次数；"
+                    "请使用 --load_weights 仅加载模型权重"
+                )
     reference = _normalise_state_dict({key: value for key, value in lit_model.state_dict().items() if torch.is_tensor(value)})
     overlap = sorted(set(state_dict).intersection(reference))
     if not overlap:
@@ -556,9 +580,10 @@ def main():
     scheduler_name = str(mc.get("lr_scheduler", "plateau")).lower()
     if scheduler_name == "plateau":
         logger.info(
-            "  LR: %.1e | plateau: patience=%d epoch(s), factor=%.3g, min=%.1e",
+            "  LR: %.1e | plateau: every validation, patience=%d, threshold=%.1e, factor=%.3g, min=%.1e",
             mc.get("learning_rate", 1e-4),
-            mc.get("lr_patience", 1),
+            mc.get("lr_patience", 2),
+            mc.get("lr_threshold", 1e-4),
             mc.get("lr_factor", 0.5),
             mc.get("lr_min", 1e-6),
         )

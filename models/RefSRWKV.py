@@ -548,9 +548,10 @@ class LitRefSRWKV(pl.LightningModule):
         model_sr: RefSRWKV,
         learning_rate: float = 1e-4,
         lr_scheduler: str = "plateau",
-        lr_patience: int = 1,
+        lr_patience: int = 2,
         lr_factor: float = 0.5,
         lr_min: float = 1e-6,
+        lr_threshold: float = 1e-4,
         warmup_steps: int = 0,
         grad_clip_norm: float = 1.0,
         ema_decay: float = 0.999,
@@ -577,6 +578,8 @@ class LitRefSRWKV(pl.LightningModule):
             raise ValueError("lr_factor 必须位于 (0, 1)")
         if not 0.0 <= float(lr_min) <= float(learning_rate):
             raise ValueError("lr_min 必须位于 [0, learning_rate]")
+        if not math.isfinite(float(lr_threshold)) or float(lr_threshold) < 0.0:
+            raise ValueError("lr_threshold 必须是非负有限数值")
         if not isinstance(warmup_steps, int) or warmup_steps < 0:
             raise ValueError("warmup_steps 必须为非负整数")
         if grad_clip_norm is not None and float(grad_clip_norm) < 0:
@@ -615,6 +618,7 @@ class LitRefSRWKV(pl.LightningModule):
         self.lr_key, self.hr_key, self.ref_key = lr_key, hr_key, ref_key
         self.ema = EMA(decay=float(ema_decay)) if use_ema else None
         self._ema_last_step = -1
+        self._plateau_scheduler = None
 
     def _unpack_batch(self, batch):
         if isinstance(batch, dict):
@@ -765,11 +769,81 @@ class LitRefSRWKV(pl.LightningModule):
     def on_validation_model_eval(self): self._ema_apply()
     def on_validation_model_train(self): self._ema_restore()
     def on_validation_start(self): self._ema_apply()
+    def on_validation_epoch_end(self):
+        # Validation metrics are aggregated by Lightning before this hook.
+        # Step here so monitoring callbacks see the updated optimizer and
+        # scheduler state when they save a checkpoint for this validation run.
+        self._step_plateau_scheduler()
+
     def on_validation_end(self): self._ema_restore()
     def on_test_model_eval(self): self._ema_apply()
     def on_test_model_train(self): self._ema_restore()
     def on_test_start(self): self._ema_apply()
     def on_test_end(self): self._ema_restore()
+
+    def _step_plateau_scheduler(self):
+        """Update ReduceLROnPlateau exactly once after each validation run.
+
+        Lightning's automatic epoch update only sees the last validation of an
+        epoch, while its step update also runs on batches without validation.
+        Calling the scheduler here preserves every validation result without
+        accidentally letting Lightning count only the final epoch metric.
+        """
+        if str(self.hparams.lr_scheduler).lower() != "plateau":
+            return
+        try:
+            trainer = self.trainer
+        except RuntimeError:
+            return
+        if trainer is None or getattr(trainer, "sanity_checking", False):
+            return
+        # During a validation loop nested inside ``fit``, Lightning switches
+        # the running stage to VALIDATING, while ``state.fn`` remains FITTING.
+        # Standalone ``validate()`` must not mutate the optimizer scheduler.
+        run_fn = getattr(getattr(trainer, "state", None), "fn", None)
+        run_fn = getattr(run_fn, "value", run_fn)
+        if run_fn is not None:
+            if str(run_fn).lower() not in {"fit", "fitting"}:
+                return
+
+        scheduler = self._plateau_scheduler
+        if scheduler is None:
+            for config in getattr(trainer, "lr_scheduler_configs", ()):
+                candidate = getattr(config, "scheduler", None)
+                if isinstance(candidate, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler = candidate
+                    self._plateau_scheduler = candidate
+                    break
+        if scheduler is None:
+            return
+
+        callback_metrics = getattr(trainer, "callback_metrics", {}) or {}
+        metric = callback_metrics.get("val_loss")
+        if metric is None:
+            raise RuntimeError("ReduceLROnPlateau 需要验证指标 val_loss，但当前验证未记录该指标")
+        if torch.is_tensor(metric):
+            if metric.numel() != 1 or not torch.isfinite(metric.detach()).item():
+                raise RuntimeError(f"验证指标 val_loss 必须是有限标量，得到 {metric}")
+            metric = metric.detach().float().item()
+        else:
+            metric = float(metric)
+        if not math.isfinite(metric):
+            raise RuntimeError(f"验证指标 val_loss 必须是有限标量，得到 {metric}")
+        scheduler.step(metric)
+
+    def lr_scheduler_step(self, scheduler, metric):
+        # Plateau is stepped manually in on_validation_epoch_end so each
+        # validation counts exactly once. Other scheduler types retain
+        # Lightning's normal step behaviour.
+        if (
+            str(self.hparams.lr_scheduler).lower() == "plateau"
+            and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
+        ):
+            return
+        if metric is None:
+            scheduler.step()
+        else:
+            scheduler.step(metric)
 
     def configure_optimizers(self):
         parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
@@ -785,7 +859,10 @@ class LitRefSRWKV(pl.LightningModule):
                 factor=float(self.hparams.lr_factor),
                 patience=int(self.hparams.lr_patience),
                 min_lr=float(self.hparams.lr_min),
+                threshold=float(self.hparams.lr_threshold),
+                threshold_mode="abs",
             )
+            self._plateau_scheduler = scheduler
             return [optimizer], [{
                 "scheduler": scheduler,
                 "monitor": "val_loss",
@@ -829,6 +906,8 @@ class LitRefSRWKV(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         if self.ema: checkpoint["ema_state_dict"] = self.ema.state_dict()
+        if str(self.hparams.lr_scheduler).lower() == "plateau":
+            checkpoint["plateau_step_unit"] = "validation"
 
     def on_load_checkpoint(self, checkpoint):
         if self.ema and "ema_state_dict" in checkpoint: self.ema.load_state_dict(checkpoint["ema_state_dict"])
@@ -839,7 +918,7 @@ class LitRefSRWKV(pl.LightningModule):
             self._ema_last_step = int(self.global_step)
         scheduler_name = str(self.hparams.lr_scheduler).lower()
         scheduler_text = (
-            f"plateau(patience={self.hparams.lr_patience}, factor={self.hparams.lr_factor}, min={self.hparams.lr_min})"
+            f"plateau(each validation, patience={self.hparams.lr_patience}, threshold={self.hparams.lr_threshold}, factor={self.hparams.lr_factor}, min={self.hparams.lr_min})"
             if scheduler_name == "plateau"
             else f"cosine(warmup={self.hparams.warmup_steps})"
         )

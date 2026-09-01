@@ -82,16 +82,37 @@ conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_10
 
 两个配置均使用 BF16 混合精度与梯度累积。RTX 5060 Ti（16 GiB）已完成上述配置的单次 batch=4 前向、反向与优化器更新。
 
-训练模块由 L1 损失与可选 SSIM、FFT 损失组成；EMA 仅在真实优化器更新后更新，并在验证和测试期间临时应用。默认学习率调度器为 `ReduceLROnPlateau`，监控 `val_loss`：`lr_patience` 表示可容忍的无改善训练 epoch 数，超过该数后学习率乘以 `lr_factor`，最低不小于 `lr_min`。这使训练不依赖预先估计的总轮数；`max_epochs` 仅作为安全上限，实际结束由 early stopping 控制。
+训练模块由 L1 损失与可选 SSIM、FFT 损失组成；EMA 仅在真实 optimizer step 后更新，并在验证和测试期间临时应用。学习率默认使用 `ReduceLROnPlateau`，调度器在每次验证运行结束时读取本次聚合后的 `val_loss`，而不是只在 epoch 末读取一次。
+
+### 学习率调度
+
+两个独立训练配置都使用以下 plateau 规则（具体初始学习率、衰减因子和下限以对应 YAML 为准）：
+
+| 参数 | 含义 |
+| --- | --- |
+| `lr_patience: 2` | 连续 2 次验证没有有效改善后，下一次无效验证触发衰减；因此第 3 次 bad validation 降 LR。 |
+| `lr_threshold: 1.0e-4` | `mode=min` 下，`val_loss` 必须比历史最佳值下降 **超过** 此绝对阈值才算改善。设为 `0` 可关闭最小改善门槛。 |
+| `lr_factor` | 触发时将当前学习率乘以该系数。 |
+| `lr_min` | 学习率下限，不会继续降到该值以下。 |
+
+`val_check_interval` 决定每个 epoch 的验证次数，`lr_patience` 也按这个验证次数计数。例如 `0.2` 通常表示每个 epoch 验证 5 次，因此 patience 不再代表 epoch 数。任何一次达到阈值的中间验证都会立即更新历史最佳值并重置 bad-validation 计数，不会被 epoch 末结果覆盖。`max_epochs` 只是安全上限，实际停止仍由 `early_stopping_patience` 控制。
 
 ### Checkpoint
 
-`--resume` 用于结构完全兼容的 Lightning checkpoint，可恢复优化器与 EMA 状态。`--load_weights` 用于仅加载匹配形状的权重，不匹配参数保留当前初始化。
+`--resume` 用于结构和调度器配置均兼容的 Lightning checkpoint，会恢复模型、optimizer、plateau 计数和 EMA 状态。脚本只接受能够明确识别为“按验证计数”的 plateau 状态，避免把其他计数单位误当成验证计数。`--load_weights` 用于热启动：只加载同名且形状匹配的模型权重，optimizer、调度器和计数器从当前配置重新开始；不匹配参数保留当前初始化。模型结构变更、调度器语义变更或只想使用已有权重时，应使用 `--load_weights`。
 
 ```bash
 conda run -n rwkv7 python scripts/train_sr_prior.py \
   --config configs/sr_prior_4.yaml \
   --load_weights /path/to/weights.ckpt
+```
+
+断点续训示例：
+
+```bash
+conda run -n rwkv7 python scripts/train_sr_prior.py \
+  --config configs/sr_prior_4.yaml \
+  --resume checkpoints/refrwkv_sr_4/last.ckpt
 ```
 
 ## 评测

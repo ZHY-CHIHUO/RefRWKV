@@ -9,9 +9,10 @@ model:
   hidden_rate: 4
   learning_rate: 1.0e-4
   lr_scheduler: plateau
-  lr_patience: 2
+  lr_patience: 2 # 容忍 2 次验证无有效改善，第 3 次触发衰减
   lr_factor: 0.7
   lr_min: 1.0e-7
+  lr_threshold: 1.0e-4 # val_loss 绝对下降需超过此数值才算改善
   grad_clip_norm: 1.0
   ema_decay: 0.999
   use_ema: true

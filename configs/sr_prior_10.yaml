@@ -15,9 +15,10 @@ model:
   # ── 优化器 ──
   learning_rate: 5.0e-5
   lr_scheduler: plateau
-  lr_patience: 1 # 容忍 1 个无改善 epoch，第 2 个触发衰减
+  lr_patience: 2 # 容忍 2 次验证无有效改善，第 3 次触发衰减
   lr_factor: 0.5
   lr_min: 1.0e-6
+  lr_threshold: 1.0e-4 # val_loss 绝对下降需超过此数值才算改善
   # ── 梯度 / EMA ──
   grad_clip_norm: 1.0        # LitRefSRWKV 内部的 fallback 值
   ema_decay: 0.999            # EMA 衰减率
