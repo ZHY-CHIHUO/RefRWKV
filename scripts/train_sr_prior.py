@@ -203,7 +203,9 @@ def _materialize_run_config(config):
         output_cfg["checkpoint_dir"] = str(Path(checkpoint_root) / f"{prefix}_{run_name}")
     if not output_cfg.get("log_dir"):
         log_root = output_cfg.get("log_root", "logs")
-        output_cfg["log_dir"] = str(Path(log_root) / f"{prefix}_{run_name}")
+        # TensorBoardLogger adds ``name`` below this root, yielding a stable
+        # layout such as logs/refrwkv_sr/aid_x4_l1/version_0.
+        output_cfg["log_dir"] = str(Path(log_root) / prefix)
 
     # Prepared remote-sensing variants record their actual degradation scale.
     # Check it when metadata is present, but keep custom datasets usable.
