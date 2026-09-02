@@ -2,7 +2,9 @@
 """
 RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
 """
+
 import torch
+
 try:
     torch.set_float32_matmul_precision("high")
 except AttributeError:
@@ -21,7 +23,14 @@ _cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 # Window stages are named after the U-Net path.  Keeping the names here makes
 # the YAML schema and checkpoint signature independent of module attributes.
 _WINDOW_STAGE_NAMES = (
-    "enc1", "enc2", "enc3", "latent", "dec3", "dec2", "dec1", "refine",
+    "enc1",
+    "enc2",
+    "enc3",
+    "latent",
+    "dec3",
+    "dec2",
+    "dec1",
+    "refine",
 )
 _WINDOW_LEVEL_ALIASES = {
     "level1": ("enc1", "dec1", "refine"),
@@ -60,8 +69,9 @@ def _window_offsets(value, size, name):
     return tuple(offsets)
 
 
-def _parse_window_spec(raw, stage_name, *, fallback=None, default_size=8,
-                       default_shift=4, default_cycle=2):
+def _parse_window_spec(
+    raw, stage_name, *, fallback=None, default_size=8, default_shift=4, default_cycle=2
+):
     """Parse one stage's compact window specification into canonical values."""
     if raw is None:
         raw = {}
@@ -95,8 +105,14 @@ def _parse_window_spec(raw, stage_name, *, fallback=None, default_size=8,
                     raw_cycle = fallback["shift_cycle"]
                 else:
                     raw_cycle = default_cycle
-            raw_shift = _window_nonnegative_int(raw_shift, f"windows.{stage_name}.shift_size")
-            if isinstance(raw_cycle, bool) or not isinstance(raw_cycle, int) or raw_cycle < 1:
+            raw_shift = _window_nonnegative_int(
+                raw_shift, f"windows.{stage_name}.shift_size"
+            )
+            if (
+                isinstance(raw_cycle, bool)
+                or not isinstance(raw_cycle, int)
+                or raw_cycle < 1
+            ):
                 raise ValueError(f"windows.{stage_name}.shift_cycle 必须是正整数")
             offsets = _window_offsets(
                 [index * raw_shift for index in range(raw_cycle)],
@@ -109,13 +125,18 @@ def _parse_window_spec(raw, stage_name, *, fallback=None, default_size=8,
     return {
         "size": size,
         "offsets": tuple(offsets),
-        "shift_size": raw.get("shift_size", raw.get("shift", fallback.get("shift_size"))),
-        "shift_cycle": raw.get("shift_cycle", raw.get("cycle", fallback.get("shift_cycle"))),
+        "shift_size": raw.get(
+            "shift_size", raw.get("shift", fallback.get("shift_size"))
+        ),
+        "shift_cycle": raw.get(
+            "shift_cycle", raw.get("cycle", fallback.get("shift_cycle"))
+        ),
     }
 
 
-def normalize_window_config(windows=None, *, window_size=8, shift_size=3,
-                            shift_cycle=3, phase_mode=None):
+def normalize_window_config(
+    windows=None, *, window_size=8, shift_size=3, shift_cycle=3, phase_mode=None
+):
     """Return canonical per-stage windows and phase indexing mode.
 
     With no ``windows`` mapping this intentionally preserves the original
@@ -128,24 +149,31 @@ def normalize_window_config(windows=None, *, window_size=8, shift_size=3,
         shift = _window_nonnegative_int(shift_size, "shift_size")
         if shift >= size:
             raise ValueError("shift_size 必须小于 window_size")
-        if isinstance(shift_cycle, bool) or not isinstance(shift_cycle, int) or shift_cycle < 1:
+        if (
+            isinstance(shift_cycle, bool)
+            or not isinstance(shift_cycle, int)
+            or shift_cycle < 1
+        ):
             raise ValueError("shift_cycle 必须是正整数")
         offsets = _window_offsets(
             [index * shift for index in range(shift_cycle)], size, "shift_offsets"
         )
         mode = "global" if phase_mode is None else str(phase_mode).lower()
         stages = {
-            name: {"size": size, "offsets": offsets}
-            for name in _WINDOW_STAGE_NAMES
+            name: {"size": size, "offsets": offsets} for name in _WINDOW_STAGE_NAMES
         }
     else:
         mode = phase_mode
         if isinstance(windows, (list, tuple)):
             if len(windows) != 4:
-                raise ValueError("windows 列表必须按 level1、level2、level3、latent 提供四项")
+                raise ValueError(
+                    "windows 列表必须按 level1、level2、level3、latent 提供四项"
+                )
             windows = {
-                "level1": windows[0], "level2": windows[1],
-                "level3": windows[2], "latent": windows[3],
+                "level1": windows[0],
+                "level2": windows[1],
+                "level3": windows[2],
+                "latent": windows[3],
             }
         if not isinstance(windows, dict):
             raise ValueError("windows 必须是 mapping 或四项列表")
@@ -159,15 +187,31 @@ def normalize_window_config(windows=None, *, window_size=8, shift_size=3,
             mode = windows.get("phase_mode") if isinstance(windows, dict) else None
         mode = "local" if mode is None else str(mode).lower()
 
-        flat_keys = {"size", "window_size", "offsets", "shift_offsets", "shift_size", "shift", "shift_cycle", "cycle"}
+        flat_keys = {
+            "size",
+            "window_size",
+            "offsets",
+            "shift_offsets",
+            "shift_size",
+            "shift",
+            "shift_cycle",
+            "cycle",
+        }
         default_raw = stage_map.get("default")
         if default_raw is None and flat_keys.intersection(stage_map):
             default_raw = {key: stage_map[key] for key in flat_keys if key in stage_map}
-        default = _parse_window_spec(
-            default_raw, "default", fallback=None,
-            default_size=window_size, default_shift=window_size // 2,
-            default_cycle=2,
-        ) if default_raw is not None else None
+        default = (
+            _parse_window_spec(
+                default_raw,
+                "default",
+                fallback=None,
+                default_size=window_size,
+                default_shift=window_size // 2,
+                default_cycle=2,
+            )
+            if default_raw is not None
+            else None
+        )
 
         stages = {}
         for stage_name in _WINDOW_STAGE_NAMES:
@@ -180,12 +224,16 @@ def normalize_window_config(windows=None, *, window_size=8, shift_size=3,
             if raw is None:
                 raw = default
             parsed = _parse_window_spec(
-                raw, stage_name, fallback=default,
-                default_size=window_size, default_shift=window_size // 2,
+                raw,
+                stage_name,
+                fallback=default,
+                default_size=window_size,
+                default_shift=window_size // 2,
                 default_cycle=2,
             )
             stages[stage_name] = {
-                "size": parsed["size"], "offsets": parsed["offsets"],
+                "size": parsed["size"],
+                "offsets": parsed["offsets"],
             }
 
     if mode in {"stage", "stage_local", "local"}:
@@ -196,56 +244,97 @@ def normalize_window_config(windows=None, *, window_size=8, shift_size=3,
         raise ValueError("window phase_mode 只能是 local 或 global")
     return {"phase_mode": mode, "stages": stages}
 
+
 # ═══════════════════════════════════════════════════════════
 # CUDA WKV 算子封装
 # ═══════════════════════════════════════════════════════════
 _wkv_cuda = None
 _wkv_load_error = None
 
+
 def _get_wkv_cuda():
     global _wkv_cuda, _wkv_load_error
-    if _wkv_cuda is not None: return _wkv_cuda
-    if _wkv_load_error is not None: raise RuntimeError("Bi-WKV CUDA 扩展加载失败") from _wkv_load_error
-    if not torch.cuda.is_available(): raise RuntimeError("Bi-WKV 需要 CUDA 环境")
-    if not os.path.isfile(os.path.join(_cuda_dir, "bi_wkv.cpp")) or not os.path.isfile(os.path.join(_cuda_dir, "bi_wkv_kernel.cu")):
+    if _wkv_cuda is not None:
+        return _wkv_cuda
+    if _wkv_load_error is not None:
+        raise RuntimeError("Bi-WKV CUDA 扩展加载失败") from _wkv_load_error
+    if not torch.cuda.is_available():
+        raise RuntimeError("Bi-WKV 需要 CUDA 环境")
+    if not os.path.isfile(os.path.join(_cuda_dir, "bi_wkv.cpp")) or not os.path.isfile(
+        os.path.join(_cuda_dir, "bi_wkv_kernel.cu")
+    ):
         raise FileNotFoundError(f"Bi-WKV CUDA 源文件不存在: {_cuda_dir}")
     cap = torch.cuda.get_device_capability()
     arch, sm = f"compute_{cap[0]}{cap[1]}", f"sm_{cap[0]}{cap[1]}"
     try:
         _wkv_cuda = load(
             name="bi_wkv",
-            sources=[os.path.join(_cuda_dir, "bi_wkv.cpp"), os.path.join(_cuda_dir, "bi_wkv_kernel.cu")],
+            sources=[
+                os.path.join(_cuda_dir, "bi_wkv.cpp"),
+                os.path.join(_cuda_dir, "bi_wkv_kernel.cu"),
+            ],
             verbose=True,
-            extra_cuda_cflags=["-res-usage", "--maxrregcount 60", "--use_fast_math", "-O3", "-Xptxas -O3",
-                               f"-gencode arch={arch},code={sm}", f"-gencode arch={arch},code={arch}"],
+            extra_cuda_cflags=[
+                "-res-usage",
+                "--maxrregcount 60",
+                "--use_fast_math",
+                "-O3",
+                "-Xptxas -O3",
+                f"-gencode arch={arch},code={sm}",
+                f"-gencode arch={arch},code={arch}",
+            ],
         )
     except Exception as exc:
         _wkv_load_error = exc
-        raise RuntimeError(f"Bi-WKV CUDA 扩展编译/加载失败 (sm_{cap[0]}{cap[1]})") from exc
+        raise RuntimeError(
+            f"Bi-WKV CUDA 扩展编译/加载失败 (sm_{cap[0]}{cap[1]})"
+        ) from exc
     return _wkv_cuda
 
-try: _compiler_disable = torch.compiler.disable
+
+try:
+    _compiler_disable = torch.compiler.disable
 except AttributeError:
-    def _compiler_disable(fn=None, **kwargs): return fn if fn is not None else (lambda f: f)
+
+    def _compiler_disable(fn=None, **kwargs):
+        return fn if fn is not None else (lambda f: f)
+
 
 class WKV(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, u, k, v):
         half_mode, bf_mode = w.dtype == torch.half, w.dtype == torch.bfloat16
         ctx.save_for_backward(w, u, k, v)
-        y = _get_wkv_cuda().bi_wkv_forward(w.float().contiguous(), u.float().contiguous(), k.float().contiguous(), v.float().contiguous())
+        y = _get_wkv_cuda().bi_wkv_forward(
+            w.float().contiguous(),
+            u.float().contiguous(),
+            k.float().contiguous(),
+            v.float().contiguous(),
+        )
         return y.half() if half_mode else (y.bfloat16() if bf_mode else y)
+
     @staticmethod
     def backward(ctx, gy):
         w, u, k, v = ctx.saved_tensors
         half_mode, bf_mode = w.dtype == torch.half, w.dtype == torch.bfloat16
-        gw, gu, gk, gv = _get_wkv_cuda().bi_wkv_backward(w.float().contiguous(), u.float().contiguous(), k.float().contiguous(), v.float().contiguous(), gy.float().contiguous())
-        if half_mode: return (gw.half(), gu.half(), gk.half(), gv.half())
-        if bf_mode: return (gw.bfloat16(), gu.bfloat16(), gk.bfloat16(), gv.bfloat16())
+        gw, gu, gk, gv = _get_wkv_cuda().bi_wkv_backward(
+            w.float().contiguous(),
+            u.float().contiguous(),
+            k.float().contiguous(),
+            v.float().contiguous(),
+            gy.float().contiguous(),
+        )
+        if half_mode:
+            return (gw.half(), gu.half(), gk.half(), gv.half())
+        if bf_mode:
+            return (gw.bfloat16(), gu.bfloat16(), gk.bfloat16(), gv.bfloat16())
         return (gw, gu, gk, gv)
 
+
 @_compiler_disable()
-def RUN_CUDA(w, u, k, v): return WKV.apply(w.float(), u.float(), k.float(), v.float())
+def RUN_CUDA(w, u, k, v):
+    return WKV.apply(w.float(), u.float(), k.float(), v.float())
+
 
 # ═══════════════════════════════════════════════════════════
 # 基础组件
@@ -254,12 +343,18 @@ class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
         super().__init__()
         self.drop_prob, self.scale_by_keep = drop_prob, scale_by_keep
+
     def forward(self, x):
-        if self.drop_prob == 0.0 or not self.training: return x
+        if self.drop_prob == 0.0 or not self.training:
+            return x
         keep_prob = 1.0 - self.drop_prob
-        random_tensor = x.new_empty((x.shape[0],) + (1,) * (x.ndim - 1)).bernoulli_(keep_prob)
-        if keep_prob > 0.0 and self.scale_by_keep: random_tensor.div_(keep_prob)
+        random_tensor = x.new_empty((x.shape[0],) + (1,) * (x.ndim - 1)).bernoulli_(
+            keep_prob
+        )
+        if keep_prob > 0.0 and self.scale_by_keep:
+            random_tensor.div_(keep_prob)
         return x * random_tensor
+
 
 class OmniShift(nn.Module):
     def __init__(self, dim):
@@ -272,35 +367,65 @@ class OmniShift(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))
         self.register_buffer("conv5x5_reparam_weight", torch.zeros(dim, 1, 5, 5))
         self._reparam_done = False
+
     def forward_train(self, x):
         alpha = torch.softmax(self.alpha, dim=0)
-        shifted = alpha[0]*x + alpha[1]*self.conv1x1(x) + alpha[2]*self.conv3x3(x) + alpha[3]*self.conv5x5(x)
+        shifted = (
+            alpha[0] * x
+            + alpha[1] * self.conv1x1(x)
+            + alpha[2] * self.conv3x3(x)
+            + alpha[3] * self.conv5x5(x)
+        )
         return x + torch.tanh(self.gate) * (shifted - x)
+
     def reparam_5x5(self):
-        if self._reparam_done: return
+        if self._reparam_done:
+            return
         with torch.no_grad():
             g, alpha = torch.tanh(self.gate), torch.softmax(self.alpha, dim=0)
             weight = self.conv1x1.weight
-            identity = torch.zeros(self.dim, 1, 5, 5, device=weight.device, dtype=weight.dtype)
+            identity = torch.zeros(
+                self.dim, 1, 5, 5, device=weight.device, dtype=weight.dtype
+            )
             identity[:, :, 2, 2] = 1.0
-            w1, w3, w5 = F.pad(weight, (2,2,2,2)), F.pad(self.conv3x3.weight, (1,1,1,1)), self.conv5x5.weight
-            self.conv5x5_reparam_weight.copy_((1.0-g)*identity + g*(alpha[0]*identity + alpha[1]*w1 + alpha[2]*w3 + alpha[3]*w5))
+            w1, w3, w5 = (
+                F.pad(weight, (2, 2, 2, 2)),
+                F.pad(self.conv3x3.weight, (1, 1, 1, 1)),
+                self.conv5x5.weight,
+            )
+            self.conv5x5_reparam_weight.copy_(
+                (1.0 - g) * identity
+                + g
+                * (alpha[0] * identity + alpha[1] * w1 + alpha[2] * w3 + alpha[3] * w5)
+            )
         self._reparam_done = True
+
     def forward(self, x):
         if self.training:
             self._reparam_done = False
             return self.forward_train(x)
-        if not self._reparam_done: self.reparam_5x5()
+        if not self._reparam_done:
+            self.reparam_5x5()
         return F.conv2d(x, self.conv5x5_reparam_weight, padding=2, groups=self.dim)
+
 
 # ═══════════════════════════════════════════════════════════
 # RWKV 空间与通道混合模块
 # ═══════════════════════════════════════════════════════════
 class VRWKV_SpatialMix(nn.Module):
-    def __init__(self, n_embd, head_dim=64, window_size=8, shift_size=3,
-                 num_groups=None, shift_offsets=None, shift_cycle=3):
+    def __init__(
+        self,
+        n_embd,
+        head_dim=64,
+        window_size=8,
+        shift_size=3,
+        num_groups=None,
+        shift_offsets=None,
+        shift_cycle=3,
+    ):
         super().__init__()
-        if num_groups is None: num_groups = max(1, n_embd // 16)
+        if num_groups is None:
+            num_groups = max(1, n_embd // 16)
         if not isinstance(num_groups, int) or num_groups < 1:
             raise ValueError("num_groups 必须为正整数")
         if not isinstance(window_size, int) or not isinstance(shift_size, int):
@@ -310,9 +435,15 @@ class VRWKV_SpatialMix(nn.Module):
         if window_size < 1 or shift_size < 0:
             raise ValueError("window_size 必须为正数，且 shift_size 必须非负")
         if shift_offsets is None and shift_size >= window_size:
-            raise ValueError("未显式指定 shift_offsets 时必须满足 shift_size < window_size")
+            raise ValueError(
+                "未显式指定 shift_offsets 时必须满足 shift_size < window_size"
+            )
         if shift_offsets is None:
-            if isinstance(shift_cycle, bool) or not isinstance(shift_cycle, int) or shift_cycle < 1:
+            if (
+                isinstance(shift_cycle, bool)
+                or not isinstance(shift_cycle, int)
+                or shift_cycle < 1
+            ):
                 raise ValueError("shift_cycle 必须是正整数")
             offsets = [index * shift_size for index in range(shift_cycle)]
         else:
@@ -320,19 +451,34 @@ class VRWKV_SpatialMix(nn.Module):
         offsets = _window_offsets(offsets, window_size, "shift_offsets")
         self.n_embd, self.window_size, self.shift_size = n_embd, window_size, shift_size
         self.shift_offsets = offsets
-        self.num_groups, self.group_dim, self.recurrence = num_groups, n_embd // num_groups, 2
+        self.num_groups, self.group_dim, self.recurrence = (
+            num_groups,
+            n_embd // num_groups,
+            2,
+        )
         self.omni_shift = OmniShift(dim=n_embd)
-        self.key, self.value, self.receptance, self.output = [nn.Linear(n_embd, n_embd, bias=False) for _ in range(4)]
+        self.key, self.value, self.receptance, self.output = [
+            nn.Linear(n_embd, n_embd, bias=False) for _ in range(4)
+        ]
         self.register_buffer("scale", torch.tensor(n_embd**0.5))
         with torch.no_grad():
             decay_init = torch.zeros(self.recurrence, n_embd)
             # The CUDA kernel expects a positive distance-decay coefficient.
             for g in range(num_groups):
                 target_decay = 0.5 * (g + 1)
-                decay_init[:, g*self.group_dim:(g+1)*self.group_dim] = math.log(math.expm1(target_decay))
-            self.spatial_decay, self.spatial_first = nn.Parameter(decay_init), nn.Parameter(torch.zeros(self.recurrence, n_embd))
+                decay_init[:, g * self.group_dim : (g + 1) * self.group_dim] = math.log(
+                    math.expm1(target_decay)
+                )
+            self.spatial_decay, self.spatial_first = nn.Parameter(
+                decay_init
+            ), nn.Parameter(torch.zeros(self.recurrence, n_embd))
         mid_ch = max(n_embd // 4, 8)
-        self.channel_gate = nn.Sequential(nn.Conv2d(n_embd, mid_ch, 1, bias=True), nn.ReLU(inplace=True), nn.Conv2d(mid_ch, n_embd, 1, bias=True), nn.Sigmoid())
+        self.channel_gate = nn.Sequential(
+            nn.Conv2d(n_embd, mid_ch, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, n_embd, 1, bias=True),
+            nn.Sigmoid(),
+        )
 
     def jit_func(self, x, resolution):
         h, w = resolution
@@ -344,22 +490,31 @@ class VRWKV_SpatialMix(nn.Module):
         s, ws = self.scale, self.window_size
         for j in range(self.recurrence):
             dj, fj = F.softplus(self.spatial_decay[j]) / s, self.spatial_first[j] / s
-            if j % 2 == 0: v = RUN_CUDA(dj, fj, k, v)
+            if j % 2 == 0:
+                v = RUN_CUDA(dj, fj, k, v)
             else:
-                kt, vt = rearrange(k, "b (h w) c -> b (w h) c", h=ws, w=ws), rearrange(v, "b (h w) c -> b (w h) c", h=ws, w=ws)
-                v = rearrange(RUN_CUDA(dj, fj, kt, vt), "b (w h) c -> b (h w) c", h=ws, w=ws)
+                kt, vt = rearrange(k, "b (h w) c -> b (w h) c", h=ws, w=ws), rearrange(
+                    v, "b (h w) c -> b (w h) c", h=ws, w=ws
+                )
+                v = rearrange(
+                    RUN_CUDA(dj, fj, kt, vt), "b (w h) c -> b (h w) c", h=ws, w=ws
+                )
         return sr * v
 
     def forward(self, x, resolution, layer_idx=0):
         B, T, C = x.size()
         h, w, ws = resolution[0], resolution[1], self.window_size
         if T != h * w or C != self.n_embd:
-            raise ValueError(f"SpatialMix 输入形状与 resolution 不一致: x={tuple(x.shape)}, resolution={resolution}")
+            raise ValueError(
+                f"SpatialMix 输入形状与 resolution 不一致: x={tuple(x.shape)}, resolution={resolution}"
+            )
         sr, k, v = self.jit_func(x, resolution)
         if isinstance(layer_idx, bool) or not isinstance(layer_idx, int):
             raise ValueError(f"layer_idx 必须是整数，得到 {layer_idx!r}")
         shift_amt = self.shift_offsets[layer_idx % len(self.shift_offsets)]
-        k, v, sr = [rearrange(t, "b (hh ww) c -> b hh ww c", hh=h, ww=w) for t in (k, v, sr)]
+        k, v, sr = [
+            rearrange(t, "b (hh ww) c -> b hh ww c", hh=h, ww=w) for t in (k, v, sr)
+        ]
 
         # Shift the window origin without circular wrap-around.  Content is
         # padded on the top/left, then the bottom/right is padded to a window
@@ -373,53 +528,94 @@ class VRWKV_SpatialMix(nn.Module):
         if Hp % ws or Wp % ws:
             raise RuntimeError(f"窗口 padding 失败: ({Hp}, {Wp}) 不能被窗口 {ws} 整除")
 
-        k, v, sr = [rearrange(t, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws) for t in (k, v, sr)]
+        k, v, sr = [
+            rearrange(t, "b (nh w1) (nw w2) c -> (b nh nw) (w1 w2) c", w1=ws, w2=ws)
+            for t in (k, v, sr)
+        ]
         out = self._window_wkv(k, v, sr)
-        out = rearrange(out, "(b nh nw) (w1 w2) c -> b (nh w1) (nw w2) c", nh=Hp // ws, nw=Wp // ws, w1=ws, w2=ws)
-        out = out[:, shift_amt:shift_amt + h, shift_amt:shift_amt + w, :]
+        out = rearrange(
+            out,
+            "(b nh nw) (w1 w2) c -> b (nh w1) (nw w2) c",
+            nh=Hp // ws,
+            nw=Wp // ws,
+            w1=ws,
+            w2=ws,
+        )
+        out = out[:, shift_amt : shift_amt + h, shift_amt : shift_amt + w, :]
 
         out = out * self.channel_gate(out.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
         return self.output(rearrange(out, "b hh ww c -> b (hh ww) c"))
+
 
 class VRWKV_ChannelMix(nn.Module):
     def __init__(self, n_embd, hidden_rate=4):
         super().__init__()
         hidden_sz = int(hidden_rate * n_embd)
-        self.key, self.omni_shift, self.receptance, self.value = nn.Linear(n_embd, hidden_sz, bias=False), OmniShift(dim=n_embd), nn.Linear(n_embd, n_embd, bias=False), nn.Linear(hidden_sz, n_embd, bias=False)
+        self.key, self.omni_shift, self.receptance, self.value = (
+            nn.Linear(n_embd, hidden_sz, bias=False),
+            OmniShift(dim=n_embd),
+            nn.Linear(n_embd, n_embd, bias=False),
+            nn.Linear(hidden_sz, n_embd, bias=False),
+        )
+
     def forward(self, x, resolution):
         h, w = resolution
         x = self.omni_shift(rearrange(x, "b (h w) c -> b c h w", h=h, w=w))
         x = rearrange(x, "b c h w -> b (h w) c")
-        return torch.sigmoid(self.receptance(x)) * self.value(torch.square(torch.relu(self.key(x))))
+        return torch.sigmoid(self.receptance(x)) * self.value(
+            torch.square(torch.relu(self.key(x)))
+        )
+
 
 class Block(nn.Module):
-    def __init__(self, n_embd, hidden_rate=4, drop_path=0.0, layer_idx=0,
-                 window_size=8, shift_offsets=None):
+    def __init__(
+        self,
+        n_embd,
+        hidden_rate=4,
+        drop_path=0.0,
+        layer_idx=0,
+        window_size=8,
+        shift_offsets=None,
+    ):
         super().__init__()
-        if isinstance(layer_idx, bool) or not isinstance(layer_idx, int) or layer_idx < 0:
+        if (
+            isinstance(layer_idx, bool)
+            or not isinstance(layer_idx, int)
+            or layer_idx < 0
+        ):
             raise ValueError("layer_idx 必须是非负整数")
         if shift_offsets is None:
             # Preserve the historical direct-Block default, while making a
             # custom window usable without having to spell out its phases.
             shift_offsets = (0, 3, 6) if window_size == 8 else (0, window_size // 2)
-        self.layer_idx, self.ln1, self.ln2 = layer_idx, nn.LayerNorm(n_embd), nn.LayerNorm(n_embd)
+        self.layer_idx, self.ln1, self.ln2 = (
+            layer_idx,
+            nn.LayerNorm(n_embd),
+            nn.LayerNorm(n_embd),
+        )
         self.att = VRWKV_SpatialMix(
             n_embd,
             window_size=window_size,
             shift_offsets=shift_offsets,
         )
         self.ffn = VRWKV_ChannelMix(n_embd, hidden_rate)
-        self.gamma1, self.gamma2 = nn.Parameter(torch.ones(n_embd)), nn.Parameter(torch.ones(n_embd))
+        self.gamma1, self.gamma2 = nn.Parameter(torch.ones(n_embd)), nn.Parameter(
+            torch.ones(n_embd)
+        )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
     def forward(self, x):
         b, c, h, w = x.shape
         resolution = (h, w)
         x = rearrange(x, "b c h w -> b (h w) c")
-        x = x + self.drop_path(self.gamma1 * self.att(self.ln1(x), resolution, self.layer_idx))
+        x = x + self.drop_path(
+            self.gamma1 * self.att(self.ln1(x), resolution, self.layer_idx)
+        )
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         x = rearrange(x, "b c h w -> b (h w) c")
         x = x + self.drop_path(self.gamma2 * self.ffn(self.ln2(x), resolution))
         return rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
+
 
 # ═══════════════════════════════════════════════════════════
 # 空间缩放与特征融合
@@ -428,47 +624,78 @@ class Downsample(nn.Module):
     def __init__(self, n_feat, channel_scale=2):
         super().__init__()
         mid_channels = n_feat * channel_scale // 4
-        self.body = nn.Sequential(nn.Conv2d(n_feat, mid_channels, 3, 1, 1, bias=False), nn.PixelUnshuffle(2))
-    def forward(self, x): return self.body(x)
+        self.body = nn.Sequential(
+            nn.Conv2d(n_feat, mid_channels, 3, 1, 1, bias=False), nn.PixelUnshuffle(2)
+        )
+
+    def forward(self, x):
+        return self.body(x)
+
 
 class Upsample(nn.Module):
     def __init__(self, n_feat, channel_scale=0.5):
         super().__init__()
         mid_channels = int(n_feat * channel_scale * 4)
-        self.body = nn.Sequential(nn.Conv2d(n_feat, mid_channels, 3, 1, 1, bias=False), nn.PixelShuffle(2))
-    def forward(self, x): return self.body(x)
+        self.body = nn.Sequential(
+            nn.Conv2d(n_feat, mid_channels, 3, 1, 1, bias=False), nn.PixelShuffle(2)
+        )
+
+    def forward(self, x):
+        return self.body(x)
+
 
 def _gn_groups(num_channels: int, max_groups: int = 32) -> int:
     for g in range(min(max_groups, num_channels), 0, -1):
-        if num_channels % g == 0: return g
+        if num_channels % g == 0:
+            return g
     return 1
+
 
 class GatedFusion(nn.Module):
     def __init__(self, dim, reduction=4):
         super().__init__()
         self.fuse_conv = nn.Conv2d(dim * 2, dim, 1, bias=False)
         self.norm = nn.GroupNorm(_gn_groups(dim), dim)
-        self.gate = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, max(dim // reduction, 8), 1), nn.ReLU(inplace=True), nn.Conv2d(max(dim // reduction, 8), dim, 1), nn.Sigmoid())
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, max(dim // reduction, 8), 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(dim // reduction, 8), dim, 1),
+            nn.Sigmoid(),
+        )
         nn.init.trunc_normal_(self.fuse_conv.weight, std=0.02)
         nn.init.constant_(self.gate[-2].bias, 0.0)
+
     def forward(self, lr_feat, ref_feat):
         sim = F.cosine_similarity(lr_feat, ref_feat, dim=1).unsqueeze(1)
         # ★ 修复：将 [-1, 1] 线性映射到 [0, 1]，避免 sigmoid 导致的过度抑制
-        conf = (sim + 1.0) / 2.0  
+        conf = (sim + 1.0) / 2.0
         fused = self.norm(self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1)))
         return lr_feat + self.gate(fused) * conf * fused
+
 
 # ═══════════════════════════════════════════════════════════
 # 核心超分网络
 # ═══════════════════════════════════════════════════════════
 class RefSRWKV(nn.Module):
-    def __init__(self, inp_channels: int = 3, out_channels: int = 3, dim: int = 48,
-                 num_blocks: tuple = (4, 6, 6, 8), num_refinement_blocks: int = 4,
-                 scale: int = 4, hr_size: int = 480,
-                 drop_path_rate: float = 0.1, hidden_rate: int = 4,
-                 ref_channels: int = None, windows=None, window_size: int = 8,
-                 shift_size: int = 3, shift_cycle: int = 3,
-                 window_phase_mode: str = None):
+    def __init__(
+        self,
+        inp_channels: int = 3,
+        out_channels: int = 3,
+        dim: int = 48,
+        num_blocks: tuple = (4, 6, 6, 8),
+        num_refinement_blocks: int = 4,
+        scale: int = 4,
+        hr_size: int = 480,
+        drop_path_rate: float = 0.1,
+        hidden_rate: int = 4,
+        ref_channels: int = None,
+        windows=None,
+        window_size: int = 8,
+        shift_size: int = 3,
+        shift_cycle: int = 3,
+        window_phase_mode: str = None,
+    ):
         super().__init__()
         if not isinstance(num_blocks, (tuple, list)) or len(num_blocks) != 4:
             raise ValueError("num_blocks 必须包含四个编码器层的 block 数")
@@ -485,11 +712,18 @@ class RefSRWKV(nn.Module):
             raise ValueError("scale 必须为正整数")
         if not isinstance(hr_size, int) or hr_size <= 0:
             raise ValueError("hr_size 必须为正整数")
-        if not math.isfinite(float(drop_path_rate)) or not 0.0 <= float(drop_path_rate) < 1.0:
+        if (
+            not math.isfinite(float(drop_path_rate))
+            or not 0.0 <= float(drop_path_rate) < 1.0
+        ):
             raise ValueError("drop_path_rate 必须位于 [0, 1)")
-        if (not isinstance(hidden_rate, (int, float)) or isinstance(hidden_rate, bool)
-                or not math.isfinite(float(hidden_rate)) or hidden_rate <= 0
-                or int(hidden_rate * dim) < 1):
+        if (
+            not isinstance(hidden_rate, (int, float))
+            or isinstance(hidden_rate, bool)
+            or not math.isfinite(float(hidden_rate))
+            or hidden_rate <= 0
+            or int(hidden_rate * dim) < 1
+        ):
             raise ValueError("hidden_rate 必须为正数")
         if ref_channels is None:
             # Reference colour statistics are matched against the LR image,
@@ -530,74 +764,121 @@ class RefSRWKV(nn.Module):
             self.skip_proj = nn.Conv2d(inp_channels, out_channels, 1, bias=False)
 
         self.lr_up = nn.Sequential(
-            nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False), nn.GroupNorm(_gn_groups(dim), dim), nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, 3, padding=1, bias=False), nn.GroupNorm(_gn_groups(dim), dim), nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, 3, padding=2, dilation=2, bias=False), nn.GroupNorm(_gn_groups(dim), dim), nn.ReLU(inplace=True),
+            nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(dim), dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(dim), dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(_gn_groups(dim), dim),
+            nn.ReLU(inplace=True),
         )
-        
+
         self.ref_to_level1 = nn.Sequential(
             nn.PixelUnshuffle(self.ref_down_factor),
-            nn.Conv2d(ref_channels * (self.ref_down_factor ** 2), dim, 1, bias=False),
-            nn.GroupNorm(_gn_groups(dim), dim), nn.ReLU(inplace=True),
+            nn.Conv2d(ref_channels * (self.ref_down_factor**2), dim, 1, bias=False),
+            nn.GroupNorm(_gn_groups(dim), dim),
+            nn.ReLU(inplace=True),
         )
-        self.ref_down2 = nn.Sequential(nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False), nn.GroupNorm(_gn_groups(dim * 2), dim * 2))
-        self.ref_down3 = nn.Sequential(nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, bias=False), nn.GroupNorm(_gn_groups(dim * 4), dim * 4))
-        self.ref_down4 = nn.Sequential(nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False), nn.GroupNorm(_gn_groups(dim * 8), dim * 8))
-        
-        self.fuse1, self.fuse2, self.fuse3, self.fuse4 = GatedFusion(dim), GatedFusion(dim * 2), GatedFusion(dim * 4), GatedFusion(dim * 8)
-        
+        self.ref_down2 = nn.Sequential(
+            nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(dim * 2), dim * 2),
+        )
+        self.ref_down3 = nn.Sequential(
+            nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(dim * 4), dim * 4),
+        )
+        self.ref_down4 = nn.Sequential(
+            nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(dim * 8), dim * 8),
+        )
+
+        self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
+            GatedFusion(dim),
+            GatedFusion(dim * 2),
+            GatedFusion(dim * 4),
+            GatedFusion(dim * 8),
+        )
+
         total_blocks = sum(num_blocks)
-        dp_rates = [drop_path_rate * i / max(1, total_blocks - 1) for i in range(total_blocks)]
+        dp_rates = [
+            drop_path_rate * i / max(1, total_blocks - 1) for i in range(total_blocks)
+        ]
         dp_idx, global_layer_idx = 0, 0
 
         def make_stage(stage_name, channels, count, *, drop_rates=None):
             nonlocal global_layer_idx
             spec = self.window_config["stages"][stage_name]
-            phase_base = global_layer_idx if self.window_config["phase_mode"] == "global" else 0
+            phase_base = (
+                global_layer_idx if self.window_config["phase_mode"] == "global" else 0
+            )
             blocks = []
             for local_idx in range(count):
                 drop_path = 0.0 if drop_rates is None else drop_rates[local_idx]
-                blocks.append(Block(
-                    channels,
-                    hidden_rate,
-                    drop_path,
-                    layer_idx=phase_base + local_idx,
-                    window_size=spec["size"],
-                    shift_offsets=spec["offsets"],
-                ))
+                blocks.append(
+                    Block(
+                        channels,
+                        hidden_rate,
+                        drop_path,
+                        layer_idx=phase_base + local_idx,
+                        window_size=spec["size"],
+                        shift_offsets=spec["offsets"],
+                    )
+                )
             global_layer_idx += count
             return nn.Sequential(*blocks)
 
         self.encoder_level1 = make_stage(
-            "enc1", dim, num_blocks[0], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[0]]
+            "enc1",
+            dim,
+            num_blocks[0],
+            drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[0]],
         )
         dp_idx += num_blocks[0]
         self.down1_2 = Downsample(dim)
         self.encoder_level2 = make_stage(
-            "enc2", dim * 2, num_blocks[1], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[1]]
+            "enc2",
+            dim * 2,
+            num_blocks[1],
+            drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[1]],
         )
         dp_idx += num_blocks[1]
         self.down2_3 = Downsample(dim * 2)
         self.encoder_level3 = make_stage(
-            "enc3", dim * 4, num_blocks[2], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[2]]
+            "enc3",
+            dim * 4,
+            num_blocks[2],
+            drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[2]],
         )
         dp_idx += num_blocks[2]
         self.down3_4 = Downsample(dim * 4)
         self.latent = make_stage(
-            "latent", dim * 8, num_blocks[3], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[3]]
+            "latent",
+            dim * 8,
+            num_blocks[3],
+            drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[3]],
         )
         dp_idx += num_blocks[3]
-        
+
         self.up4_3 = Upsample(dim * 8)
-        self.reduce_chan_level3 = nn.Sequential(nn.Conv2d(dim * 8, dim * 4, 1, bias=False), nn.GroupNorm(_gn_groups(dim * 4), dim * 4))
+        self.reduce_chan_level3 = nn.Sequential(
+            nn.Conv2d(dim * 8, dim * 4, 1, bias=False),
+            nn.GroupNorm(_gn_groups(dim * 4), dim * 4),
+        )
         self.decoder_level3 = make_stage("dec3", dim * 4, num_blocks[2])
         self.up3_2 = Upsample(dim * 4)
-        self.reduce_chan_level2 = nn.Sequential(nn.Conv2d(dim * 4, dim * 2, 1, bias=False), nn.GroupNorm(_gn_groups(dim * 2), dim * 2))
+        self.reduce_chan_level2 = nn.Sequential(
+            nn.Conv2d(dim * 4, dim * 2, 1, bias=False),
+            nn.GroupNorm(_gn_groups(dim * 2), dim * 2),
+        )
         self.decoder_level2 = make_stage("dec2", dim * 2, num_blocks[1])
         self.up2_1 = Upsample(dim * 2)
-        self.reduce_chan_level1 = nn.Sequential(nn.Conv2d(dim * 2, dim, 1, bias=False), nn.GroupNorm(_gn_groups(dim), dim))
+        self.reduce_chan_level1 = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, 1, bias=False), nn.GroupNorm(_gn_groups(dim), dim)
+        )
         self.decoder_level1 = make_stage("dec1", dim, num_blocks[0])
-        
+
         self.refinement = make_stage("refine", dim, num_refinement_blocks)
 
         # d1 lives at HR/4.  Learn the missing four spatial phases with two
@@ -627,8 +908,11 @@ class RefSRWKV(nn.Module):
     def _init_weights(m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None: nn.init.zeros_(m.bias)
-        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)): nn.init.zeros_(m.bias); nn.init.ones_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+            nn.init.zeros_(m.bias)
+            nn.init.ones_(m.weight)
 
     def _match_color(self, ref, target):
         # Keep statistics in float32: bf16/half spatial reductions can lose
@@ -651,7 +935,9 @@ class RefSRWKV(nn.Module):
 
     def forward(self, lr, ref):
         if lr.ndim != 4 or ref.ndim != 4:
-            raise ValueError(f"lr/ref 必须是 4D NCHW 张量，得到 {lr.shape} 和 {ref.shape}")
+            raise ValueError(
+                f"lr/ref 必须是 4D NCHW 张量，得到 {lr.shape} 和 {ref.shape}"
+            )
         if lr.shape[0] != ref.shape[0]:
             raise ValueError(f"lr/ref batch 不一致: {lr.shape[0]} vs {ref.shape[0]}")
         if lr.shape[1] != self.inp_channels:
@@ -661,15 +947,20 @@ class RefSRWKV(nn.Module):
         if lr.shape[2] < 1 or lr.shape[3] < 1 or ref.shape[2] < 1 or ref.shape[3] < 1:
             raise ValueError("lr/ref 的空间尺寸必须为正数")
         target_hr_h, target_hr_w = ref.shape[2], ref.shape[3]
-        lr_hr_input = F.interpolate(lr, size=(target_hr_h, target_hr_w), mode="bicubic", align_corners=False)
+        lr_hr_input = F.interpolate(
+            lr, size=(target_hr_h, target_hr_w), mode="bicubic", align_corners=False
+        )
         ref_aligned = self._match_color(ref, lr_hr_input)
         lr_hr = self.skip_proj(lr_hr_input)
-        
+
         if target_hr_h % self.ref_down_factor or target_hr_w % self.ref_down_factor:
             raise ValueError(
                 f"ref 空间尺寸 {target_hr_h}x{target_hr_w} 必须能被 {self.ref_down_factor} 整除"
             )
-        int_h, int_w = target_hr_h // self.ref_down_factor, target_hr_w // self.ref_down_factor
+        int_h, int_w = (
+            target_hr_h // self.ref_down_factor,
+            target_hr_w // self.ref_down_factor,
+        )
         if int_h % 8 or int_w % 8:
             raise ValueError(
                 f"内部网格 {int_h}x{int_w} 必须可被 8 整除，以通过三级 U-Net 下采样"
@@ -680,40 +971,57 @@ class RefSRWKV(nn.Module):
         # incoming HR/LR geometry instead of shrinking a larger test image to
         # the training patch.
         if lr.shape[2] != int_h or lr.shape[3] != int_w:
-            lr_int = F.interpolate(lr, size=(int_h, int_w), mode="bicubic", align_corners=False)
+            lr_int = F.interpolate(
+                lr, size=(int_h, int_w), mode="bicubic", align_corners=False
+            )
         else:
             lr_int = lr
 
         target_ref_size = (int_h * self.ref_down_factor, int_w * self.ref_down_factor)
         if ref_aligned.shape[2:] != target_ref_size:
-            ref_int = F.interpolate(ref_aligned, size=target_ref_size, mode="bicubic", align_corners=False)
+            ref_int = F.interpolate(
+                ref_aligned, size=target_ref_size, mode="bicubic", align_corners=False
+            )
         else:
             ref_int = ref_aligned
-            
+
         fea = self.lr_up(lr_int)
         ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_int)
-        
+
         e1 = self.encoder_level1(self.fuse1(fea, ref_1))
         e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
         e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
         latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
-        
-        d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1)))
-        d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)))
-        d1 = self.decoder_level1(self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)))
+
+        d3 = self.decoder_level3(
+            self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
+        )
+        d2 = self.decoder_level2(
+            self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
+        )
+        d1 = self.decoder_level1(
+            self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
+        )
         d1 = self.refinement(d1)
 
         out_feat = self.output_conv(self.up_final(d1))
         if out_feat.shape[2] != target_hr_h or out_feat.shape[3] != target_hr_w:
-            out_feat = F.interpolate(out_feat, size=(target_hr_h, target_hr_w), mode="bicubic", align_corners=False)
+            out_feat = F.interpolate(
+                out_feat,
+                size=(target_hr_h, target_hr_w),
+                mode="bicubic",
+                align_corners=False,
+            )
 
         return torch.clamp(lr_hr + out_feat, min=-1.0, max=1.0)
 
     def prepare_for_inference(self):
         self.eval()
         for m in self.modules():
-            if isinstance(m, OmniShift): m.reparam_5x5()
+            if isinstance(m, OmniShift):
+                m.reparam_5x5()
         return self
+
 
 # ═══════════════════════════════════════════════════════════
 # EMA 与 Lightning 训练封装
@@ -738,7 +1046,8 @@ class EMA:
         self._lazy_init(model)
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
-                if self.shadow[name].device != param.device: self.shadow[name] = self.shadow[name].to(param.device)
+                if self.shadow[name].device != param.device:
+                    self.shadow[name] = self.shadow[name].to(param.device)
                 p_data = param.detach().float()
                 self.shadow[name].mul_(self.decay).add_(p_data, alpha=1.0 - self.decay)
 
@@ -749,23 +1058,29 @@ class EMA:
         self.backup = {}
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
-                if self.shadow[name].device != param.device: self.shadow[name] = self.shadow[name].to(param.device)
+                if self.shadow[name].device != param.device:
+                    self.shadow[name] = self.shadow[name].to(param.device)
                 self.backup[name] = param.detach().clone()
-                param.data.copy_(self.shadow[name].to(device=param.device, dtype=param.dtype))
+                param.data.copy_(
+                    self.shadow[name].to(device=param.device, dtype=param.dtype)
+                )
         self._applied = True
 
     def restore(self, model: nn.Module):
         if not self._applied:
             return
         for name, param in model.named_parameters():
-            if param.requires_grad and name in self.backup: param.data.copy_(self.backup[name].to(param.device))
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name].to(param.device))
         self.backup = {}
         self._applied = False
 
     def state_dict(self):
         return {
             "decay": self.decay,
-            "shadow": {name: value.detach().clone() for name, value in self.shadow.items()},
+            "shadow": {
+                name: value.detach().clone() for name, value in self.shadow.items()
+            },
             "initialized": self._initialized,
         }
 
@@ -783,6 +1098,7 @@ class EMA:
         }
         self._initialized = bool(sd.get("initialized", bool(self.shadow)))
         self.backup, self._applied = {}, False
+
 
 class LitRefSRWKV(pl.LightningModule):
     def __init__(
@@ -829,10 +1145,17 @@ class LitRefSRWKV(pl.LightningModule):
             raise ValueError("warmup_steps 必须为非负整数")
         if grad_clip_norm is not None and float(grad_clip_norm) < 0:
             raise ValueError("grad_clip_norm 不能为负数")
-        if (not isinstance(adam_betas, (list, tuple)) or len(adam_betas) != 2
-                or any(isinstance(beta, bool) or not isinstance(beta, (int, float))
-                       or not math.isfinite(float(beta)) or not 0.0 <= float(beta) < 1.0
-                       for beta in adam_betas)):
+        if (
+            not isinstance(adam_betas, (list, tuple))
+            or len(adam_betas) != 2
+            or any(
+                isinstance(beta, bool)
+                or not isinstance(beta, (int, float))
+                or not math.isfinite(float(beta))
+                or not 0.0 <= float(beta) < 1.0
+                for beta in adam_betas
+            )
+        ):
             raise ValueError("adam_betas 必须是两个位于 [0, 1) 的有限数值")
         if not math.isfinite(float(weight_decay)) or float(weight_decay) < 0.0:
             raise ValueError("weight_decay 必须是非负有限数值")
@@ -882,7 +1205,11 @@ class LitRefSRWKV(pl.LightningModule):
 
     def _unpack_batch(self, batch):
         if isinstance(batch, dict):
-            missing = [key for key in (self.lr_key, self.hr_key, self.ref_key) if key not in batch]
+            missing = [
+                key
+                for key in (self.lr_key, self.hr_key, self.ref_key)
+                if key not in batch
+            ]
             if missing:
                 raise KeyError(f"batch 缺少字段: {missing}")
             return batch[self.lr_key], batch[self.hr_key], batch[self.ref_key]
@@ -898,7 +1225,9 @@ class LitRefSRWKV(pl.LightningModule):
         if lr is not None:
             # Dropped references follow the single-image SR path for every
             # batch size: use the current sample's bicubic-upsampled LR.
-            replacement = F.interpolate(lr, size=ref.shape[-2:], mode="bicubic", align_corners=False)
+            replacement = F.interpolate(
+                lr, size=ref.shape[-2:], mode="bicubic", align_corners=False
+            )
             if replacement.shape[1] != ref.shape[1]:
                 replacement = torch.zeros_like(ref)
         else:
@@ -909,40 +1238,67 @@ class LitRefSRWKV(pl.LightningModule):
     def _reference_input(self, ref, lr):
         if self.reference_mode != "lr_up":
             return ref
-        replacement = F.interpolate(lr, size=ref.shape[-2:], mode="bicubic", align_corners=False)
+        replacement = F.interpolate(
+            lr, size=ref.shape[-2:], mode="bicubic", align_corners=False
+        )
         if replacement.shape[1] != ref.shape[1]:
             raise ValueError(
                 f"lr_up reference 的通道数与 ref 不一致: {replacement.shape[1]} vs {ref.shape[1]}"
             )
         return replacement
 
-    def forward(self, lr, ref): return self.model_sr(lr, ref)
+    def forward(self, lr, ref):
+        return self.model_sr(lr, ref)
 
     @staticmethod
     def _fft_loss(pred, target):
         pred_f, target_f = pred.float(), target.float()
-        return (torch.fft.rfft2(pred_f, norm="ortho") - torch.fft.rfft2(target_f, norm="ortho")).abs().mean()
+        return (
+            (
+                torch.fft.rfft2(pred_f, norm="ortho")
+                - torch.fft.rfft2(target_f, norm="ortho")
+            )
+            .abs()
+            .mean()
+        )
 
     @staticmethod
     def _manual_ssim_loss(pred, target):
         if pred.ndim != 4 or target.shape != pred.shape:
-            raise ValueError(f"SSIM 输入形状不一致: {tuple(pred.shape)} vs {tuple(target.shape)}")
+            raise ValueError(
+                f"SSIM 输入形状不一致: {tuple(pred.shape)} vs {tuple(target.shape)}"
+            )
         channels, window_size, sigma = pred.shape[1], 11, 1.5
         pred_f, target_f = pred.float(), target.float()
         coords = torch.arange(window_size, dtype=torch.float32, device=pred.device)
-        gaussian = torch.exp(-((coords - window_size // 2) ** 2) / (2.0 * sigma ** 2))
+        gaussian = torch.exp(-((coords - window_size // 2) ** 2) / (2.0 * sigma**2))
         window_2d = torch.outer(gaussian, gaussian)
         window_2d = window_2d / window_2d.sum()
-        window = window_2d.view(1, 1, window_size, window_size).expand(channels, 1, -1, -1).contiguous()
+        window = (
+            window_2d.view(1, 1, window_size, window_size)
+            .expand(channels, 1, -1, -1)
+            .contiguous()
+        )
         pad = window_size // 2
         mu_p = F.conv2d(pred_f, window, padding=pad, groups=channels)
         mu_t = F.conv2d(target_f, window, padding=pad, groups=channels)
-        sigma_p_sq = (F.conv2d(pred_f.square(), window, padding=pad, groups=channels) - mu_p.square()).clamp_min(0.0)
-        sigma_t_sq = (F.conv2d(target_f.square(), window, padding=pad, groups=channels) - mu_t.square()).clamp_min(0.0)
-        sigma_pt = F.conv2d(pred_f * target_f, window, padding=pad, groups=channels) - mu_p * mu_t
+        sigma_p_sq = (
+            F.conv2d(pred_f.square(), window, padding=pad, groups=channels)
+            - mu_p.square()
+        ).clamp_min(0.0)
+        sigma_t_sq = (
+            F.conv2d(target_f.square(), window, padding=pad, groups=channels)
+            - mu_t.square()
+        ).clamp_min(0.0)
+        sigma_pt = (
+            F.conv2d(pred_f * target_f, window, padding=pad, groups=channels)
+            - mu_p * mu_t
+        )
         c1, c2 = (0.01 * 2.0) ** 2, (0.03 * 2.0) ** 2
         numerator = (2.0 * mu_p * mu_t + c1) * (2.0 * sigma_pt + c2)
-        denominator = (mu_p.square() + mu_t.square() + c1) * (sigma_p_sq + sigma_t_sq + c2)
+        denominator = (mu_p.square() + mu_t.square() + c1) * (
+            sigma_p_sq + sigma_t_sq + c2
+        )
         score = (numerator / denominator.clamp_min(1e-12)).clamp(-1.0, 1.0).mean()
         return 1.0 - score
 
@@ -950,7 +1306,9 @@ class LitRefSRWKV(pl.LightningModule):
         if self._ssim_backend == "pyiqa" and self.ssim_loss_fn is not None:
             metric = self.ssim_loss_fn
             metric_device = next(metric.parameters(), None)
-            metric_device = metric_device.device if metric_device is not None else pred.device
+            metric_device = (
+                metric_device.device if metric_device is not None else pred.device
+            )
             if metric_device != pred.device:
                 metric.to(pred.device)
             metric.eval()
@@ -962,7 +1320,9 @@ class LitRefSRWKV(pl.LightningModule):
 
     def _compute_loss(self, pred, target):
         if pred.shape != target.shape:
-            raise ValueError(f"模型输出与 HR 形状不一致: {tuple(pred.shape)} vs {tuple(target.shape)}")
+            raise ValueError(
+                f"模型输出与 HR 形状不一致: {tuple(pred.shape)} vs {tuple(target.shape)}"
+            )
         base_loss = self.criterion(pred, target)
         if base_loss.ndim:
             base_loss = base_loss.mean()
@@ -982,12 +1342,37 @@ class LitRefSRWKV(pl.LightningModule):
         output = self(lr, self._apply_ref_dropout(reference, lr=lr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log("train_l1", metrics["l1"], on_step=True, on_epoch=True, batch_size=batch_size)
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train_l1",
+            metrics["l1"],
+            on_step=True,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
         if "ssim_loss" in metrics:
-            self.log("train_ssim_loss", metrics["ssim_loss"], on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log(
+                "train_ssim_loss",
+                metrics["ssim_loss"],
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
         if "fft_loss" in metrics:
-            self.log("train_fft_loss", metrics["fft_loss"], on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log(
+                "train_fft_loss",
+                metrics["fft_loss"],
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -995,14 +1380,41 @@ class LitRefSRWKV(pl.LightningModule):
         output = self(lr, self._reference_input(ref, lr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log("val_l1", metrics["l1"], on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "val_l1", metrics["l1"], on_step=False, on_epoch=True, batch_size=batch_size
+        )
         if "ssim_loss" in metrics:
-            self.log("val_ssim_loss", metrics["ssim_loss"], on_step=False, on_epoch=True, batch_size=batch_size)
+            self.log(
+                "val_ssim_loss",
+                metrics["ssim_loss"],
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
         if "fft_loss" in metrics:
-            self.log("val_fft_loss", metrics["fft_loss"], on_step=False, on_epoch=True, batch_size=batch_size)
+            self.log(
+                "val_fft_loss",
+                metrics["fft_loss"],
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
         mse = F.mse_loss(output.float(), hr.float())
-        self.log("val/psnr", 10.0 * torch.log10(4.0 / mse.clamp_min(1e-8)), on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(
+            "val/psnr",
+            10.0 * torch.log10(4.0 / mse.clamp_min(1e-8)),
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -1011,7 +1423,13 @@ class LitRefSRWKV(pl.LightningModule):
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
         self.log("test_loss", loss, on_step=False, on_epoch=True, batch_size=batch_size)
-        self.log("test_l1", metrics["l1"], on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(
+            "test_l1",
+            metrics["l1"],
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
         return loss
 
     def _ema_apply(self):
@@ -1035,20 +1453,35 @@ class LitRefSRWKV(pl.LightningModule):
     # Lightning 2.x model-state hooks, with start/end fallbacks for older
     # releases.  EMA.apply/restore are idempotent so both hook families can
     # safely coexist.
-    def on_validation_model_eval(self): self._ema_apply()
-    def on_validation_model_train(self): self._ema_restore()
-    def on_validation_start(self): self._ema_apply()
+    def on_validation_model_eval(self):
+        self._ema_apply()
+
+    def on_validation_model_train(self):
+        self._ema_restore()
+
+    def on_validation_start(self):
+        self._ema_apply()
+
     def on_validation_epoch_end(self):
         # Validation metrics are aggregated by Lightning before this hook.
         # Step here so monitoring callbacks see the updated optimizer and
         # scheduler state when they save a checkpoint for this validation run.
         self._step_plateau_scheduler()
 
-    def on_validation_end(self): self._ema_restore()
-    def on_test_model_eval(self): self._ema_apply()
-    def on_test_model_train(self): self._ema_restore()
-    def on_test_start(self): self._ema_apply()
-    def on_test_end(self): self._ema_restore()
+    def on_validation_end(self):
+        self._ema_restore()
+
+    def on_test_model_eval(self):
+        self._ema_apply()
+
+    def on_test_model_train(self):
+        self._ema_restore()
+
+    def on_test_start(self):
+        self._ema_apply()
+
+    def on_test_end(self):
+        self._ema_restore()
 
     def _step_plateau_scheduler(self):
         """Update ReduceLROnPlateau exactly once after each validation run.
@@ -1089,7 +1522,9 @@ class LitRefSRWKV(pl.LightningModule):
         callback_metrics = getattr(trainer, "callback_metrics", {}) or {}
         metric = callback_metrics.get("val_loss")
         if metric is None:
-            raise RuntimeError("ReduceLROnPlateau 需要验证指标 val_loss，但当前验证未记录该指标")
+            raise RuntimeError(
+                "ReduceLROnPlateau 需要验证指标 val_loss，但当前验证未记录该指标"
+            )
         if torch.is_tensor(metric):
             if metric.numel() != 1 or not torch.isfinite(metric.detach()).item():
                 raise RuntimeError(f"验证指标 val_loss 必须是有限标量，得到 {metric}")
@@ -1104,9 +1539,8 @@ class LitRefSRWKV(pl.LightningModule):
         # Plateau is stepped manually in on_validation_epoch_end so each
         # validation counts exactly once. Other scheduler types retain
         # Lightning's normal step behaviour.
-        if (
-            str(self.hparams.lr_scheduler).lower() == "plateau"
-            and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
+        if str(self.hparams.lr_scheduler).lower() == "plateau" and isinstance(
+            scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
         ):
             return
         if metric is None:
@@ -1115,7 +1549,9 @@ class LitRefSRWKV(pl.LightningModule):
             scheduler.step(metric)
 
     def configure_optimizers(self):
-        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        parameters = [
+            parameter for parameter in self.parameters() if parameter.requires_grad
+        ]
         if not parameters:
             raise RuntimeError("没有可训练参数")
         learning_rate = float(self.hparams.learning_rate)
@@ -1137,13 +1573,15 @@ class LitRefSRWKV(pl.LightningModule):
                 threshold_mode="abs",
             )
             self._plateau_scheduler = scheduler
-            return [optimizer], [{
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-                "strict": True,
-            }]
+            return [optimizer], [
+                {
+                    "scheduler": scheduler,
+                    "monitor": "val_loss",
+                    "interval": "epoch",
+                    "frequency": 1,
+                    "strict": True,
+                }
+            ]
 
         warmup_steps = int(self.hparams.warmup_steps)
         try:
@@ -1155,11 +1593,16 @@ class LitRefSRWKV(pl.LightningModule):
         eta_min = min(1e-6, learning_rate * 0.01)
 
         if warmup_steps <= 0:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, max_steps), eta_min=eta_min)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, max_steps), eta_min=eta_min
+            )
         elif max_steps <= warmup_steps:
             # There is no post-warmup phase in a very short run.
             scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=1e-3, end_factor=1.0, total_iters=max(1, max_steps)
+                optimizer,
+                start_factor=1e-3,
+                end_factor=1.0,
+                total_iters=max(1, max_steps),
             )
         else:
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -1169,17 +1612,32 @@ class LitRefSRWKV(pl.LightningModule):
                 optimizer, T_max=max(1, max_steps - warmup_steps), eta_min=eta_min
             )
             scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps],
             )
-        return [optimizer], [{"scheduler": scheduler, "interval": "step", "frequency": 1}]
+        return [optimizer], [
+            {"scheduler": scheduler, "interval": "step", "frequency": 1}
+        ]
 
-    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
-        clip_val = gradient_clip_val if gradient_clip_val is not None else self.hparams.grad_clip_norm
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
+        clip_val = (
+            gradient_clip_val
+            if gradient_clip_val is not None
+            else self.hparams.grad_clip_norm
+        )
         if clip_val is not None and float(clip_val) > 0:
-            self.clip_gradients(optimizer, gradient_clip_val=float(clip_val), gradient_clip_algorithm=gradient_clip_algorithm or "norm")
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=float(clip_val),
+                gradient_clip_algorithm=gradient_clip_algorithm or "norm",
+            )
 
     def on_save_checkpoint(self, checkpoint):
-        if self.ema: checkpoint["ema_state_dict"] = self.ema.state_dict()
+        if self.ema:
+            checkpoint["ema_state_dict"] = self.ema.state_dict()
         if str(self.hparams.lr_scheduler).lower() == "plateau":
             checkpoint["plateau_step_unit"] = "validation"
         signature = getattr(self, "_experiment_signature", None)
@@ -1187,7 +1645,8 @@ class LitRefSRWKV(pl.LightningModule):
             checkpoint["refsrwkv_experiment_signature"] = dict(signature)
 
     def on_load_checkpoint(self, checkpoint):
-        if self.ema and "ema_state_dict" in checkpoint: self.ema.load_state_dict(checkpoint["ema_state_dict"])
+        if self.ema and "ema_state_dict" in checkpoint:
+            self.ema.load_state_dict(checkpoint["ema_state_dict"])
 
     def on_train_start(self):
         if self.ema:
@@ -1199,4 +1658,6 @@ class LitRefSRWKV(pl.LightningModule):
             if scheduler_name == "plateau"
             else f"cosine(warmup={self.hparams.warmup_steps})"
         )
-        print(f"✅ LitRefSRWKV 训练开始 | 参数量: {sum(p.numel() for p in self.model_sr.parameters()) / 1e6:.2f}M | lr_scheduler={scheduler_text} | grad_clip={self.hparams.grad_clip_norm} | EMA={'on' if self.ema else 'off'} | SSIM={self.ssim_weight} | FFT={self.fft_weight}")
+        print(
+            f"✅ LitRefSRWKV 训练开始 | 参数量: {sum(p.numel() for p in self.model_sr.parameters()) / 1e6:.2f}M | lr_scheduler={scheduler_text} | grad_clip={self.hparams.grad_clip_norm} | EMA={'on' if self.ema else 'off'} | SSIM={self.ssim_weight} | FFT={self.fft_weight}"
+        )

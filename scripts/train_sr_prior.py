@@ -5,6 +5,7 @@ RefSRWKV SR Prior 训练脚本。
 配置文件、数据目录和 checkpoint 路径默认相对于仓库根目录解析，因而从
 PowerShell 的任意当前目录启动都得到一致行为。配置文本按 UTF-8（兼容 BOM）读取。
 """
+
 import argparse
 import copy
 import json
@@ -20,13 +21,16 @@ sys.path.insert(0, str(PROJECT_ROOT.parent))
 import pytorch_lightning as pl
 import torch
 import yaml
-from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 
 from RefRWKV.models.RefSRWKV import LitRefSRWKV, RefSRWKV, normalize_window_config
 from RefRWKV.RefSR_data.RefDataset import RefPNGDataset
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -173,7 +177,9 @@ def _materialize_run_config(config):
         prepared_cfg = {}
     scale = run_cfg.get("scale")
     if scale is None:
-        scale = data_cfg.get("scale", dataset_cfg.get("default_scale", prepared_cfg.get("scale")))
+        scale = data_cfg.get(
+            "scale", dataset_cfg.get("default_scale", prepared_cfg.get("scale"))
+        )
     if scale is None:
         raise ValueError("run.scale 未设置，且数据集没有 default_scale")
     patch_size = run_cfg.get("hr_patch")
@@ -196,11 +202,15 @@ def _materialize_run_config(config):
     if not isinstance(run_name, str) or not run_name.strip():
         raise ValueError("run.name 必须是非空字符串")
     run_name = run_name.strip()
-    prefix = str(output_cfg.get("experiment_prefix", "refrwkv_sr")).strip() or "refrwkv_sr"
+    prefix = (
+        str(output_cfg.get("experiment_prefix", "refrwkv_sr")).strip() or "refrwkv_sr"
+    )
     output_cfg.setdefault("experiment_name", run_name)
     if not output_cfg.get("checkpoint_dir"):
         checkpoint_root = output_cfg.get("checkpoint_root", "checkpoints")
-        output_cfg["checkpoint_dir"] = str(Path(checkpoint_root) / f"{prefix}_{run_name}")
+        output_cfg["checkpoint_dir"] = str(
+            Path(checkpoint_root) / f"{prefix}_{run_name}"
+        )
     if not output_cfg.get("log_dir"):
         log_root = output_cfg.get("log_root", "logs")
         # TensorBoardLogger adds ``name`` below this root, yielding a stable
@@ -215,7 +225,9 @@ def _materialize_run_config(config):
             with metadata_path.open("r", encoding="utf-8-sig") as file_obj:
                 metadata = json.load(file_obj)
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"无法读取数据集 metadata.json: {metadata_path}: {exc}") from exc
+            raise ValueError(
+                f"无法读取数据集 metadata.json: {metadata_path}: {exc}"
+            ) from exc
         actual_scale = metadata.get("scale") if isinstance(metadata, dict) else None
         if actual_scale is not None and int(actual_scale) != int(scale):
             raise ValueError(
@@ -245,7 +257,9 @@ def _require_number(value, name, *, minimum=None, maximum=None, maximum_inclusiv
         raise ValueError(f"{name} 必须是有限数值，得到 {value!r}")
     if minimum is not None and value < minimum:
         raise ValueError(f"{name} 不能小于 {minimum}，得到 {value}")
-    if maximum is not None and (value > maximum or (not maximum_inclusive and value == maximum)):
+    if maximum is not None and (
+        value > maximum or (not maximum_inclusive and value == maximum)
+    ):
         suffix = ")" if not maximum_inclusive else "]"
         raise ValueError(f"{name} 必须位于 [{minimum}, {maximum}{suffix}，得到 {value}")
 
@@ -264,9 +278,13 @@ def validate_config(cfg):
     _require_int(patch_size, "data.patch_size")
     _require_int(scale, "data.scale")
     if patch_size % scale != 0:
-        raise ValueError(f"data.patch_size ({patch_size}) 必须能被 data.scale ({scale}) 整除")
+        raise ValueError(
+            f"data.patch_size ({patch_size}) 必须能被 data.scale ({scale}) 整除"
+        )
     if patch_size % 32 != 0:
-        raise ValueError("data.patch_size 必须能被 32 整除（HR/4 网格再经过三次 x2 下采样和 8x8 窗口）")
+        raise ValueError(
+            "data.patch_size 必须能被 32 整除（HR/4 网格再经过三次 x2 下采样和 8x8 窗口）"
+        )
 
     model_scale = mc.get("scale", scale)
     _require_int(model_scale, "model.scale")
@@ -277,7 +295,9 @@ def validate_config(cfg):
     ref_channels = mc.get("ref_channels", mc.get("inp_channels", 3))
     _require_int(ref_channels, "model.ref_channels")
     if ref_channels != mc.get("inp_channels", 3):
-        raise ValueError("当前颜色对齐路径要求 model.ref_channels == model.inp_channels")
+        raise ValueError(
+            "当前颜色对齐路径要求 model.ref_channels == model.inp_channels"
+        )
 
     dim = mc.get("dim", 48)
     _require_int(dim, "model.dim")
@@ -288,8 +308,16 @@ def validate_config(cfg):
         raise ValueError("model.num_blocks 必须包含四项")
     for index, count in enumerate(blocks):
         _require_int(count, f"model.num_blocks[{index}]")
-    _require_int(mc.get("num_refinement_blocks", 4), "model.num_refinement_blocks", minimum=0)
-    _require_number(mc.get("drop_path_rate", 0.1), "model.drop_path_rate", minimum=0.0, maximum=1.0, maximum_inclusive=False)
+    _require_int(
+        mc.get("num_refinement_blocks", 4), "model.num_refinement_blocks", minimum=0
+    )
+    _require_number(
+        mc.get("drop_path_rate", 0.1),
+        "model.drop_path_rate",
+        minimum=0.0,
+        maximum=1.0,
+        maximum_inclusive=False,
+    )
     _require_number(mc.get("hidden_rate", 4), "model.hidden_rate", minimum=1e-12)
     learning_rate = mc.get("learning_rate", 1e-4)
     _require_number(learning_rate, "model.learning_rate", minimum=1e-12)
@@ -297,7 +325,13 @@ def validate_config(cfg):
     if lr_scheduler not in {"plateau", "cosine"}:
         raise ValueError("model.lr_scheduler 只能是 plateau 或 cosine")
     _require_int(mc.get("lr_patience", 2), "model.lr_patience", minimum=0)
-    _require_number(mc.get("lr_factor", 0.5), "model.lr_factor", minimum=1e-12, maximum=1.0, maximum_inclusive=False)
+    _require_number(
+        mc.get("lr_factor", 0.5),
+        "model.lr_factor",
+        minimum=1e-12,
+        maximum=1.0,
+        maximum_inclusive=False,
+    )
     lr_min = mc.get("lr_min", 1e-6)
     _require_number(lr_min, "model.lr_min", minimum=0.0)
     if float(lr_min) > float(learning_rate):
@@ -305,16 +339,30 @@ def validate_config(cfg):
     _require_number(mc.get("lr_threshold", 1e-4), "model.lr_threshold", minimum=0.0)
     _require_int(mc.get("warmup_steps", 0), "model.warmup_steps", minimum=0)
     _require_number(mc.get("grad_clip_norm", 1.0), "model.grad_clip_norm", minimum=0.0)
-    _require_number(mc.get("ema_decay", 0.999), "model.ema_decay", minimum=0.0, maximum=1.0, maximum_inclusive=False)
+    _require_number(
+        mc.get("ema_decay", 0.999),
+        "model.ema_decay",
+        minimum=0.0,
+        maximum=1.0,
+        maximum_inclusive=False,
+    )
     adam_betas = mc.get("adam_betas", [0.9, 0.999])
-    if (not isinstance(adam_betas, (list, tuple)) or len(adam_betas) != 2):
+    if not isinstance(adam_betas, (list, tuple)) or len(adam_betas) != 2:
         raise ValueError("model.adam_betas 必须包含两个数值")
     for index, beta in enumerate(adam_betas):
-        _require_number(beta, f"model.adam_betas[{index}]", minimum=0.0, maximum=1.0, maximum_inclusive=False)
+        _require_number(
+            beta,
+            f"model.adam_betas[{index}]",
+            minimum=0.0,
+            maximum=1.0,
+            maximum_inclusive=False,
+        )
     _require_number(mc.get("weight_decay", 0.0), "model.weight_decay", minimum=0.0)
     _require_number(mc.get("ssim_weight", 0.0), "model.ssim_weight", minimum=0.0)
     _require_number(mc.get("fft_weight", 0.0), "model.fft_weight", minimum=0.0)
-    _require_number(mc.get("ref_drop_prob", 0.0), "model.ref_drop_prob", minimum=0.0, maximum=1.0)
+    _require_number(
+        mc.get("ref_drop_prob", 0.0), "model.ref_drop_prob", minimum=0.0, maximum=1.0
+    )
     reference_mode = str(dc.get("reference_mode", "paired")).lower()
     if reference_mode in {"sisr", "lr", "lr_up", "bicubic_lr"}:
         dc["reference_mode"] = "lr_up"
@@ -335,7 +383,11 @@ def validate_config(cfg):
         raise ValueError("data.root 必须是非空路径")
     for name in ("batch_size", "val_batch_size", "num_workers", "val_num_workers"):
         minimum = 0 if "workers" in name else 1
-        _require_int(dc.get(name, 4 if name == "batch_size" else 1), f"data.{name}", minimum=minimum)
+        _require_int(
+            dc.get(name, 4 if name == "batch_size" else 1),
+            f"data.{name}",
+            minimum=minimum,
+        )
     _require_int(dc.get("prefetch_factor", 4), "data.prefetch_factor")
     for name in ("max_samples_train", "max_samples_val", "max_samples_test"):
         value = dc.get(name)
@@ -343,7 +395,11 @@ def validate_config(cfg):
             _require_int(value, f"data.{name}")
     strengths = dc.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03])
     probs = dc.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5])
-    if not isinstance(strengths, (list, tuple)) or not isinstance(probs, (list, tuple)) or len(strengths) != len(probs):
+    if (
+        not isinstance(strengths, (list, tuple))
+        or not isinstance(probs, (list, tuple))
+        or len(strengths) != len(probs)
+    ):
         raise ValueError("data.ref_aug_strengths 与 data.ref_aug_probs 必须是等长列表")
     for index, value in enumerate(strengths):
         _require_number(value, f"data.ref_aug_strengths[{index}]", minimum=0.0)
@@ -352,29 +408,48 @@ def validate_config(cfg):
     tc = cfg.get("train", {})
     if not isinstance(tc, dict):
         raise ValueError("train 必须是 mapping")
-    _require_number(dc.get("ref_gray_prob", 0.2), "data.ref_gray_prob", minimum=0.0, maximum=1.0)
-    _require_int(dc.get("sample_seed", tc.get("seed", 42)), "data.sample_seed", minimum=0)
+    _require_number(
+        dc.get("ref_gray_prob", 0.2), "data.ref_gray_prob", minimum=0.0, maximum=1.0
+    )
+    _require_int(
+        dc.get("sample_seed", tc.get("seed", 42)), "data.sample_seed", minimum=0
+    )
     max_epochs = tc.get("max_epochs", 200)
     if max_epochs != -1:
         _require_int(max_epochs, "train.max_epochs")
     _require_int(tc.get("accumulate_grad_batches", 1), "train.accumulate_grad_batches")
     if "max_steps" in tc:
-        if isinstance(tc["max_steps"], bool) or not isinstance(tc["max_steps"], int) or tc["max_steps"] < -1:
+        if (
+            isinstance(tc["max_steps"], bool)
+            or not isinstance(tc["max_steps"], int)
+            or tc["max_steps"] < -1
+        ):
             raise ValueError("train.max_steps 必须是 >= -1 的整数")
     if max_epochs == -1 and tc.get("max_steps", -1) == -1:
         raise ValueError("train.max_epochs 和 train.max_steps 不能同时为 -1")
     if "num_sanity_val_steps" in tc:
-        _require_int(tc["num_sanity_val_steps"], "train.num_sanity_val_steps", minimum=-1)
+        _require_int(
+            tc["num_sanity_val_steps"], "train.num_sanity_val_steps", minimum=-1
+        )
     _require_int(tc.get("log_every_n_steps", 20), "train.log_every_n_steps")
     interval = tc.get("val_check_interval", 0.1)
-    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(float(interval)) or interval <= 0:
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(float(interval))
+        or interval <= 0
+    ):
         raise ValueError("train.val_check_interval 必须为正数")
     if isinstance(interval, float) and interval > 1.0:
-        raise ValueError("train.val_check_interval 为小数时必须位于 (0, 1]；整数批次数请使用整数")
+        raise ValueError(
+            "train.val_check_interval 为小数时必须位于 (0, 1]；整数批次数请使用整数"
+        )
     _require_int(tc.get("save_top_k", 3), "train.save_top_k", minimum=-1)
     early_stopping_patience = tc.get("early_stopping_patience", 30)
     if early_stopping_patience is not None:
-        _require_int(early_stopping_patience, "train.early_stopping_patience", minimum=0)
+        _require_int(
+            early_stopping_patience, "train.early_stopping_patience", minimum=0
+        )
     if "grad_clip_val" in tc and tc["grad_clip_val"] is not None:
         _require_number(tc["grad_clip_val"], "train.grad_clip_val", minimum=0.0)
     algorithm = str(tc.get("gradient_clip_algorithm", "norm")).lower()
@@ -410,7 +485,11 @@ def build_dataloaders(cfg):
         ref_aug_strengths=dc.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
         ref_aug_probs=dc.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
         ref_gray_prob=dc.get("ref_gray_prob", 0.2),
-        max_samples=(dc.get("max_samples_train"), dc.get("max_samples_val"), dc.get("max_samples_test")),
+        max_samples=(
+            dc.get("max_samples_train"),
+            dc.get("max_samples_val"),
+            dc.get("max_samples_test"),
+        ),
         sample_seed=dc.get("sample_seed", tc.get("seed", 42)),
         lr_key=dc.get("lr_key", "lr"),
         hr_key=dc.get("hr_key", "hr"),
@@ -426,7 +505,9 @@ def build_dataloaders(cfg):
     if len(train_ds) == 0:
         raise ValueError("训练数据集为空")
     if len(val_ds) == 0:
-        raise ValueError("验证数据集为空；当前脚本需要 val_loss 进行 checkpoint/early stopping")
+        raise ValueError(
+            "验证数据集为空；当前脚本需要 val_loss 进行 checkpoint/early stopping"
+        )
 
     pin_memory = bool(dc.get("pin_memory", False))
     train_workers = dc.get("num_workers", 4)
@@ -435,7 +516,11 @@ def build_dataloaders(cfg):
     val_batch_size = dc.get("val_batch_size", 1)
     drop_last = bool(dc.get("drop_last", True))
     if drop_last and len(train_ds) < batch_size:
-        logger.warning("训练样本数 (%d) 小于 batch_size (%d)，自动关闭 drop_last 以避免零 step", len(train_ds), batch_size)
+        logger.warning(
+            "训练样本数 (%d) 小于 batch_size (%d)，自动关闭 drop_last 以避免零 step",
+            len(train_ds),
+            batch_size,
+        )
         drop_last = False
 
     train_kwargs = dict(
@@ -465,7 +550,11 @@ def build_dataloaders(cfg):
 def build_model(cfg):
     validate_config(cfg)
     mc, dc = cfg["model"], cfg["data"]
-    lr_key, hr_key, ref_key = dc.get("lr_key", "lr"), dc.get("hr_key", "hr"), dc.get("ref_key", "ref")
+    lr_key, hr_key, ref_key = (
+        dc.get("lr_key", "lr"),
+        dc.get("hr_key", "hr"),
+        dc.get("ref_key", "ref"),
+    )
     hr_size = dc.get("patch_size", 480)
     data_scale = dc.get("scale", 4)
     model = RefSRWKV(
@@ -523,7 +612,14 @@ def build_model(cfg):
 
 _CKPT_PREFIXES = tuple(
     sorted(
-        ("generator.sr_model.", "generator.model_sr.", "sr_model.", "model_sr.", "model.", "module."),
+        (
+            "generator.sr_model.",
+            "generator.model_sr.",
+            "sr_model.",
+            "model_sr.",
+            "model.",
+            "module.",
+        ),
         key=len,
         reverse=True,
     )
@@ -540,7 +636,7 @@ def _strip_prefix(key: str) -> str:
         changed = False
         for prefix in _CKPT_PREFIXES:
             if key.startswith(prefix):
-                key = key[len(prefix):]
+                key = key[len(prefix) :]
                 changed = True
                 break
     return key
@@ -558,10 +654,22 @@ def _load_raw_checkpoint(path):
 
 def _find_tensor_mapping(value):
     if isinstance(value, dict):
-        direct = {key: tensor for key, tensor in value.items() if isinstance(key, str) and torch.is_tensor(tensor)}
+        direct = {
+            key: tensor
+            for key, tensor in value.items()
+            if isinstance(key, str) and torch.is_tensor(tensor)
+        }
         if direct:
             return direct
-        for key in ("state_dict", "model_state_dict", "model", "params", "weights", "generator", "sr_model"):
+        for key in (
+            "state_dict",
+            "model_state_dict",
+            "model",
+            "params",
+            "weights",
+            "generator",
+            "sr_model",
+        ):
             if key in value:
                 found = _find_tensor_mapping(value[key])
                 if found:
@@ -586,7 +694,9 @@ def _load_hot_start_state_dict(path: str):
     if isinstance(checkpoint, dict):
         ema_state = checkpoint.get("ema_state_dict")
         shadow = ema_state.get("shadow") if isinstance(ema_state, dict) else None
-        if isinstance(shadow, dict) and any(torch.is_tensor(value) for value in shadow.values()):
+        if isinstance(shadow, dict) and any(
+            torch.is_tensor(value) for value in shadow.values()
+        ):
             return shadow, "EMA"
     return _extract_state_dict(checkpoint, path), "raw"
 
@@ -600,7 +710,10 @@ def _normalise_state_dict(state_dict):
         if not isinstance(normalized_key, str):
             continue
         key_length = len(key)
-        if normalized_key not in normalized or key_length < source_lengths[normalized_key]:
+        if (
+            normalized_key not in normalized
+            or key_length < source_lengths[normalized_key]
+        ):
             normalized[normalized_key] = value
             source_lengths[normalized_key] = key_length
     return normalized
@@ -673,7 +786,9 @@ def _experiment_signature(cfg):
         "hr_size": int(data_cfg.get("patch_size", 480)),
         "dim": int(model_cfg.get("dim", 48)),
         "hidden_rate": float(model_cfg.get("hidden_rate", 4)),
-        "ref_channels": int(model_cfg.get("ref_channels", model_cfg.get("inp_channels", 3))),
+        "ref_channels": int(
+            model_cfg.get("ref_channels", model_cfg.get("inp_channels", 3))
+        ),
         "num_blocks": list(model_cfg.get("num_blocks", [4, 6, 6, 8])),
         "num_refinement_blocks": int(model_cfg.get("num_refinement_blocks", 4)),
         "windows": copy.deepcopy(model_cfg.get("windows")),
@@ -691,7 +806,9 @@ def check_resume_compatible(ckpt_path: str, lit_model):
         if not hasattr(hparams, "get"):
             hparams = {}
         saved_scheduler = str(hparams.get("lr_scheduler", "cosine")).lower()
-        current_scheduler = str(getattr(lit_model.hparams, "lr_scheduler", "plateau")).lower()
+        current_scheduler = str(
+            getattr(lit_model.hparams, "lr_scheduler", "plateau")
+        ).lower()
         if saved_scheduler != current_scheduler:
             return False, (
                 f"学习率调度器不兼容: checkpoint={saved_scheduler}, "
@@ -718,7 +835,9 @@ def check_resume_compatible(ckpt_path: str, lit_model):
                     "请使用 --load_weights 仅加载模型权重"
                 )
 
-    saved_hparams = checkpoint.get("hyper_parameters", {}) if isinstance(checkpoint, dict) else {}
+    saved_hparams = (
+        checkpoint.get("hyper_parameters", {}) if isinstance(checkpoint, dict) else {}
+    )
     current_hparams = getattr(lit_model, "hparams", {})
     if hasattr(saved_hparams, "get") and hasattr(current_hparams, "get"):
         for key in _RESUME_HPARAM_KEYS:
@@ -734,16 +853,31 @@ def check_resume_compatible(ckpt_path: str, lit_model):
     current_signature = getattr(lit_model, "_experiment_signature", None)
     saved_signature = (
         checkpoint.get("refsrwkv_experiment_signature")
-        if isinstance(checkpoint, dict) else None
+        if isinstance(checkpoint, dict)
+        else None
     )
     if isinstance(current_signature, dict):
         if isinstance(saved_signature, dict):
             for key in (
-                "data_root", "patch_size", "scale", "reference_mode", "hr_size", "dim",
-                "hidden_rate", "ref_channels", "num_blocks", "num_refinement_blocks", "windows",
+                "data_root",
+                "patch_size",
+                "scale",
+                "reference_mode",
+                "hr_size",
+                "dim",
+                "hidden_rate",
+                "ref_channels",
+                "num_blocks",
+                "num_refinement_blocks",
+                "windows",
             ):
-                if (key in saved_signature and key in current_signature
-                        and not _resume_values_equal(saved_signature[key], current_signature[key])):
+                if (
+                    key in saved_signature
+                    and key in current_signature
+                    and not _resume_values_equal(
+                        saved_signature[key], current_signature[key]
+                    )
+                ):
                     return False, (
                         f"实验结构不兼容: {key}={saved_signature[key]!r} vs "
                         f"当前={current_signature[key]!r}；请使用 --load_weights"
@@ -765,14 +899,23 @@ def check_resume_compatible(ckpt_path: str, lit_model):
                             f"当前={current_signature['data_root']}；请使用 --load_weights"
                         )
                 for key in ("patch_size", "scale", "reference_mode"):
-                    if (key in saved_data
-                            and not _resume_values_equal(saved_data[key], current_signature[key])):
+                    if key in saved_data and not _resume_values_equal(
+                        saved_data[key], current_signature[key]
+                    ):
                         return False, (
                             f"数据参数不兼容: {key}={saved_data[key]!r} vs "
                             f"当前={current_signature[key]!r}；请使用 --load_weights"
                         )
             if isinstance(saved_model, dict):
-                for key in ("dim", "hidden_rate", "ref_channels", "num_blocks", "num_refinement_blocks", "scale", "windows"):
+                for key in (
+                    "dim",
+                    "hidden_rate",
+                    "ref_channels",
+                    "num_blocks",
+                    "num_refinement_blocks",
+                    "scale",
+                    "windows",
+                ):
                     if key == "windows" and key not in saved_model:
                         # A pre-window checkpoint has the historical global
                         # 8/[0,3,6] behavior.  Do not silently resume it under
@@ -782,13 +925,19 @@ def check_resume_compatible(ckpt_path: str, lit_model):
                         continue
                     else:
                         saved_value = saved_model[key]
-                    if (not _resume_values_equal(saved_value, current_signature[key])):
+                    if not _resume_values_equal(saved_value, current_signature[key]):
                         return False, (
                             f"模型结构不兼容: {key}={saved_value!r} vs "
                             f"当前={current_signature[key]!r}；请使用 --load_weights"
                         )
 
-    reference = _normalise_state_dict({key: value for key, value in lit_model.state_dict().items() if torch.is_tensor(value)})
+    reference = _normalise_state_dict(
+        {
+            key: value
+            for key, value in lit_model.state_dict().items()
+            if torch.is_tensor(value)
+        }
+    )
     overlap = sorted(set(state_dict).intersection(reference))
     if not overlap:
         return False, "checkpoint 与当前模型没有任何同名参数"
@@ -799,10 +948,16 @@ def check_resume_compatible(ckpt_path: str, lit_model):
     ]
     if mismatched:
         key, ckpt_shape, model_shape = mismatched[0]
-        return False, f"{len(mismatched)} 个参数形状不匹配: {key}: ckpt{ckpt_shape} vs 现模型{model_shape}"
+        return (
+            False,
+            f"{len(mismatched)} 个参数形状不匹配: {key}: ckpt{ckpt_shape} vs 现模型{model_shape}",
+        )
     missing = sorted(set(reference) - set(state_dict))
     if missing:
-        return False, f"当前模型有 {len(missing)} 个参数在 checkpoint 中缺失: {missing[:3]}"
+        return (
+            False,
+            f"当前模型有 {len(missing)} 个参数在 checkpoint 中缺失: {missing[:3]}",
+        )
     extra = sorted(set(state_dict) - set(reference))
     if extra:
         return False, f"checkpoint 有 {len(extra)} 个多余参数: {extra[:3]}"
@@ -812,7 +967,11 @@ def check_resume_compatible(ckpt_path: str, lit_model):
 def load_weights_filtered(lit_model, ckpt_path: str):
     state_dict, source = _load_hot_start_state_dict(ckpt_path)
     state_dict = _normalise_state_dict(state_dict)
-    reference = {key: value for key, value in lit_model.state_dict().items() if torch.is_tensor(value)}
+    reference = {
+        key: value
+        for key, value in lit_model.state_dict().items()
+        if torch.is_tensor(value)
+    }
     reference_by_normalized = {}
     for key in reference:
         reference_by_normalized.setdefault(_strip_prefix(key), key)
@@ -856,8 +1015,18 @@ def main():
         help="覆盖配置字段，如 data.scale=4 output.experiment_name=aid_x4",
     )
     checkpoint_group = parser.add_mutually_exclusive_group()
-    checkpoint_group.add_argument("--load_weights", type=str, default=None, help="仅加载匹配的模型权重，重新初始化优化器")
-    checkpoint_group.add_argument("--resume", type=str, default=None, help="恢复完整 Lightning checkpoint（含 optimizer/EMA）")
+    checkpoint_group.add_argument(
+        "--load_weights",
+        type=str,
+        default=None,
+        help="仅加载匹配的模型权重，重新初始化优化器",
+    )
+    checkpoint_group.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="恢复完整 Lightning checkpoint（含 optimizer/EMA）",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config, overrides=args.overrides)
@@ -869,11 +1038,15 @@ def main():
     if accelerator == "auto":
         accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     if accelerator != "gpu" or not torch.cuda.is_available():
-        raise RuntimeError("RefSRWKV 的空间 WKV 算子只支持 CUDA；请安装 CUDA 版 PyTorch 并使用 train.accelerator=gpu")
+        raise RuntimeError(
+            "RefSRWKV 的空间 WKV 算子只支持 CUDA；请安装 CUDA 版 PyTorch 并使用 train.accelerator=gpu"
+        )
     pl.seed_everything(tc.get("seed", 42), workers=True)
 
     train_loader, val_loader = build_dataloaders(cfg)
-    logger.info("训练样本: %d, 验证样本: %d", len(train_loader.dataset), len(val_loader.dataset))
+    logger.info(
+        "训练样本: %d, 验证样本: %d", len(train_loader.dataset), len(val_loader.dataset)
+    )
     lit_model = build_model(cfg)
 
     ckpt_dir = _resolve_path(oc.get("checkpoint_dir", "checkpoints/refrwkv_sr"))
@@ -897,12 +1070,15 @@ def main():
     ]
     early_stopping_patience = tc.get("early_stopping_patience", 30)
     if early_stopping_patience is not None:
-        callbacks.insert(1, EarlyStopping(
-            monitor="val_loss",
-            patience=early_stopping_patience,
-            mode="min",
-            verbose=True,
-        ))
+        callbacks.insert(
+            1,
+            EarlyStopping(
+                monitor="val_loss",
+                patience=early_stopping_patience,
+                mode="min",
+                verbose=True,
+            ),
+        )
 
     trainer_kwargs = dict(
         accelerator=accelerator,
@@ -949,18 +1125,33 @@ def main():
             else:
                 # Leave an incompatible last.ckpt untouched; it may still be
                 # useful for a later configuration or manual weight loading.
-                logger.warning("%s 不兼容，已忽略，从头训练: %s\n  原因: %s", source, candidate, reason)
+                logger.warning(
+                    "%s 不兼容，已忽略，从头训练: %s\n  原因: %s",
+                    source,
+                    candidate,
+                    reason,
+                )
 
     logger.info("=" * 60)
     logger.info("  RefSRWKV SR Prior 训练 (Dynamic Spatial Resolution)")
-    logger.info("  数据: %s (patch_size=%d, scale=%d)", cfg["data"]["root"], cfg["data"].get("patch_size", 480), cfg["data"].get("scale", 4))
+    logger.info(
+        "  数据: %s (patch_size=%d, scale=%d)",
+        cfg["data"]["root"],
+        cfg["data"].get("patch_size", 480),
+        cfg["data"].get("scale", 4),
+    )
     window_cfg = lit_model.model_sr.window_config
     window_text = ", ".join(
         f"{name}={spec['size']}/{list(spec['offsets'])}"
         for name, spec in window_cfg["stages"].items()
     )
     logger.info("  Windows: phase=%s | %s", window_cfg["phase_mode"], window_text)
-    logger.info("  Batch size: %d × accumulate %d = 等效 %d", cfg["data"].get("batch_size", 4), tc.get("accumulate_grad_batches", 1), cfg["data"].get("batch_size", 4) * tc.get("accumulate_grad_batches", 1))
+    logger.info(
+        "  Batch size: %d × accumulate %d = 等效 %d",
+        cfg["data"].get("batch_size", 4),
+        tc.get("accumulate_grad_batches", 1),
+        cfg["data"].get("batch_size", 4) * tc.get("accumulate_grad_batches", 1),
+    )
     scheduler_name = str(mc.get("lr_scheduler", "plateau")).lower()
     if scheduler_name == "plateau":
         logger.info(
@@ -972,15 +1163,28 @@ def main():
             mc.get("lr_min", 1e-6),
         )
     else:
-        logger.info("  LR: %.1e | cosine warmup: %d 步", mc.get("learning_rate", 1e-4), mc.get("warmup_steps", 0))
+        logger.info(
+            "  LR: %.1e | cosine warmup: %d 步",
+            mc.get("learning_rate", 1e-4),
+            mc.get("warmup_steps", 0),
+        )
     logger.info(
         "  Loss: L1 + SSIM(%.2f) + FFT(%.2f) | Adam betas=%s | weight_decay=%.3g | Ref=%s | Ref dropout=%.2f",
-        mc.get("ssim_weight", 0.0), mc.get("fft_weight", 0.0),
-        tuple(mc.get("adam_betas", [0.9, 0.999])), mc.get("weight_decay", 0.0),
+        mc.get("ssim_weight", 0.0),
+        mc.get("fft_weight", 0.0),
+        tuple(mc.get("adam_betas", [0.9, 0.999])),
+        mc.get("weight_decay", 0.0),
         cfg["data"].get("reference_mode", "paired"),
         mc.get("ref_drop_prob", 0.0),
     )
-    logger.info("  EMA: %s", "on (decay=%.4f)" % mc.get("ema_decay", 0.999) if mc.get("use_ema", True) else "off")
+    logger.info(
+        "  EMA: %s",
+        (
+            "on (decay=%.4f)" % mc.get("ema_decay", 0.999)
+            if mc.get("use_ema", True)
+            else "off"
+        ),
+    )
     if explicit_weights is not None:
         logger.info("  权重来源: 热启动 %s", explicit_weights)
     else:

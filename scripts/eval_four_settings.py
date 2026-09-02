@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """RefSRWKV 评测：bicubic、SISR Ref、数据集 Ref 和 HR 参考上限。"""
+
 import argparse
 import os
 import sys
@@ -27,24 +28,36 @@ SETTINGS = ["bicubic", "sisr_ref", "dataset_ref", "perfect_ref"]
 def gaussian_ssim(pred, target):
     """Per-image RGB SSIM on [-1, 1] tensors using an 11x11 Gaussian window."""
     if pred.shape != target.shape:
-        raise ValueError(f"SSIM 输入形状不一致: {tuple(pred.shape)} vs {tuple(target.shape)}")
+        raise ValueError(
+            f"SSIM 输入形状不一致: {tuple(pred.shape)} vs {tuple(target.shape)}"
+        )
     channels, window_size, sigma = pred.shape[1], 11, 1.5
     pred_f, target_f = pred.float(), target.float()
     coords = torch.arange(window_size, dtype=torch.float32, device=pred.device)
-    gaussian = torch.exp(-((coords - window_size // 2) ** 2) / (2.0 * sigma ** 2))
+    gaussian = torch.exp(-((coords - window_size // 2) ** 2) / (2.0 * sigma**2))
     window_2d = torch.outer(gaussian, gaussian)
     window = (window_2d / window_2d.sum()).view(1, 1, window_size, window_size)
     window = window.expand(channels, 1, -1, -1).contiguous()
     pad = window_size // 2
     mu_p = F.conv2d(pred_f, window, padding=pad, groups=channels)
     mu_t = F.conv2d(target_f, window, padding=pad, groups=channels)
-    sigma_p_sq = (F.conv2d(pred_f.square(), window, padding=pad, groups=channels) - mu_p.square()).clamp_min(0.0)
-    sigma_t_sq = (F.conv2d(target_f.square(), window, padding=pad, groups=channels) - mu_t.square()).clamp_min(0.0)
-    sigma_pt = F.conv2d(pred_f * target_f, window, padding=pad, groups=channels) - mu_p * mu_t
+    sigma_p_sq = (
+        F.conv2d(pred_f.square(), window, padding=pad, groups=channels) - mu_p.square()
+    ).clamp_min(0.0)
+    sigma_t_sq = (
+        F.conv2d(target_f.square(), window, padding=pad, groups=channels)
+        - mu_t.square()
+    ).clamp_min(0.0)
+    sigma_pt = (
+        F.conv2d(pred_f * target_f, window, padding=pad, groups=channels) - mu_p * mu_t
+    )
     c1, c2 = (0.01 * 2.0) ** 2, (0.03 * 2.0) ** 2
     numerator = (2.0 * mu_p * mu_t + c1) * (2.0 * sigma_pt + c2)
     denominator = (mu_p.square() + mu_t.square() + c1) * (sigma_p_sq + sigma_t_sq + c2)
-    return (numerator / denominator.clamp_min(1e-12)).clamp(-1.0, 1.0).mean(dim=(1, 2, 3))
+    return (
+        (numerator / denominator.clamp_min(1e-12)).clamp(-1.0, 1.0).mean(dim=(1, 2, 3))
+    )
+
 
 def strip_prefix(sd):
     out = {}
@@ -53,7 +66,7 @@ def strip_prefix(sd):
             continue
         for p in PREFIXES:
             if k.startswith(p):
-                k = k[len(p):]
+                k = k[len(p) :]
                 break
         out[k] = v
     return out
@@ -75,13 +88,17 @@ def load_weights(model, ckpt_path, use_ema):
     real_miss = [k for k in missing if not k.endswith(BUFFER_SUFFIXES)]
     epoch = ckpt.get("epoch", "?") if isinstance(ckpt, dict) else "?"
     print(f"[load] {ckpt_path}")
-    print(f"       weights={tag} | epoch={epoch} | "
-          f"missing={len(missing)} (buffer {len(buf_miss)} / 参数 {len(real_miss)}) "
-          f"| unexpected={len(unexpected)}")
+    print(
+        f"       weights={tag} | epoch={epoch} | "
+        f"missing={len(missing)} (buffer {len(buf_miss)} / 参数 {len(real_miss)}) "
+        f"| unexpected={len(unexpected)}"
+    )
     if unexpected:
         print(f"       unexpected 示例: {list(unexpected)[:5]}")
     if real_miss:
-        print(f"[FATAL] {len(real_miss)} 个真实参数未加载（非 buffer），结果必然错误，中止。")
+        print(
+            f"[FATAL] {len(real_miss)} 个真实参数未加载（非 buffer），结果必然错误，中止。"
+        )
         print(f"        示例: {real_miss[:10]}")
         sys.exit(1)
 
@@ -92,7 +109,9 @@ def checkpoint_model_options(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     except TypeError:
         ckpt = torch.load(ckpt_path, map_location="cpu")
-    signature = ckpt.get("refsrwkv_experiment_signature") if isinstance(ckpt, dict) else None
+    signature = (
+        ckpt.get("refsrwkv_experiment_signature") if isinstance(ckpt, dict) else None
+    )
     options = {}
     if isinstance(signature, dict):
         if signature.get("hr_size") is not None:
@@ -120,14 +139,25 @@ def checkpoint_model_options(ckpt_path):
                     options["hr_size"] = int(data_cfg["patch_size"])
                 if "scale" not in options and data_cfg.get("scale") is not None:
                     options["scale"] = int(data_cfg["scale"])
-            if "windows" not in options and isinstance(model_cfg, dict) and isinstance(model_cfg.get("windows"), dict):
+            if (
+                "windows" not in options
+                and isinstance(model_cfg, dict)
+                and isinstance(model_cfg.get("windows"), dict)
+            ):
                 options["windows"] = model_cfg["windows"]
     return options
 
+
 @torch.no_grad()
 def run_split(model, split, args, device):
-    ds = RefPNGDataset(data_dir=args.data, mode=split, scale=args.scale,
-                       patch_size=args.patch, augment=False, augment_ref=False)
+    ds = RefPNGDataset(
+        data_dir=args.data,
+        mode=split,
+        scale=args.scale,
+        patch_size=args.patch,
+        augment=False,
+        augment_ref=False,
+    )
     n = min(args.n, len(ds))
     loader = DataLoader(
         ds,
@@ -169,7 +199,9 @@ def run_split(model, split, args, device):
             if s not in acc:
                 continue
             mse = (o.float() - hr.float()).square().mean(dim=(1, 2, 3))
-            acc[s]["psnr"].extend((10.0 * torch.log10(4.0 / mse.clamp_min(1e-10))).cpu().tolist())
+            acc[s]["psnr"].extend(
+                (10.0 * torch.log10(4.0 / mse.clamp_min(1e-10))).cpu().tolist()
+            )
             acc[s]["ssim"].extend(gaussian_ssim(o, hr).cpu().tolist())
         seen += lr.size(0)
         if seen - last_log >= 50 or seen == n:
@@ -177,8 +209,10 @@ def run_split(model, split, args, device):
                 f"{s}=PSNR {np.mean(acc[s]['psnr']):.2f} / SSIM {np.mean(acc[s]['ssim']):.4f}"
                 for s in args.settings
             )
-            print(f"  [{split}] {seen}/{n}  {(time.time() - t0) / 60:.1f}min  {run}",
-                  flush=True)
+            print(
+                f"  [{split}] {seen}/{n}  {(time.time() - t0) / 60:.1f}min  {run}",
+                flush=True,
+            )
             last_log = seen
     return {
         s: {metric: float(np.mean(values)) for metric, values in metrics.items()}
@@ -190,19 +224,40 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--data", default="RefSR_data/HRMS_SCD")
-    ap.add_argument("--splits", nargs="+", default=None,
-                    help="默认优先使用 test；若数据集没有 test，则使用 test_easy/test_hard")
+    ap.add_argument(
+        "--splits",
+        nargs="+",
+        default=None,
+        help="默认优先使用 test；若数据集没有 test，则使用 test_easy/test_hard",
+    )
     ap.add_argument("--n", type=int, default=500)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=0)
-    ap.add_argument("--settings", nargs="+", choices=SETTINGS, default=SETTINGS,
-                    help="要评测的设置；默认 bicubic、sisr_ref、dataset_ref、perfect_ref 全部执行")
-    ap.add_argument("--scale", type=int, default=None,
-                    help="SR scale; omit to read the checkpoint signature")
-    ap.add_argument("--hr_size", type=int, default=None,
-                    help="SR checkpoint 训练时的 HR patch 边长；省略时读取 checkpoint 签名")
-    ap.add_argument("--patch", type=int, default=None,
-                    help="评测时的 HR 裁剪边长；默认 None 表示全图")
+    ap.add_argument(
+        "--settings",
+        nargs="+",
+        choices=SETTINGS,
+        default=SETTINGS,
+        help="要评测的设置；默认 bicubic、sisr_ref、dataset_ref、perfect_ref 全部执行",
+    )
+    ap.add_argument(
+        "--scale",
+        type=int,
+        default=None,
+        help="SR scale; omit to read the checkpoint signature",
+    )
+    ap.add_argument(
+        "--hr_size",
+        type=int,
+        default=None,
+        help="SR checkpoint 训练时的 HR patch 边长；省略时读取 checkpoint 签名",
+    )
+    ap.add_argument(
+        "--patch",
+        type=int,
+        default=None,
+        help="评测时的 HR 裁剪边长；默认 None 表示全图",
+    )
     ap.add_argument("--raw", action="store_true", help="用原始权重而非 EMA")
     ap.add_argument("--window-size", type=int, default=None)
     ap.add_argument("--shift-size", type=int, default=None)
@@ -211,10 +266,16 @@ def main():
     args = ap.parse_args()
 
     if args.splits is None:
-        available = {name for name in ("test", "test_easy", "test_hard")
-                     if os.path.isdir(os.path.join(args.data, name))}
-        args.splits = (["test"] if "test" in available else
-                       [name for name in ("test_easy", "test_hard") if name in available])
+        available = {
+            name
+            for name in ("test", "test_easy", "test_hard")
+            if os.path.isdir(os.path.join(args.data, name))
+        }
+        args.splits = (
+            ["test"]
+            if "test" in available
+            else [name for name in ("test_easy", "test_hard") if name in available]
+        )
         if not args.splits:
             raise FileNotFoundError(
                 f"未找到可用测试 split: {args.data}/test 或 test_easy/test_hard"
@@ -226,19 +287,30 @@ def main():
     if args.scale is None:
         args.scale = ckpt_options.get("scale", 4)
     windows = ckpt_options.get("windows")
-    if (args.window_size is not None or args.shift_size is not None
-            or args.shift_cycle is not None or args.window_phase_mode is not None):
+    if (
+        args.window_size is not None
+        or args.shift_size is not None
+        or args.shift_cycle is not None
+        or args.window_phase_mode is not None
+    ):
         windows = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = RefSRWKV(inp_channels=3, out_channels=3, dim=48,
-                     num_blocks=(4, 6, 6, 8), num_refinement_blocks=4,
-                     scale=args.scale, hr_size=args.hr_size,
-                     drop_path_rate=0.1, hidden_rate=4,
-                     windows=windows,
-                     window_size=args.window_size if args.window_size is not None else 8,
-                     shift_size=args.shift_size if args.shift_size is not None else 3,
-                     shift_cycle=args.shift_cycle if args.shift_cycle is not None else 3,
-                     window_phase_mode=args.window_phase_mode)
+    model = RefSRWKV(
+        inp_channels=3,
+        out_channels=3,
+        dim=48,
+        num_blocks=(4, 6, 6, 8),
+        num_refinement_blocks=4,
+        scale=args.scale,
+        hr_size=args.hr_size,
+        drop_path_rate=0.1,
+        hidden_rate=4,
+        windows=windows,
+        window_size=args.window_size if args.window_size is not None else 8,
+        shift_size=args.shift_size if args.shift_size is not None else 3,
+        shift_cycle=args.shift_cycle if args.shift_cycle is not None else 3,
+        window_phase_mode=args.window_phase_mode,
+    )
     load_weights(model, args.ckpt, use_ema=not args.raw)
     model.prepare_for_inference().to(device)
 
@@ -256,5 +328,7 @@ def main():
                 text += f" (ΔPSNR {metric['psnr'] - b['psnr']:+.2f})"
             parts.append(text)
         print(f"  {sp}: " + " | ".join(parts))
+
+
 if __name__ == "__main__":
     main()

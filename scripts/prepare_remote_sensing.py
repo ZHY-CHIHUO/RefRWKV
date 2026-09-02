@@ -31,7 +31,6 @@ from typing import Iterable
 
 from PIL import Image, ImageChops
 
-
 DATASET_DEFAULTS = {
     "ucmerced": {
         "hr_size": 256,
@@ -110,13 +109,17 @@ def _discover_images(source_dir: Path) -> list[SourceRecord]:
     return records
 
 
-def _split_counts(total: int, ratios: tuple[float, float, float]) -> tuple[int, int, int]:
+def _split_counts(
+    total: int, ratios: tuple[float, float, float]
+) -> tuple[int, int, int]:
     if total < 3:
         raise ValueError(f"class has only {total} images; at least 3 are required")
     raw = [total * ratio for ratio in ratios]
     counts = [int(math.floor(value)) for value in raw]
     remainder = total - sum(counts)
-    order = sorted(range(3), key=lambda i: (raw[i] - counts[i], ratios[i]), reverse=True)
+    order = sorted(
+        range(3), key=lambda i: (raw[i] - counts[i], ratios[i]), reverse=True
+    )
     for i in order[:remainder]:
         counts[i] += 1
 
@@ -126,7 +129,9 @@ def _split_counts(total: int, ratios: tuple[float, float, float]) -> tuple[int, 
     for i in active:
         if counts[i] > 0:
             continue
-        donor = max((j for j in active if counts[j] > 1), key=lambda j: counts[j], default=None)
+        donor = max(
+            (j for j in active if counts[j] > 1), key=lambda j: counts[j], default=None
+        )
         if donor is None:
             raise ValueError("cannot make every requested split non-empty")
         counts[donor] -= 1
@@ -183,7 +188,9 @@ def _write_image(path: Path, image: Image.Image) -> None:
     image.save(path, format="PNG", optimize=False, compress_level=1)
 
 
-def _validate_output(output_dir: Path, expected_sizes: dict[str, tuple[int, int]]) -> dict[str, int]:
+def _validate_output(
+    output_dir: Path, expected_sizes: dict[str, tuple[int, int]]
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     for split in SPLITS:
         hr_dir = output_dir / split / "HR"
@@ -197,26 +204,40 @@ def _validate_output(output_dir: Path, expected_sizes: dict[str, tuple[int, int]
             for directory in ("LR", "HR", "Ref")
         }
         if len(set(directory_counts.values())) != 1:
-            raise RuntimeError(f"split directories have different counts: {split}: {directory_counts}")
+            raise RuntimeError(
+                f"split directories have different counts: {split}: {directory_counts}"
+            )
         for name in names:
-            paths = [hr_dir / f"{name}.png", lr_dir / f"{name}.png", ref_dir / f"{name}.png"]
+            paths = [
+                hr_dir / f"{name}.png",
+                lr_dir / f"{name}.png",
+                ref_dir / f"{name}.png",
+            ]
             if not all(path.is_file() for path in paths):
                 raise RuntimeError(f"incomplete pair for {split}/{name}")
-            with Image.open(paths[0]) as hr, Image.open(paths[1]) as lr, Image.open(paths[2]) as ref:
+            with Image.open(paths[0]) as hr, Image.open(paths[1]) as lr, Image.open(
+                paths[2]
+            ) as ref:
                 if hr.mode != "RGB" or lr.mode != "RGB" or ref.mode != "RGB":
                     raise RuntimeError(f"non-RGB output for {split}/{name}")
                 if hr.size != expected_sizes["hr"] or ref.size != expected_sizes["hr"]:
-                    raise RuntimeError(f"bad HR/Ref size for {split}/{name}: {hr.size}, {ref.size}")
+                    raise RuntimeError(
+                        f"bad HR/Ref size for {split}/{name}: {hr.size}, {ref.size}"
+                    )
                 if lr.size != expected_sizes["lr"]:
                     raise RuntimeError(f"bad LR size for {split}/{name}: {lr.size}")
                 expected_ref = lr.resize(hr.size, Image.Resampling.BICUBIC)
                 if ImageChops.difference(ref, expected_ref).getbbox() is not None:
-                    raise RuntimeError(f"Ref is not bicubic-upsampled LR for {split}/{name}")
+                    raise RuntimeError(
+                        f"Ref is not bicubic-upsampled LR for {split}/{name}"
+                    )
         counts[split] = len(names)
     return counts
 
 
-def _prepare_item(args: tuple[SourceRecord, str, Path, str, int, int]) -> dict[str, object]:
+def _prepare_item(
+    args: tuple[SourceRecord, str, Path, str, int, int],
+) -> dict[str, object]:
     record, name, output_dir, split, hr_size, lr_size = args
     hr = _open_hr(record.path, hr_size)
     lr = hr.resize((lr_size, lr_size), Image.Resampling.BICUBIC)
@@ -253,7 +274,9 @@ def prepare(
         raise ValueError(f"--hr-size {hr_size} must be divisible by --scale {scale}")
     if hr_size % 32 != 0:
         raise ValueError("--hr-size must be divisible by 32 for RefSRWKV")
-    if any(ratio <= 0 for ratio in ratios) or not math.isclose(sum(ratios), 1.0, abs_tol=1e-6):
+    if any(ratio <= 0 for ratio in ratios) or not math.isclose(
+        sum(ratios), 1.0, abs_tol=1e-6
+    ):
         raise ValueError("train/val/test ratios must all be positive and sum to 1")
     if workers < 1:
         raise ValueError("--workers must be at least 1")
@@ -303,13 +326,17 @@ def prepare(
                 (record, names_by_record[record], output_dir, split, hr_size, lr_size)
                 for record in items
             )
-            for index, manifest_item in enumerate(executor.map(_prepare_item, jobs), start=1):
+            for index, manifest_item in enumerate(
+                executor.map(_prepare_item, jobs), start=1
+            ):
                 all_manifest.append(manifest_item)
                 if index % 250 == 0 or index == len(items):
                     print(f"[{dataset}/{split}] {index}/{len(items)}", flush=True)
 
     sizes = {"hr": [hr_size, hr_size], "lr": [lr_size, lr_size]}
-    validated = _validate_output(output_dir, {"hr": (hr_size, hr_size), "lr": (lr_size, lr_size)})
+    validated = _validate_output(
+        output_dir, {"hr": (hr_size, hr_size), "lr": (lr_size, lr_size)}
+    )
     metadata = {
         "dataset": dataset,
         "source_url": defaults["source_url"],
@@ -338,7 +365,12 @@ def prepare(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=sorted(DATASET_DEFAULTS), required=True)
-    parser.add_argument("--source-dir", type=Path, required=True, help="extracted class-folder directory")
+    parser.add_argument(
+        "--source-dir",
+        type=Path,
+        required=True,
+        help="extracted class-folder directory",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-archive", type=Path, default=None)
     parser.add_argument("--hr-size", type=int, default=None)
@@ -347,7 +379,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--workers", type=int, default=4, help="并行生成样本的 worker 数")
+    parser.add_argument(
+        "--workers", type=int, default=4, help="并行生成样本的 worker 数"
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.hr_size is None:
