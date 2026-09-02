@@ -28,7 +28,7 @@ train:
   max_steps: 50000
   # Validate about ten times per epoch. The deterministic 300-image subset
   # keeps every plateau update comparable.
-  val_check_interval: 0.1
+  val_check_interval: 1
   accumulate_grad_batches: 4
   log_every_n_steps: 50
   early_stopping_patience: null
