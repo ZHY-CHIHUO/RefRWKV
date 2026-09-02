@@ -1,14 +1,14 @@
 # RefRWKV — Reference-Guided Remote Sensing Super-Resolution
 
-基于 RWKV + Stable Diffusion 2.1 的参考引导遥感图像超分辨率重建框架，实现 **4 倍超分**（LR 120×120 → HR 480×480）。
+基于 RWKV + Stable Diffusion 2.1 的参考引导遥感图像超分辨率重建框架。SR Prior 根据数据集配置支持 4× 和 10× 超分。
 
 ## 核心链路
 
 ```
-LR (120×120) ──→ RefSRWKV SR Prior ──→ SR image / SR latent ──┐
-Ref (480×480) ──→ RWKV Adapter ──→ 多尺度残差 ───────────────┤
+LR (H/scale × W/scale) ──→ RefSRWKV SR Prior ──→ SR image / SR latent ──┐
+Ref (H×W) ────────────────→ RWKV Adapter ──→ 多尺度残差 ────────────────┤
                ──→ DINOv2 + RWKV Pyramid ──→ 语义 token ─────┤
-                                                              ├──→ SD2 UNet (8ch) ──→ VAE ──→ HR (480×480)
+                                                              ├──→ SD2 UNet (8ch) ──→ VAE ──→ HR (H×W)
               SR latent ──→ concat(noisy_latent) ─────────────┘
 ```
 
@@ -26,7 +26,7 @@ Ref (480×480) ──→ RWKV Adapter ──→ 多尺度残差 ─────�
 ## 环境
 
 - Python >= 3.10，PyTorch >= 2.1，CUDA >= 12.1
-- 依赖：diffusers transformers peft pytorch-lightning lpips pyiqa open_clip_torch vision_aided_loss lmdb pillow pyyaml tensorboard
+- 依赖：diffusers transformers peft pytorch-lightning lpips pyiqa open_clip_torch vision_aided_loss pillow pyyaml tensorboard
 - RWKV WKV CUDA 算子通过 torch.utils.cpp_extension.load首次运行时 JIT 编译，无需手动 setup.py install（见 [WKV 后端](#wkv-后端)）。
 
 ## 数据准备
@@ -40,15 +40,14 @@ Ref (480×480) ──→ RWKV Adapter ──→ 多尺度残差 ─────�
 └── test/{HR,LR,Ref}/*.png
 ```
 
-- HR / Ref：480×480，LR：120×120（4× 下采样），文件名一一对应。
+- 图像尺寸和倍率由配置决定：HRMS-SCD / UC Merced / AID 为 4×，Real-RefRSSRD 为 10×；文件名一一对应。
+- 当前本地数据尺寸：HRMS-SCD `512/128`、UC Merced `256/64`、AID `512/128`、Real-RefRSSRD `480/48`（HR/LR）。
 - 值域在数据集内部统一为 [-1, 1]。
 - 裁剪先采 LR 整数坐标再乘 scale 映射 HR/Ref，保证严格对齐。
 
-LMDB 加速（可选）：
+数据集说明：[`RefSR_data/HRMS_SCD/RefSR-HRMS.md`](RefSR_data/HRMS_SCD/RefSR-HRMS.md)、[`RefSR_data/ALL_2/Real-RefRSSRD.md`](RefSR_data/ALL_2/Real-RefRSSRD.md)、[`data/remote_sensing/prepared/UC_Merced/介绍.md`](data/remote_sensing/prepared/UC_Merced/介绍.md)、[`data/remote_sensing/prepared/AID/介绍.md`](data/remote_sensing/prepared/AID/介绍.md)。图像和压缩包均由 `.gitignore` 排除，GitHub 只保留这些说明和代码。
 
-```bash
-python RefSR_data/convert_to_lmdb.py --data_dir RefSR_data/ALL_2
-```
+训练和评估统一读取 PNG 文件夹中的同名 `HR`、`LR`、`Ref` 三元组。
 
 ## 训练
 
@@ -63,7 +62,8 @@ configs/
 ├── stage2_semantic.yaml      # Stage 2 覆盖
 ├── stage3_texture.yaml       # Stage 3 覆盖
 ├── stage4_gan.yaml           # Stage 4 覆盖
-├── sr_prior_4.yaml           # SR Prior ×4 独立训练
+├── sr_prior_hrms_scd_x4.yaml # HRMS-SCD ×4 独立训练
+├── sr_prior_real_refrssrd_x10.yaml # Real-RefRSSRD ×10 独立训练
 └── ablation/
     └── b_sd2_noref.yaml      # 消融 B：无参考（示例预置）
 ```
@@ -79,63 +79,27 @@ configs/
 | 3 | stage3_texture.yaml | SelfSim + 置信/时序门控 | diff_sr=0.3, lpips=0.5, sr_noise=0(warmdown) | 5e-6 / bf16 |
 | 4 | stage4_gan.yaml | D_sem/D_tex + Swap + D_tex 加权 | +gan=0.02, gan_tex=0.05 | 1e-6 / fp32 |
 
-### 🔧 SR Prior ×4 独立训练
+### SR Prior 独立训练
 
-SR Prior（RefSRWKV）可独立于四阶段课程单独训练，用于生成高质量 SR latent 作为扩散先验。
+SR Prior（RefSRWKV）可独立于四阶段扩散课程训练，用于生成 SR 图像和结构先验。按数据集选择配置：
 
-**配置文件：`configs/sr_prior_4.yaml`**
+| 数据集 | 配置 | HR/LR | 倍率 | 输出目录 |
+| --- | --- | ---: | ---: | --- |
+| HRMS-SCD | `configs/sr_prior_hrms_scd_x4.yaml` | 512/128 | 4× | `checkpoints/refrwkv_sr_hrms_scd_x4` |
+| Real-RefRSSRD | `configs/sr_prior_real_refrssrd_x10.yaml` | 480/48 | 10× | `checkpoints/refrwkv_sr_real_refrssrd_x10` |
+| UC Merced | `configs/sr_prior_ucmerced.yaml` | 256/64 | 4× | `checkpoints/refrwkv_sr_ucmerced` |
+| AID | `configs/sr_prior_aid.yaml` | 512/128 | 4× | `checkpoints/refrwkv_sr_aid` |
 
-```yaml
-model:
-  dim: 48
-  num_blocks: [4, 6, 6, 8]
-  learning_rate: 1.0e-4    # 从头训练（热启动用 1e-5）
-  lr_scheduler: plateau     # 监控 val_loss 的自适应衰减
-  lr_patience: 2            # 容忍 2 次验证无有效改善，第 3 次触发
-  lr_factor: 0.5            # 触发后学习率乘以该系数
-  lr_min: 1.0e-6            # 学习率下限
-  lr_threshold: 1.0e-4      # val_loss 绝对下降需超过此数值才算改善
-  ssim_weight: 0.2          # SSIM 结构相似度损失权重
-  fft_weight: 0.1           # 频域 L1 损失权重（增强高频细节）
-
-data:
-  data_dir: "RefSR_data/ALL_2"
-  batch_size: 8
-  num_workers: 4
-
-trainer:
-  max_epochs: 100
-  precision: "bf16"
-  gradient_clip_val: 1.0
-```
-
-**训练命令：**
+启动命令（使用 `rwkv7` 环境）：
 
 ```bash
-python scripts/train_sr_prior.py --config configs/sr_prior_4.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_hrms_scd_x4.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_real_refrssrd_x10.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_ucmerced.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_aid.yaml
 ```
 
-**关键改进（vs 早期版本）：**
-
-| 改进点 | 说明 | 效果 |
-| --- | --- | --- |
-| LR bicubic 上采样 + 残差学习 | 输出 = bicubic + residual，bicubic 兜底 | 训练稳定，PSNR 下限有保证 |
-| 参考图颜色对齐 | Ref 减去通道均值后再融合 | 消除 T1-T2 跨时相色偏 |
-| GatedFusion 余弦置信度 | cos_sim(ref_feat, lr_feat) 作为门控权重 | 抑制不可靠参考图的颜色污染 |
-| OmniShift 残差门控 | `self.gate` 初始为 0（恒等映射） | 训练初期稳定，逐步学习偏移量 |
-| lr_up 加 dilation | 上采样卷积加空洞卷积 | 扩大感受野，保留更多细节 |
-| 频域 loss (FFT) | `torch.fft.rfft2` 算频域 L1 loss | 增强高频边缘和纹理重建 |
-| PixelShuffle 间加 ReLU | 每个 PixelShuffle 层后加 ReLU | 消除棋盘格伪影 |
-
-**预期指标（val 集）：**
-
-| 方法 | val PSNR (dB) | 备注 |
-| --- | --- | --- |
-| Bicubic 基线 | ~23.3 | 直接 4× 双三次插值 |
-| SwinIR 零样本迁移 | ~19.0 | 自然图像预训练，跨域退化 |
-| RefRWKV (旧版) | ~18.7 | 有颜色污染+伪影问题 |
-| **RefRWKV (新版)** | **> 20 (1-2 epoch)** | **残差学习+颜色对齐** |
-| **RefRWKV (收敛)** | **目标 > 23** | **超过 bicubic 基线** |
+所有 SR Prior 配置使用 EMA、验证驱动的 `ReduceLROnPlateau`、梯度裁剪及可选的 SSIM/FFT 损失；具体权重、验证频率和停止条件以 YAML 为准。训练日志和 checkpoint 会写入配置中与数据集对应的目录。
 
 ### 关键开关速查
 
@@ -163,7 +127,7 @@ python scripts/train_sr_prior.py --config configs/sr_prior_4.yaml
 
 | 实验 | 构成 | 命令 |
 | --- | --- | --- |
-| A | 仅 RWKV SR | `python scripts/train_sr_prior.py --config configs/sr_prior_4.yaml` |
+| A | 仅 RWKV SR | `python scripts/train_sr_prior.py --config configs/sr_prior_hrms_scd_x4.yaml` |
 | B | +SD2 先验（无参考） | `python scripts/train_sd2_gan.py --config configs/ablation/b_sd2_noref.yaml` |
 | C | +参考图 | `python scripts/train_sd2_gan.py --config configs/stage1_baseline.yaml` |
 | D | +语义金字塔 | `python scripts/train_sd2_gan.py --config configs/stage2_semantic.yaml` |
@@ -228,7 +192,7 @@ RefRWKV/
 │   └── RefDiffRWKV/    # generator / adapter / semantic / discriminator / gan system / sampler
 ├── scripts/            # train_sd2_gan.py / train_sr_prior.py / test.py
 ├── evaluation/         # eval_pyiqa.py / eval_sewar.py
-├── RefSR_data/         # RefDataset.py / convert_to_lmdb.py
+├── RefSR_data/         # RefDataset.py（PNG loader）
 └── checkpoints/        # 模型权重
 ```
 
@@ -258,7 +222,7 @@ TensorBoard 指标一览（logs/sd2_ref_gan/）：
 
 | 症状 | 可能原因 | 处理 |
 | --- | --- | --- |
-| 启动报 SR 权重无处加载 | sr.ckpt_path 不存在且无 resume_ckpt | 检查 checkpoints/refrwkv_sr/ 下实际文件（本机为 new.ckpt），或 `--overrides model.sr.ckpt_path=...` |
+| 启动报 SR 权重无处加载 | sr.ckpt_path 不存在且无 resume_ckpt | 检查对应数据集配置的 `output.checkpoint_dir`，或用 `--overrides model.sr.ckpt_path=...` 指定权重 |
 | 首次运行 JIT 编译失败 | CUDA/NVCC 版本与 GPU 不匹配 | Blackwell(sm_120) 需 CUDA >= 12.8 |
 | semantic_pyramid 权重跳过 | WKV 公式与 checkpoint 不一致 | 属预期（公式变更），日志会提示 |
 | 训练中断恢复 | — | 重交同一命令，last.ckpt 自动断点续训 |
@@ -267,10 +231,10 @@ TensorBoard 指标一览（logs/sd2_ref_gan/）：
 
 ## 已知限制
 
-- 仅支持 4× 超分（120→480），单卡 RTX 4090/4060 16GB。
+- 当前 SR Prior 配置覆盖 4×（HRMS-SCD、UC Merced、AID）和 10×（Real-RefRSSRD）；显存需求随数据集尺寸和 batch size 变化。
 - CUDA WKV 算子需要 CUDA/NVCC，不支持纯 CPU 推理（空间 RWKV 路径）。
 - SelfSimTransfer 全局 affinity 为 O(N²)，高分辨率下需注意显存（Stage 3/4 开启）。
 - 数据加载器暂不支持断点续训的 epoch 内恢复（中断后重新遍历）。
 - 评估暂未集成遥感专用指标（SAM / ERGAS）。
 
-详见根目录 [优化.md](优化.md) 获取优化明细与验证记录。
+训练、评估和数据集的现行入口以本 README、`RefSRWKV.md`、配置文件及数据集目录内的说明为准。

@@ -54,6 +54,6 @@ train:
   accumulate_grad_batches: 2
 
 output:
-  checkpoint_dir: "checkpoints/refrwkv_sr_10"
-  log_dir: "logs/refrwkv_sr"
-  experiment_name: "refrwkv_sr_10"
+  checkpoint_dir: "checkpoints/refrwkv_sr_real_refrssrd_x10"
+  log_dir: "logs/refrwkv_sr_real_refrssrd_x10"
+  experiment_name: "refrwkv_sr_real_refrssrd_x10"

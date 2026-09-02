@@ -7,7 +7,6 @@ dist/
 build/
 
 # ===== 数据集 =====
-*.lmdb/
 RefSR_data/ALL_2/
 RefSR_data/ALL_2_zip/
 RefSR_data/CUFED/

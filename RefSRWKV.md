@@ -33,7 +33,7 @@ clamp(bicubic(lr) + residual, -1, 1)
 lr_feature + gate(fused) * confidence * fused
 ```
 
-训练时可通过 `ref_drop_prob` 随机替换参考图，以增强 SISR 场景下的恢复能力。每个样本独立决定是否替换，和 batch size 无关；替换值始终是该样本 LR 的双三次上采样。`configs/sr_prior_4.yaml` 当前设置为 `ref_drop_prob: 0.2`。
+训练时可通过 `ref_drop_prob` 随机替换参考图，以增强 SISR 场景下的恢复能力。每个样本独立决定是否替换，和 batch size 无关；替换值始终是该样本 LR 的双三次上采样。`configs/sr_prior_hrms_scd_x4.yaml`、`configs/sr_prior_ucmerced.yaml` 和 `configs/sr_prior_aid.yaml` 当前设置为 `ref_drop_prob: 0.2`。
 
 ## CUDA 环境
 
@@ -50,7 +50,6 @@ pytorch-lightning
 torchvision
 Pillow
 PyYAML
-lmdb
 pyiqa  # 可选；不可用时自动使用手写 SSIM
 ```
 
@@ -111,21 +110,23 @@ conda run -n rwkv7 python scripts/prepare_remote_sensing.py \
 
 脚本会写出 `metadata.json` 和 `manifest.jsonl`，并校验每个 split 的 RGB、尺寸和三目录同名配对。由于两个数据集的 HR 尺寸不同，训练时要使用对应配置，不能把 UC Merced 的 `hr_size=256` 与 AID 的 `hr_size=512` 混在同一个固定网格实验中。
 
+真实参考数据集 `RefSR_data/ALL_2`（Real-RefRSSRD）与上述合成 SISR 数据不同：其 `HR` 和 `Ref` 是真实 NAIP 影像，`LR` 是真实 Sentinel-2 影像，倍率为 10（480×480 / 48×48）。数据说明见 [`RefSR_data/ALL_2/Real-RefRSSRD.md`](RefSR_data/ALL_2/Real-RefRSSRD.md)。HRMS-SCD 的跨时相 RefSR 转换说明见 [`RefSR_data/HRMS_SCD/RefSR-HRMS.md`](RefSR_data/HRMS_SCD/RefSR-HRMS.md)。
+
 ## 训练
 
 在仓库根目录使用 `rwkv7` 环境启动：
 
 ```bash
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_4.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_10.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_hrms_scd_x4.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_real_refrssrd_x10.yaml
 conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_ucmerced.yaml
 conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_aid.yaml
 ```
 
 | 配置 | HR patch | LR patch | 倍率 | 内部网格 | batch size |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `configs/sr_prior_4.yaml` | 512 | 128 | 4 | 128 | 4 |
-| `configs/sr_prior_10.yaml` | 480 | 48 | 10 | 120 | 4 |
+| `configs/sr_prior_hrms_scd_x4.yaml` | 512 | 128 | 4 | 128 | 4 |
+| `configs/sr_prior_real_refrssrd_x10.yaml` | 480 | 48 | 10 | 120 | 4 |
 | `configs/sr_prior_ucmerced.yaml` | 256 | 64 | 4 | 64 | 4 |
 | `configs/sr_prior_aid.yaml` | 512 | 128 | 4 | 128 | 4 |
 
@@ -152,7 +153,7 @@ conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_ai
 
 ```bash
 conda run -n rwkv7 python scripts/train_sr_prior.py \
-  --config configs/sr_prior_4.yaml \
+  --config configs/sr_prior_hrms_scd_x4.yaml \
   --load_weights /path/to/weights.ckpt
 ```
 
@@ -160,24 +161,39 @@ conda run -n rwkv7 python scripts/train_sr_prior.py \
 
 ```bash
 conda run -n rwkv7 python scripts/train_sr_prior.py \
-  --config configs/sr_prior_4.yaml \
-  --resume checkpoints/refrwkv_sr_4/last.ckpt
+  --config configs/sr_prior_hrms_scd_x4.yaml \
+  --resume checkpoints/refrwkv_sr_hrms_scd_x4/last.ckpt
 ```
 
 ## 评测
 
-`scripts/eval_four_settings.py` 可在同一测试集上对比 bicubic、准备好的 SISR Ref 和 HR 作为上限参考。准备好的遥感数据只有 `train/val/test`，因此显式指定 `--splits test`；`--hr_size` 必须与 checkpoint 训练时的 HR patch 一致：
+`scripts/eval_four_settings.py` 可在同一测试集上对比四种输入：`bicubic`（插值基线）、`sisr_ref`（LR 的 bicubic 上采样，SISR 模式）、`dataset_ref`（当前样本的配对真实 Ref）和 `perfect_ref`（HR 作为诊断上限）。HRMS-SCD 应使用 `dataset_ref`；UC Merced 与 AID 是合成 SISR 数据，应使用 `sisr_ref`。`--hr_size` 必须与 checkpoint 训练时的 HR patch 一致，而不是测试图像的边长。
+
+HRMS-SCD 的两个正式测试 split 可按以下命令复现：
 
 ```bash
 conda run -n rwkv7 python scripts/eval_four_settings.py \
   --ckpt checkpoints/refrwkv_sr_4/last.ckpt \
+  --data RefSR_data/HRMS_SCD \
+  --splits test_easy test_hard \
+  --settings bicubic dataset_ref sisr_ref \
+  --scale 4 \
+  --hr_size 512 \
+  --batch-size 4
+```
+
+准备好的遥感数据只有 `train/val/test`，评测时显式指定 `--splits test`：
+
+```bash
+conda run -n rwkv7 python scripts/eval_four_settings.py \
+  --ckpt checkpoints/refrwkv_sr_hrms_scd_x4/last.ckpt \
   --data data/remote_sensing/prepared/AID \
   --splits test \
   --scale 4 \
   --hr_size 512
 ```
 
-UC Merced 使用 `--data data/remote_sensing/prepared/UC_Merced --hr_size 256`。评测默认加载 EMA 权重，并在推理前调用 `prepare_for_inference()`；`Ref` 设定就是 SISR 的实际测试路径，`perfect_ref` 仅用于诊断参考信息的理论上限。
+当前 `checkpoints/refrwkv_sr_4/last.ckpt` 使用 512 网格，因此它交叉评测 UC Merced 时仍应传 `--hr_size 512`；只有使用 UC Merced 专用 checkpoint 时才传 `--hr_size 256`。评测默认加载 EMA 权重，并在推理前调用 `prepare_for_inference()`；`perfect_ref` 仅用于诊断参考信息的理论上限。
 
 ## 扩散阶段集成
 

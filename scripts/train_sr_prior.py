@@ -574,7 +574,7 @@ def main():
                 logger.warning("%s 不兼容，已忽略，从头训练: %s\n  原因: %s", source, candidate, reason)
 
     logger.info("=" * 60)
-    logger.info("  RefSRWKV SR Prior 训练 (Fixed HR/4 Internal Resolution)")
+    logger.info("  RefSRWKV SR Prior 训练 (Fixed HR/scale Internal Resolution)")
     logger.info("  数据: %s (patch_size=%d, scale=%d)", cfg["data"]["root"], cfg["data"].get("patch_size", 480), cfg["data"].get("scale", 4))
     logger.info("  Batch size: %d × accumulate %d = 等效 %d", cfg["data"].get("batch_size", 4), tc.get("accumulate_grad_batches", 1), cfg["data"].get("batch_size", 4) * tc.get("accumulate_grad_batches", 1))
     scheduler_name = str(mc.get("lr_scheduler", "plateau")).lower()

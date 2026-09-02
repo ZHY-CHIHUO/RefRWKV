@@ -45,6 +45,6 @@ train:
   early_stopping_patience: 10
 
 output:
-  checkpoint_dir: checkpoints/refrwkv_sr_4
-  log_dir: logs/refrwkv_sr_4
-  experiment_name: refwkv_sr_4
+  checkpoint_dir: checkpoints/refrwkv_sr_hrms_scd_x4
+  log_dir: logs/refrwkv_sr_hrms_scd_x4
+  experiment_name: refrwkv_sr_hrms_scd_x4

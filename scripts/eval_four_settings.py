@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""RefSRWKV SISR 评测：bicubic、LR 上采样 Ref，以及 HR 参考上限。"""
+"""RefSRWKV 评测：bicubic、SISR Ref、数据集 Ref 和 HR 参考上限。"""
 import argparse
 import os
 import sys
@@ -9,6 +9,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.getcwd())
 
@@ -18,7 +19,30 @@ from RefSR_data.RefDataset import RefPNGDataset
 PREFIXES = ("model_sr.", "model.", "generator.sr_model.", "sr_model.", "module.")
 # EMA shadow 不含 buffer，这些键缺失属正常
 BUFFER_SUFFIXES = ("conv5x5_reparam_weight", ".scale")
-SETTINGS = ["bicubic", "sisr_ref", "perfect_ref"]
+SETTINGS = ["bicubic", "sisr_ref", "dataset_ref", "perfect_ref"]
+
+
+def gaussian_ssim(pred, target):
+    """Per-image RGB SSIM on [-1, 1] tensors using an 11x11 Gaussian window."""
+    if pred.shape != target.shape:
+        raise ValueError(f"SSIM 输入形状不一致: {tuple(pred.shape)} vs {tuple(target.shape)}")
+    channels, window_size, sigma = pred.shape[1], 11, 1.5
+    pred_f, target_f = pred.float(), target.float()
+    coords = torch.arange(window_size, dtype=torch.float32, device=pred.device)
+    gaussian = torch.exp(-((coords - window_size // 2) ** 2) / (2.0 * sigma ** 2))
+    window_2d = torch.outer(gaussian, gaussian)
+    window = (window_2d / window_2d.sum()).view(1, 1, window_size, window_size)
+    window = window.expand(channels, 1, -1, -1).contiguous()
+    pad = window_size // 2
+    mu_p = F.conv2d(pred_f, window, padding=pad, groups=channels)
+    mu_t = F.conv2d(target_f, window, padding=pad, groups=channels)
+    sigma_p_sq = (F.conv2d(pred_f.square(), window, padding=pad, groups=channels) - mu_p.square()).clamp_min(0.0)
+    sigma_t_sq = (F.conv2d(target_f.square(), window, padding=pad, groups=channels) - mu_t.square()).clamp_min(0.0)
+    sigma_pt = F.conv2d(pred_f * target_f, window, padding=pad, groups=channels) - mu_p * mu_t
+    c1, c2 = (0.01 * 2.0) ** 2, (0.03 * 2.0) ** 2
+    numerator = (2.0 * mu_p * mu_t + c1) * (2.0 * sigma_pt + c2)
+    denominator = (mu_p.square() + mu_t.square() + c1) * (sigma_p_sq + sigma_t_sq + c2)
+    return (numerator / denominator.clamp_min(1e-12)).clamp(-1.0, 1.0).mean(dim=(1, 2, 3))
 
 def strip_prefix(sd):
     out = {}
@@ -64,43 +88,77 @@ def run_split(model, split, args, device):
     ds = RefPNGDataset(data_dir=args.data, mode=split, scale=args.scale,
                        patch_size=args.patch, augment=False, augment_ref=False)
     n = min(args.n, len(ds))
-    acc = {s: [] for s in SETTINGS}
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device == "cuda"),
+    )
+    acc = {s: {"psnr": [], "ssim": []} for s in args.settings}
     t0 = time.time()
     tag = f"patch{args.patch}" if args.patch else "full"
-    print(f"\n>>> {split} [{tag}] 开始（{n} 张）", flush=True)
-    for i in range(n):
-        it = ds[i]
-        lr = it["lr"].unsqueeze(0).to(device)
-        hr = it["hr"].unsqueeze(0).to(device)
+    print(f"\n>>> {split} [{tag}] 开始（{n} 张，batch={args.batch_size}）", flush=True)
+    seen = 0
+    last_log = 0
+    for batch in loader:
+        remaining = n - seen
+        if remaining <= 0:
+            break
+        lr = batch["lr"][:remaining].to(device, non_blocking=True)
+        hr = batch["hr"][:remaining].to(device, non_blocking=True)
         # The SISR setting is defined by the runtime bicubic LR upsample,
         # independent of interpolation details or stale Ref files.
         H, W = hr.shape[2:]
         lr_up = F.interpolate(lr, size=(H, W), mode="bicubic", align_corners=False)
-        outs = {
-            "bicubic": lr_up,
-            "sisr_ref": model(lr, lr_up).clamp(-1, 1),
-            "perfect_ref": model(lr, hr).clamp(-1, 1),
-        }
+        outs = {"bicubic": lr_up}
+        if "sisr_ref" in args.settings:
+            outs["sisr_ref"] = model(lr, lr_up).clamp(-1, 1)
+        if "dataset_ref" in args.settings:
+            ref = batch["ref"][:remaining].to(device, non_blocking=True)
+            if ref.shape != hr.shape:
+                raise ValueError(
+                    "dataset_ref requires paired Ref and HR with identical shapes: "
+                    f"{tuple(ref.shape)} vs {tuple(hr.shape)}"
+                )
+            outs["dataset_ref"] = model(lr, ref).clamp(-1, 1)
+        if "perfect_ref" in args.settings:
+            outs["perfect_ref"] = model(lr, hr).clamp(-1, 1)
         for s, o in outs.items():
-            mse = F.mse_loss(o.float(), hr.float()).item()
-            acc[s].append(10.0 * np.log10(4.0 / max(mse, 1e-10)))
-        if (i + 1) % 50 == 0 or (i + 1) == n:
-            run = "  ".join(f"{s}={np.mean(acc[s]):.2f}" for s in SETTINGS)
-            print(f"  [{split}] {i + 1}/{n}  {(time.time() - t0) / 60:.1f}min  {run}",
+            if s not in acc:
+                continue
+            mse = (o.float() - hr.float()).square().mean(dim=(1, 2, 3))
+            acc[s]["psnr"].extend((10.0 * torch.log10(4.0 / mse.clamp_min(1e-10))).cpu().tolist())
+            acc[s]["ssim"].extend(gaussian_ssim(o, hr).cpu().tolist())
+        seen += lr.size(0)
+        if seen - last_log >= 50 or seen == n:
+            run = "  ".join(
+                f"{s}=PSNR {np.mean(acc[s]['psnr']):.2f} / SSIM {np.mean(acc[s]['ssim']):.4f}"
+                for s in args.settings
+            )
+            print(f"  [{split}] {seen}/{n}  {(time.time() - t0) / 60:.1f}min  {run}",
                   flush=True)
-    return {s: float(np.mean(acc[s])) for s in SETTINGS}
+            last_log = seen
+    return {
+        s: {metric: float(np.mean(values)) for metric, values in metrics.items()}
+        for s, metrics in acc.items()
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="checkpoints/refrwkv_sr_4/last.ckpt")
+    ap.add_argument("--ckpt", default="checkpoints/refrwkv_sr_hrms_scd_x4/last.ckpt")
     ap.add_argument("--data", default="RefSR_data/HRMS_SCD")
     ap.add_argument("--splits", nargs="+", default=None,
                     help="默认优先使用 test；若数据集没有 test，则使用 test_easy/test_hard")
     ap.add_argument("--n", type=int, default=500)
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--num-workers", type=int, default=0)
+    ap.add_argument("--settings", nargs="+", choices=SETTINGS, default=SETTINGS,
+                    help="要评测的设置；默认 bicubic、sisr_ref、dataset_ref、perfect_ref 全部执行")
     ap.add_argument("--scale", type=int, default=4)
     ap.add_argument("--hr_size", type=int, default=512,
-                    help="SR checkpoint 训练时的 HR patch 边长；sr_prior_10 使用 480")
+                    help="SR checkpoint 训练时的 HR patch 边长；Real-RefRSSRD ×10 配置使用 480")
     ap.add_argument("--patch", type=int, default=None,
                     help="评测时的 HR 裁剪边长；默认 None 表示全图")
     ap.add_argument("--raw", action="store_true", help="用原始权重而非 EMA")
@@ -130,8 +188,13 @@ def main():
 
     print("\n===== 汇总（Δ vs bicubic）=====")
     for sp, r in results.items():
-        b = r["bicubic"]
-        print(f"  {sp}: bicubic {b:.2f} | sisr_ref {r['sisr_ref']:.2f} ({r['sisr_ref'] - b:+.2f}) "
-              f"| perfect_ref {r['perfect_ref']:.2f} ({r['perfect_ref'] - b:+.2f})")
+        b = r.get("bicubic")
+        parts = []
+        for setting, metric in r.items():
+            text = f"{setting} PSNR {metric['psnr']:.2f} / SSIM {metric['ssim']:.4f}"
+            if b is not None and setting != "bicubic":
+                text += f" (ΔPSNR {metric['psnr'] - b['psnr']:+.2f})"
+            parts.append(text)
+        print(f"  {sp}: " + " | ".join(parts))
 if __name__ == "__main__":
     main()
