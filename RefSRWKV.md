@@ -1,200 +1,194 @@
 # RefSRWKV
 
-RefSRWKV 是面向 RGB 图像的参考引导超分辨率先验网络。模型以窗口化双向 RWKV 为骨干，结合多尺度特征融合与残差重建头；数据集输入和输出的数值范围均为 `[-1, 1]`。当前的单图超分（SISR）数据管线把 bicubic 上采样的 LR 作为 Ref，不依赖同类或外部语义参考图。
+RefSRWKV 是用于遥感图像超分辨率的 RGB 重建先验网络。它以窗口化双向 RWKV 为主干，在 U-Net 的四个尺度融合 LR 与参考特征，并以残差方式恢复 HR 图像。训练和推理张量均使用 [-1, 1] 值域。
 
-## 输入与尺寸约定
+## 输入与尺寸
 
-```text
+~~~text
 lr:   [B, C_in, H_lr, W_lr]
-ref:  [B, C_in, H_ref, W_ref]
-out:  [B, C_out, H_ref, W_ref]
-```
+ref:  [B, C_in, H_hr, W_hr]
+out:  [B, C_out, H_hr, W_hr]
+~~~
 
-- `ref_channels` 必须等于 `inp_channels`，因为参考图颜色统计以 LR 上采样图为目标进行对齐。
-- `dim` 必须是 16 的倍数，以满足 CUDA Bi-WKV 算子的通道约束。
-- `hr_size` 是训练 HR patch 的边长，用于定义模型内部网格，必须能被 32 整除。
-- `scale` 定义数据集裁剪时的 LR/HR 尺寸关系；网络内部始终使用固定网格，因此可用于任意整数倍率的数据。
+- ref_channels 必须等于 inp_channels，因为参考图会先与 LR 的 bicubic 上采样结果做逐样本颜色统计匹配。
+- dim 必须是 16 的倍数，满足 CUDA Bi-WKV 算子的通道约束。
+- 配置中的 hr_size 是训练 crop 与 checkpoint 的尺寸契约，必须可被 32 整除。
+- 推理时网络从输入 ref 的实际尺寸推导内部网格，不会把更大的测试图缩回训练 crop。运行时 ref 的高和宽也必须可被 32 整除。
+- scale 描述数据 loader 中 LR/HR crop 的对应关系；模型输出的空间尺寸始终跟随 ref。
 
-内部特征尺寸为 `internal_size = hr_size / 4`。参考图先经过 `PixelUnshuffle(4)` 折叠到 HR/4 网格，再经过三级下采样；解码器回到 HR/4 网格后使用两级 `PixelShuffle(2)` 生成高分辨率残差。最终输出为：
+参考图先用 PixelUnshuffle(4) 进入 HR/4 网格，经过三级下采样与对称解码后，再由两级 PixelShuffle(2) 重建 HR 残差：
 
-```text
-clamp(bicubic(lr) + residual, -1, 1)
-```
+~~~text
+out = clamp(bicubic(lr, ref.size) + residual, -1, 1)
+~~~
 
-残差输出卷积采用零初始化，训练开始时的预测即为双三次插值基线。
+最终输出卷积零初始化，因此训练开始时的预测就是 bicubic 基线。
 
-## 空间混合与参考融合
+## 分层窗口 RWKV
 
-`VRWKV_SpatialMix` 将特征分成 8x8 窗口，并在窗口内执行行优先与列优先的 Bi-WKV 扫描。移位窗口在上侧和左侧进行零填充，在下侧和右侧补齐窗口尺寸，因此图像边界不会发生循环拼接。
+每个 Block 只执行一次窗口内 Bi-WKV。offsets 定义同一 stage 内各 block 轮流使用的窗口原点；例如 [0, 4] 表示第 0 个 block 不移位、第 1 个 block 移位 4 像素、第 2 个 block 再回到不移位。它不是在单个 block 内额外计算两次。
 
-`GatedFusion` 在四个尺度融合 LR 与参考特征。它以余弦相似度作为置信度，将其映射到 `[0, 1]`，并通过可学习门控注入融合特征：
+默认训练配置位于 configs/sr_prior_base.yaml，采用每个 stage 独立重新计相位的对称方案：
 
-```text
+| Stage | AID x4 特征尺寸 | window / offsets |
+| --- | ---: | --- |
+| enc1、dec1、refine | 64 x 64 | 8 / [0, 4] |
+| enc2、dec2 | 32 x 32 | 8 / [0, 4] |
+| enc3、dec3 | 16 x 16 | 4 / [0, 2] |
+| latent | 8 x 8 | 4 / [0, 2] |
+
+窗口边界以零填充移动，不发生循环拼接。窗口大小和偏移量不引入可学习参数，也不改变 RWKV、卷积或融合层的张量形状。因此，在 dim、hidden_rate、通道数、block 数和其余网络结构相同的前提下，改变窗口配置可以通过 --load_weights 迁移权重。
+
+没有 windows 字段时，模型保持全局相位的兼容模式：window_size: 8、shift_size: 3、shift_cycle: 3 对应 8 / [0, 3, 6]。
+
+## 参考模式
+
+data.reference_mode 控制进入模型的参考图：
+
+| 模式 | 行为 | 使用数据集 |
+| --- | --- | --- |
+| lr_up | 在运行时把当前 LR bicubic 上采样到 HR 尺寸，忽略存储的 Ref 内容 | AID、UC Merced 的 SISR |
+| paired | 使用 PNG 中同名的真实配对 Ref | HRMS-SCD、Real-RefRSSRD |
+
+model.ref_drop_prob 仅在训练阶段生效，并按样本将配对参考替换为该样本的 LR 上采样图。AID 的 aid_x4_l1 使用 lr_up 与 ref_drop_prob: 0.0，因此训练、验证和测试始终是相同的单图超分辨率条件。
+
+GatedFusion 在四个尺度融合 LR 与参考特征。它以余弦相似度构成置信度，再通过可学习门控控制参考信息：
+
+~~~text
 lr_feature + gate(fused) * confidence * fused
-```
-
-训练时可通过 `ref_drop_prob` 随机替换参考图，以增强 SISR 场景下的恢复能力。每个样本独立决定是否替换，和 batch size 无关；替换值始终是该样本 LR 的双三次上采样。`configs/sr_prior_hrms_scd_x4.yaml`、`configs/sr_prior_ucmerced.yaml` 和 `configs/sr_prior_aid.yaml` 当前设置为 `ref_drop_prob: 0.2`。
+~~~
 
 ## CUDA 环境
 
-空间 RWKV 路径依赖 `models/cuda/bi_wkv.cpp` 与 `models/cuda/bi_wkv_kernel.cu`。首次使用时，PyTorch 会通过 `torch.utils.cpp_extension.load` 编译并加载扩展。
+空间 RWKV 只使用 models/cuda/bi_wkv.cpp 和 models/cuda/bi_wkv_kernel.cu 提供的 CUDA Bi-WKV 实现。首次前向传播时，PyTorch 通过 torch.utils.cpp_extension.load 编译并加载扩展；不提供 PyTorch 等价后端。
 
-建议使用带 CUDA 的 PyTorch 环境。项目已在 Conda 环境 `rwkv7`、PyTorch `2.10.0+cu128`、CUDA `12.8` 和 RTX 5060 Ti 上完成训练路径验证。
+已验证环境：Conda rwkv7、PyTorch 2.10.0+cu128、CUDA 12.8、RTX 5060 Ti。
 
-所需 Python 依赖：
+主要依赖：
 
-```text
+~~~text
 torch
 einops
 pytorch-lightning
 torchvision
 Pillow
 PyYAML
-pyiqa  # 可选；不可用时自动使用手写 SSIM
-```
+pyiqa  # 可选；不可用时使用内置 SSIM
+~~~
 
-## 数据集目录
+## 数据与配置
 
-PNG 数据集按同名文件配对：
+所有数据集使用 PNG 三元组：
 
-```text
+~~~text
 <data_root>/<split>/LR/*.png
 <data_root>/<split>/HR/*.png
 <data_root>/<split>/Ref/*.png
-```
+~~~
 
-图像以 RGB 读取并归一化到 `[-1, 1]`。随机裁剪先采样整数 LR 坐标，再按 `data.scale` 映射到 HR 与 Ref 坐标，以保持空间对齐。`RefPNGDataset` 读取的是上述三目录配对格式，不能直接读取 UC Merced/AID 的原始分类目录。
+RefPNGDataset 从 LR 坐标采样 crop，再按 scale 映射到 HR 与 Ref，以保持像素对齐。训练 crop 随机采样；验证和测试 crop 使用样本索引与固定种子，保证每次验证覆盖相同区域。
 
-### UC Merced 与 AID
+配置分为三层：
 
-这两个公开数据集原本用于遥感场景分类，并不提供 SR 的 LR/HR 配对。仓库中的准备脚本先按类别做固定种子的 `70%/15%/15%` 分层切分，再从每张原图中心裁剪 HR，使用 PIL bicubic 生成 LR，并把 LR 再 bicubic 上采样到 HR 尺寸写入 Ref：
+~~~text
+configs/sr_prior_base.yaml       # 网络、窗口、优化器和通用训练默认值
+configs/datasets/*.yaml          # 数据集事实、根目录与存储尺寸
+configs/runs/*.yaml              # 训练 HR crop、倍率、loss 与实验差异
+~~~
 
-```text
-Ref = bicubic(LR, HR.size)  # SISR reference
-```
+run 配置通过 base: 继承数据集配置，脚本会自动展开为 data.root、data.patch_size、data.scale 和 model.scale。数据集信息见以下说明：
 
-已下载的原始压缩包（均位于 `data/remote_sensing/raw/`，该目录已被 git 忽略）：
-
-| 数据集 | 文件 | 原始规模 | 准备后 split（train/val/test）与尺寸（scale=4） |
-| --- | --- | ---: | --- |
-| UC Merced | `uc_merced_land_use.zip` | 21 类 / 2100 张 | `1470/315/315`；HR/Ref `256x256`，LR `64x64` |
-| AID | `aid_scene_classification.zip` | 30 类 / 10000 张 | `7000/1507/1493`；HR/Ref `512x512`，LR `128x128` |
-
-来源：UC Merced 原始数据集 [UCMerced Land Use](http://weegee.vision.ucmerced.edu/datasets/landuse.html)（本地下载使用 [Kaggle 镜像](https://www.kaggle.com/datasets/abdulhasibuddin/uc-merced-land-use-dataset)）；AID 原始数据集 [AID](http://captain.whu.edu.cn/AID/)（本地下载使用 [Kaggle 镜像](https://www.kaggle.com/datasets/jiayuanchengala/aid-scene-classification-datasets)）。准备数据：
-
-```bash
-mkdir -p data/remote_sensing/raw
-curl -L 'https://www.kaggle.com/api/v1/datasets/download/abdulhasibuddin/uc-merced-land-use-dataset' \
-  -o data/remote_sensing/raw/uc_merced_land_use.zip
-curl -L 'https://www.kaggle.com/api/v1/datasets/download/jiayuanchengala/aid-scene-classification-datasets' \
-  -o data/remote_sensing/raw/aid_scene_classification.zip
-
-mkdir -p data/remote_sensing/raw/ucmerced_extracted data/remote_sensing/raw/aid_extracted
-unzip -q data/remote_sensing/raw/uc_merced_land_use.zip -d data/remote_sensing/raw/ucmerced_extracted
-unzip -q data/remote_sensing/raw/aid_scene_classification.zip -d data/remote_sensing/raw/aid_extracted
-
-conda run -n rwkv7 python scripts/prepare_remote_sensing.py \
-  --dataset ucmerced \
-  --source-dir data/remote_sensing/raw/ucmerced_extracted/UCMerced_LandUse/Images \
-  --output-dir data/remote_sensing/prepared/UC_Merced \
-  --source-archive data/remote_sensing/raw/uc_merced_land_use.zip \
-  --workers 8
-
-conda run -n rwkv7 python scripts/prepare_remote_sensing.py \
-  --dataset aid \
-  --source-dir data/remote_sensing/raw/aid_extracted/AID \
-  --output-dir data/remote_sensing/prepared/AID \
-  --source-archive data/remote_sensing/raw/aid_scene_classification.zip \
-  --workers 8
-```
-
-脚本会写出 `metadata.json` 和 `manifest.jsonl`，并校验每个 split 的 RGB、尺寸和三目录同名配对。由于两个数据集的 HR 尺寸不同，训练时要使用对应配置，不能把 UC Merced 的 `hr_size=256` 与 AID 的 `hr_size=512` 混在同一个固定网格实验中。
-
-真实参考数据集 `RefSR_data/ALL_2`（Real-RefRSSRD）与上述合成 SISR 数据不同：其 `HR` 和 `Ref` 是真实 NAIP 影像，`LR` 是真实 Sentinel-2 影像，倍率为 10（480×480 / 48×48）。数据说明见 [`RefSR_data/ALL_2/Real-RefRSSRD.md`](RefSR_data/ALL_2/Real-RefRSSRD.md)。HRMS-SCD 的跨时相 RefSR 转换说明见 [`RefSR_data/HRMS_SCD/RefSR-HRMS.md`](RefSR_data/HRMS_SCD/RefSR-HRMS.md)。
+- [AID](data/remote_sensing/prepared/AID/介绍.md)
+- [UC Merced](data/remote_sensing/prepared/UC_Merced/介绍.md)
+- [RefSR-HRMS](RefSR_data/HRMS_SCD/RefSR-HRMS.md)
+- [Real-RefRSSRD](RefSR_data/ALL_2/Real-RefRSSRD.md)
 
 ## 训练
 
-在仓库根目录使用 `rwkv7` 环境启动：
+| 配置 | HR/LR train crop | 参考模式 | batch | 训练终点 |
+| --- | --- | --- | ---: | --- |
+| configs/runs/aid_x4_l1.yaml | 256 / 64, x4 | lr_up | 32 | L1，50,000 optimizer steps |
+| configs/runs/hrms_scd_x4.yaml | 512 / 128, x4 | paired | 4 | 50,000 optimizer steps |
+| configs/runs/ucmerced_x4.yaml | 256 / 64, x4 | lr_up | 4 | 50 epochs |
+| configs/runs/real_refrssrd_x10.yaml | 480 / 48, x10 | paired | 4 | 200 epochs |
 
-```bash
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_hrms_scd_x4.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_real_refrssrd_x10.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_ucmerced.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_aid.yaml
-```
+先从头训练 AID：
 
-| 配置 | HR patch | LR patch | 倍率 | 内部网格 | batch size |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `configs/sr_prior_hrms_scd_x4.yaml` | 512 | 128 | 4 | 128 | 4 |
-| `configs/sr_prior_real_refrssrd_x10.yaml` | 480 | 48 | 10 | 120 | 4 |
-| `configs/sr_prior_ucmerced.yaml` | 256 | 64 | 4 | 64 | 4 |
-| `configs/sr_prior_aid.yaml` | 512 | 128 | 4 | 128 | 4 |
-
-表中配置均使用 BF16 混合精度与梯度累积；两个新增配置将验证采样上限设为 `300`，训练集和测试集仍保留全部样本。UC Merced 配置的 HR 网格较小，适合先做快速验证。RTX 5060 Ti（16 GiB）已完成上述配置的单次 batch=4 前向、反向与优化器更新。
-
-训练模块由 L1 损失与可选 SSIM、FFT 损失组成；EMA 仅在真实 optimizer step 后更新，并在验证和测试期间临时应用。学习率默认使用 `ReduceLROnPlateau`，调度器在每次验证运行结束时读取本次聚合后的 `val_loss`，而不是只在 epoch 末读取一次。
-
-### 学习率调度
-
-上述训练配置都使用以下 plateau 规则（具体初始学习率、衰减因子和下限以对应 YAML 为准）：
-
-| 参数 | 含义 |
-| --- | --- |
-| `lr_patience: 2` | 连续 2 次验证没有有效改善后，下一次无效验证触发衰减；因此第 3 次 bad validation 降 LR。 |
-| `lr_threshold: 1.0e-4` | `mode=min` 下，`val_loss` 必须比历史最佳值下降 **超过** 此绝对阈值才算改善。设为 `0` 可关闭最小改善门槛。 |
-| `lr_factor` | 触发时将当前学习率乘以该系数。 |
-| `lr_min` | 学习率下限，不会继续降到该值以下。 |
-
-`val_check_interval` 决定每个 epoch 的验证次数，`lr_patience` 也按这个验证次数计数。例如 `0.2` 通常表示每个 epoch 验证 5 次，因此 patience 不再代表 epoch 数。任何一次达到阈值的中间验证都会立即更新历史最佳值并重置 bad-validation 计数，不会被 epoch 末结果覆盖。`max_epochs` 只是安全上限，实际停止仍由 `early_stopping_patience` 控制。
-
-### Checkpoint
-
-`--resume` 用于结构和调度器配置均兼容的 Lightning checkpoint，会恢复模型、optimizer、plateau 计数和 EMA 状态。脚本只接受能够明确识别为“按验证计数”的 plateau 状态，避免把其他计数单位误当成验证计数。`--load_weights` 用于热启动：只加载同名且形状匹配的模型权重，optimizer、调度器和计数器从当前配置重新开始；不匹配参数保留当前初始化。模型结构变更、调度器语义变更或只想使用已有权重时，应使用 `--load_weights`。
-
-```bash
+~~~bash
 conda run -n rwkv7 python scripts/train_sr_prior.py \
-  --config configs/sr_prior_hrms_scd_x4.yaml \
-  --load_weights /path/to/weights.ckpt
-```
+  --config configs/runs/aid_x4_l1.yaml
+~~~
 
-断点续训示例：
+首次运行会创建 checkpoints/refrwkv_sr_aid_x4_l1/。同一命令再次执行会自动检测该目录的兼容 last.ckpt 并恢复完整训练状态。需要创建一条全新的 AID 实验时，覆盖 run 名称：
 
-```bash
+~~~bash
 conda run -n rwkv7 python scripts/train_sr_prior.py \
-  --config configs/sr_prior_hrms_scd_x4.yaml \
-  --resume checkpoints/refrwkv_sr_hrms_scd_x4/last.ckpt
-```
+  --config configs/runs/aid_x4_l1.yaml \
+  --overrides run.name=aid_x4_l1_run2
+~~~
+
+完成 AID 后，将其 EMA 权重迁移到 HRMS-SCD：
+
+~~~bash
+conda run -n rwkv7 python scripts/train_sr_prior.py \
+  --config configs/runs/hrms_scd_x4.yaml \
+  --load_weights checkpoints/refrwkv_sr_aid_x4_l1/last.ckpt
+~~~
+
+--load_weights 优先加载 checkpoint 中的 EMA 参数，只迁移同名且形状匹配的模型权重；Adam、学习率调度器、global step 和 EMA 计数从当前 run 重新开始。--resume 只用于数据、窗口、模型和训练语义均相同的完整续训。
+
+若 AID 的 batch 32 在实际训练中显存不足，保持等效 batch 32：
+
+~~~bash
+conda run -n rwkv7 python scripts/train_sr_prior.py \
+  --config configs/runs/aid_x4_l1.yaml \
+  --overrides data.batch_size=16 train.accumulate_grad_batches=2
+~~~
+
+## 学习率与验证
+
+默认使用 ReduceLROnPlateau。调度器在每次验证结束后读取聚合的 val_loss，不是只读取 epoch 的最后一次验证：
+
+- lr_patience: 2：连续两次无有效改善后，第三次无效验证触发降学习率。
+- lr_threshold: 1.0e-4：只有 val_loss 至少下降该绝对值才视为改善。
+- val_check_interval 决定验证频率，因此 patience 的单位是验证次数。
+- AID 使用确定性的 300 张验证子集与 val_check_interval: 0.5，使每次 plateau 判断可比较且成本受控。
+
+EMA 只在真实 optimizer step 后更新，并在验证、测试和 checkpoint 热启动时使用。
 
 ## 评测
 
-`scripts/eval_four_settings.py` 可在同一测试集上对比四种输入：`bicubic`（插值基线）、`sisr_ref`（LR 的 bicubic 上采样，SISR 模式）、`dataset_ref`（当前样本的配对真实 Ref）和 `perfect_ref`（HR 作为诊断上限）。HRMS-SCD 应使用 `dataset_ref`；UC Merced 与 AID 是合成 SISR 数据，应使用 `sisr_ref`。`--hr_size` 必须与 checkpoint 训练时的 HR patch 一致，而不是测试图像的边长。
+scripts/eval_four_settings.py 支持四种输入条件：
 
-HRMS-SCD 的两个正式测试 split 可按以下命令复现：
+- bicubic：插值基线。
+- sisr_ref：当前 LR 的 bicubic 上采样，适用于 AID 与 UC Merced。
+- dataset_ref：数据集中的真实配对 Ref，适用于 HRMS-SCD 与 Real-RefRSSRD。
+- perfect_ref：将 HR 当作参考，仅用于诊断上限。
 
-```bash
+训练完成后评测 AID 的完整 test split：
+
+~~~bash
 conda run -n rwkv7 python scripts/eval_four_settings.py \
-  --ckpt checkpoints/refrwkv_sr_4/last.ckpt \
+  --ckpt checkpoints/refrwkv_sr_aid_x4_l1/last.ckpt \
+  --data data/remote_sensing/prepared/AID \
+  --splits test \
+  --settings bicubic sisr_ref \
+  --batch-size 1
+~~~
+
+迁移训练后的 HRMS-SCD 使用两个测试 split：
+
+~~~bash
+conda run -n rwkv7 python scripts/eval_four_settings.py \
+  --ckpt checkpoints/refrwkv_sr_hrms_scd_x4/last.ckpt \
   --data RefSR_data/HRMS_SCD \
   --splits test_easy test_hard \
   --settings bicubic dataset_ref sisr_ref \
-  --scale 4 \
-  --hr_size 512 \
-  --batch-size 4
-```
+  --batch-size 1
+~~~
 
-准备好的遥感数据只有 `train/val/test`，评测时显式指定 `--splits test`：
-
-```bash
-conda run -n rwkv7 python scripts/eval_four_settings.py \
-  --ckpt checkpoints/refrwkv_sr_hrms_scd_x4/last.ckpt \
-  --data data/remote_sensing/prepared/AID \
-  --splits test \
-  --scale 4 \
-  --hr_size 512
-```
-
-当前 `checkpoints/refrwkv_sr_4/last.ckpt` 使用 512 网格，因此它交叉评测 UC Merced 时仍应传 `--hr_size 512`；只有使用 UC Merced 专用 checkpoint 时才传 `--hr_size 256`。评测默认加载 EMA 权重，并在推理前调用 `prepare_for_inference()`；`perfect_ref` 仅用于诊断参考信息的理论上限。
+评测脚本优先从 checkpoint 签名读取 scale、训练 hr_size 和窗口配置；不需要手工重复这些参数。
 
 ## 扩散阶段集成
 
-`scripts/train_sd2_gan.py` 构建 SR prior 时优先读取 `model.sr.hr_size`；未设置时使用 `data.patch_size`。这使 SR 内部网格与扩散训练 patch 保持一致。需要有意使用不同网格时，可在 `model.sr.hr_size` 中显式指定。
+scripts/train_sd2_gan.py 从 configs/base.yaml 的 model.sr 构建 SR prior，并传递相同的窗口配置。model.sr.ckpt_path 默认是 null，避免扩散阶段意外加载不属于当前实验的 SR 权重；开始扩散训练前应显式设置为相应 SR checkpoint。

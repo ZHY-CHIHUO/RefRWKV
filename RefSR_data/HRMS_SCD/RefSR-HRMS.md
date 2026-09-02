@@ -219,26 +219,32 @@ test_hard = RefPNGDataset(
 ### 7.2 训练 Config 示例
 
 ```yaml
-# configs/sr_prior_hrms_scd_x4.yaml
-data:
-  root: "RefSR_data/HRMS_SCD"
-  patch_size: 512
+# configs/runs/hrms_scd_x4.yaml
+base: ../datasets/hrms_scd.yaml
+
+run:
+  name: hrms_scd_x4
   scale: 4
-  augment: true
-  augment_ref: false
-  ref_gray_prob: 0.0
-  batch_size: 4
-  val_batch_size: 1
-  num_workers: 8
-  val_num_workers: 2
-  prefetch_factor: 4
+  hr_patch: 512
+
+data:
+  reference_mode: paired
+  max_samples_val: 300
+
+model:
+  learning_rate: 2.5e-5
+  ref_drop_prob: 0.2
+
+train:
+  max_epochs: -1
+  max_steps: 50000
 ```
 
-完整训练入口是 `configs/sr_prior_hrms_scd_x4.yaml`；它使用现成 CUDA Bi-WKV、`rwkv7` 环境和每次验证触发的 plateau 学习率调度。训练命令：
+完整训练入口是 `configs/runs/hrms_scd_x4.yaml`；它使用现成 CUDA Bi-WKV、`rwkv7` 环境和每次验证触发的 plateau 学习率调度。训练命令：
 
 ```bash
 conda run -n rwkv7 python scripts/train_sr_prior.py \
-  --config configs/sr_prior_hrms_scd_x4.yaml
+  --config configs/runs/hrms_scd_x4.yaml
 ```
 
 ---

@@ -1,0 +1,21 @@
+# Real-RefRSSRD dataset metadata. Training choices belong in configs/runs/.
+base: ../sr_prior_base.yaml
+
+dataset:
+  id: real_refrssrd
+  name: Real-RefRSSRD
+  kind: paired_reference
+  root: RefSR_data/ALL_2
+  default_scale: 10
+  source:
+    hr_size: [480, 480]
+    lr_size: [48, 48]
+    ref_size: [480, 480]
+    channels: 3
+  prepared:
+    hr_size: [480, 480]
+    lr_size: [48, 48]
+    ref_size: [480, 480]
+    scale: 10
+    splits: {train: 74093, val: 172, test: 1456}
+  reference_policy: historical NAIP reference image

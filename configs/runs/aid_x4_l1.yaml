@@ -1,0 +1,34 @@
+# AID x4 SISR fine-tuning with the L1-only 50,000-step recipe.
+# Prepared files are HR/LR 512/128; the training grid is HR/LR 256/64.
+base: ../datasets/aid.yaml
+
+run:
+  name: aid_x4_l1
+  scale: 4
+  hr_patch: 256
+  recipe: l1
+
+model:
+  learning_rate: 5.0e-5
+  ssim_weight: 0.0
+  fft_weight: 0.0
+  ref_drop_prob: 0.0
+
+data:
+  # SISR mode: every training and validation sample uses this sample's
+  # bicubic-upsampled LR instead of the stored Ref PNG.
+  reference_mode: lr_up
+  ref_gray_prob: 0.0
+  batch_size: 32
+  val_batch_size: 32
+  max_samples_val: 300
+
+train:
+  max_epochs: -1
+  max_steps: 50000
+  # Validate twice per epoch. The 300-image deterministic subset keeps the
+  # every-validation plateau scheduler inexpensive and comparable.
+  val_check_interval: 0.5
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  early_stopping_patience: null

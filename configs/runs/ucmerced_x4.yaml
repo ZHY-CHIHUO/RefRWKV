@@ -1,0 +1,14 @@
+# UC Merced x4. Only values different from sr_prior_base.yaml are listed.
+base: ../datasets/ucmerced.yaml
+
+run:
+  name: ucmerced_x4
+  scale: 4
+  hr_patch: 256
+
+data:
+  reference_mode: lr_up
+  max_samples_val: 300
+
+model:
+  ref_drop_prob: 0.0

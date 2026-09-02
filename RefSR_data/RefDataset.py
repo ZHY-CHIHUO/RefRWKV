@@ -47,6 +47,7 @@ class RefPNGDataset(Dataset):
         self.mode = mode
         self.patch_size = patch_size
         self.scale = scale
+        self.sample_seed = sample_seed
         self.augment = augment and (mode == "train")
         self.augment_ref = augment_ref and (mode == "train")
         self.lr_patch_size = None if patch_size is None else patch_size // scale
@@ -148,8 +149,8 @@ class RefPNGDataset(Dataset):
         img_hsv = Image.merge("HSV", (h, s, v))
         return img_hsv.convert("RGB")
 
-    def _random_crop(self, lr, hr, ref):
-        """先采 LR 整数坐标，再映射 HR/ref，保证像素严格对齐。"""
+    def _random_crop(self, lr, hr, ref, rng=random):
+        """Sample LR coordinates, then map them to aligned HR/ref pixels."""
         th_lr = self.patch_size // self.scale
         tw_lr = self.patch_size // self.scale
 
@@ -166,8 +167,8 @@ class RefPNGDataset(Dataset):
             )
 
         # ★ 先采 LR 坐标，再乘 scale 映射到 HR（保证整除对齐）
-        y_lr = random.randint(0, H_lr - th_lr)
-        x_lr = random.randint(0, W_lr - tw_lr)
+        y_lr = rng.randint(0, H_lr - th_lr)
+        x_lr = rng.randint(0, W_lr - tw_lr)
         y_hr = y_lr * self.scale
         x_hr = x_lr * self.scale
 
@@ -208,7 +209,10 @@ class RefPNGDataset(Dataset):
         ref = (np.array(ref_pil, dtype=np.float32) / 127.5) - 1.0
 
         if self.patch_size is not None:
-            lr, hr, ref = self._random_crop(lr, hr, ref)
+            # Validation/test crops must be repeatable: val_loss then measures
+            # model changes rather than a different random region each pass.
+            crop_rng = random if self.mode == "train" else random.Random(self.sample_seed + idx)
+            lr, hr, ref = self._random_crop(lr, hr, ref, rng=crop_rng)
 
         lr = np.ascontiguousarray(np.transpose(lr, (2, 0, 1)))
         hr = np.ascontiguousarray(np.transpose(hr, (2, 0, 1)))

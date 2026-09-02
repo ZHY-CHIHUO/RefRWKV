@@ -53,17 +53,26 @@ Ref (H×W) ────────────────→ RWKV Adapter ─�
 
 ### 配置结构（base + 覆盖）
 
-所有训练/消融配置共用 configs/base.yaml（全部默认值：功能开关全关、loss 系数全 0），各配置通过 base: 字段引用并只写差异：
+扩散阶段配置共用 `configs/base.yaml`。SR Prior 单独使用 `configs/sr_prior_base.yaml`，数据集元信息与训练实验分开维护：
 
 ```
 configs/
-├── base.yaml                 # 公共默认（数据/训练器/模型默认/输出）
+├── base.yaml                 # 扩散阶段公共默认
+├── sr_prior_base.yaml        # SR Prior 公共默认
+├── datasets/                 # 数据集基本信息和原始/准备后尺寸
+│   ├── aid.yaml
+│   ├── hrms_scd.yaml
+│   ├── real_refrssrd.yaml
+│   └── ucmerced.yaml
+├── runs/                     # SR Prior 训练网格和实验差异
+│   ├── aid_x4_l1.yaml
+│   ├── hrms_scd_x4.yaml
+│   ├── real_refrssrd_x10.yaml
+│   └── ucmerced_x4.yaml
 ├── stage1_baseline.yaml      # Stage 1 覆盖
 ├── stage2_semantic.yaml      # Stage 2 覆盖
 ├── stage3_texture.yaml       # Stage 3 覆盖
 ├── stage4_gan.yaml           # Stage 4 覆盖
-├── sr_prior_hrms_scd_x4.yaml # HRMS-SCD ×4 独立训练
-├── sr_prior_real_refrssrd_x10.yaml # Real-RefRSSRD ×10 独立训练
 └── ablation/
     └── b_sd2_noref.yaml      # 消融 B：无参考（示例预置）
 ```
@@ -83,23 +92,25 @@ configs/
 
 SR Prior（RefSRWKV）可独立于四阶段扩散课程训练，用于生成 SR 图像和结构先验。按数据集选择配置：
 
-| 数据集 | 配置 | HR/LR | 倍率 | 输出目录 |
-| --- | --- | ---: | ---: | --- |
-| HRMS-SCD | `configs/sr_prior_hrms_scd_x4.yaml` | 512/128 | 4× | `checkpoints/refrwkv_sr_hrms_scd_x4` |
-| Real-RefRSSRD | `configs/sr_prior_real_refrssrd_x10.yaml` | 480/48 | 10× | `checkpoints/refrwkv_sr_real_refrssrd_x10` |
-| UC Merced | `configs/sr_prior_ucmerced.yaml` | 256/64 | 4× | `checkpoints/refrwkv_sr_ucmerced` |
-| AID | `configs/sr_prior_aid.yaml` | 512/128 | 4× | `checkpoints/refrwkv_sr_aid` |
+| 数据集 | 配置 | 存储 HR/LR | 训练 HR/LR | 倍率 | 输出目录 |
+| --- | --- | ---: | ---: | ---: | --- |
+| HRMS-SCD | `configs/runs/hrms_scd_x4.yaml` | 512/128 | 512/128 | 4× | `checkpoints/refrwkv_sr_hrms_scd_x4` |
+| Real-RefRSSRD | `configs/runs/real_refrssrd_x10.yaml` | 480/48 | 480/48 | 10× | `checkpoints/refrwkv_sr_real_refrssrd_x10` |
+| UC Merced | `configs/runs/ucmerced_x4.yaml` | 256/64 | 256/64 | 4× | `checkpoints/refrwkv_sr_ucmerced_x4` |
+| AID | `configs/runs/aid_x4_l1.yaml` | 512/128 | 256/64 | 4× | `checkpoints/refrwkv_sr_aid_x4_l1` |
 
 启动命令（使用 `rwkv7` 环境）：
 
 ```bash
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_hrms_scd_x4.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_real_refrssrd_x10.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_ucmerced.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_aid.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/hrms_scd_x4.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/real_refrssrd_x10.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/ucmerced_x4.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/aid_x4_l1.yaml
 ```
 
-所有 SR Prior 配置使用 EMA、验证驱动的 `ReduceLROnPlateau`、梯度裁剪及可选的 SSIM/FFT 损失；具体权重、验证频率和停止条件以 YAML 为准。训练日志和 checkpoint 会写入配置中与数据集对应的目录。
+数据集 YAML 只记录数据集根目录、原始/准备后图像尺寸、类别和 split 等信息；训练 YAML 通过 `base:` 继承数据集配置，只记录 `run.scale`、`run.hr_patch` 以及与公共默认值不同的训练参数。脚本会把它们自动展开为 loader/model 所需的 `data.scale`、`data.patch_size` 和 `model.scale`，并按 `run.name` 生成独立的日志和 checkpoint 目录。
+
+所有 SR Prior 配置使用 EMA、验证驱动的 `ReduceLROnPlateau`、梯度裁剪及可选的 SSIM/FFT 损失；AID run 使用 HR 256/LR 64、batch=32、纯 L1 和 50,000 个 optimizer steps。改变倍率时可直接用 `--overrides run.scale=... run.hr_patch=...`，但必须使用按该倍率生成的 LR/HR 配对目录。
 
 ### 关键开关速查
 
@@ -127,7 +138,7 @@ conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_ai
 
 | 实验 | 构成 | 命令 |
 | --- | --- | --- |
-| A | 仅 RWKV SR | `python scripts/train_sr_prior.py --config configs/sr_prior_hrms_scd_x4.yaml` |
+| A | 仅 RWKV SR | `python scripts/train_sr_prior.py --config configs/runs/hrms_scd_x4.yaml` |
 | B | +SD2 先验（无参考） | `python scripts/train_sd2_gan.py --config configs/ablation/b_sd2_noref.yaml` |
 | C | +参考图 | `python scripts/train_sd2_gan.py --config configs/stage1_baseline.yaml` |
 | D | +语义金字塔 | `python scripts/train_sd2_gan.py --config configs/stage2_semantic.yaml` |

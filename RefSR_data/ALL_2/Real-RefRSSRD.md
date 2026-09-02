@@ -92,14 +92,14 @@ val_ds = RefPNGDataset(
 
 ## 5. 当前 RefSRWKV 训练入口
 
-本项目对应配置为 `configs/sr_prior_real_refrssrd_x10.yaml`：
+本项目对应配置为 `configs/runs/real_refrssrd_x10.yaml`：
 
 ```bash
 conda run -n rwkv7 python scripts/train_sr_prior.py \
-  --config configs/sr_prior_real_refrssrd_x10.yaml
+  --config configs/runs/real_refrssrd_x10.yaml
 ```
 
-该配置使用 `scale=10`、`patch_size=480`、现成 CUDA Bi-WKV 和 `rwkv7` 环境；训练时启用参考图风格增强（亮度、对比度、饱和度、色相和灰度化）。配置未默认把真实历史 `Ref` 替换为 bicubic LR；若做 SISR 对照，应显式设置 `model.ref_drop_prob`，并单独记录该实验。
+`configs/runs/real_refrssrd_x10.yaml` 使用 `run.scale=10`、`run.hr_patch=480`、现成 CUDA Bi-WKV 和 `rwkv7` 环境；训练时启用参考图风格增强（亮度、对比度、饱和度、色相和灰度化）。配置保持 `data.reference_mode: paired`，不会将真实历史 `Ref` 替换为 bicubic LR；若做 SISR 对照，应显式设置 `data.reference_mode=lr_up`，并单独记录该实验。
 
 ## 6. 评测注意事项
 

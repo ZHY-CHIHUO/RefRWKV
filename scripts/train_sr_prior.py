@@ -6,6 +6,8 @@ RefSRWKV SR Prior 训练脚本。
 PowerShell 的任意当前目录启动都得到一致行为。配置文本按 UTF-8（兼容 BOM）读取。
 """
 import argparse
+import copy
+import json
 import logging
 import math
 import os
@@ -22,7 +24,7 @@ from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, Mode
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 
-from RefRWKV.models.RefSRWKV import LitRefSRWKV, RefSRWKV
+from RefRWKV.models.RefSRWKV import LitRefSRWKV, RefSRWKV, normalize_window_config
 from RefRWKV.RefSR_data.RefDataset import RefPNGDataset
 
 
@@ -48,15 +50,184 @@ def _resolve_path(value, *, prefer_cwd=False) -> Path:
     return repo_path.resolve()
 
 
-def load_config(path):
-    path = _resolve_path(path, prefer_cwd=True)
+def _apply_overrides(config, overrides):
+    """Apply dotted ``key=value`` overrides after loading YAML."""
+    for item in overrides or []:
+        if "=" not in item:
+            raise ValueError(f"--overrides 项缺少 = : {item!r}")
+        key, raw_value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--overrides 键不能为空: {item!r}")
+        try:
+            value = yaml.safe_load(raw_value)
+        except yaml.YAMLError:
+            value = raw_value
+        node = config
+        parts = key.split(".")
+        for part in parts[:-1]:
+            if not part:
+                raise ValueError(f"--overrides 键无效: {item!r}")
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        if not parts[-1]:
+            raise ValueError(f"--overrides 键无效: {item!r}")
+        node[parts[-1]] = value
+    return config
+
+
+def _deep_merge(base, override):
+    """Recursively merge mappings while keeping the input configurations intact."""
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _load_config_file(path, stack=()):
+    """Load one YAML file and its relative ``base`` chain."""
+    path = Path(path).expanduser().resolve()
+    if path in stack:
+        chain = " -> ".join(str(item) for item in (*stack, path))
+        raise ValueError(f"配置 base 循环引用: {chain}")
     if not path.is_file():
         raise FileNotFoundError(f"配置文件不存在: {path}")
     with path.open("r", encoding="utf-8-sig") as file_obj:
         config = yaml.safe_load(file_obj)
     if not isinstance(config, dict):
         raise ValueError(f"配置文件顶层必须是 mapping: {path}")
+
+    base_ref = config.pop("base", None)
+    if base_ref is None:
+        return config
+    base_refs = base_ref if isinstance(base_ref, (list, tuple)) else [base_ref]
+    merged = {}
+    for ref in base_refs:
+        if not isinstance(ref, (str, os.PathLike)) or not str(ref):
+            raise ValueError(f"配置 base 必须是非空路径: {path}")
+        base_path = Path(ref).expanduser()
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        merged = _deep_merge(merged, _load_config_file(base_path, (*stack, path)))
+    return _deep_merge(merged, config)
+
+
+def _size_scalar(value, name):
+    """Return a square size from an integer or a two-item size list."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} 不能是布尔值")
+    if isinstance(value, int):
+        if value < 1:
+            raise ValueError(f"{name} 必须为正整数")
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        if all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+            if value[0] == value[1] and value[0] > 0:
+                return int(value[0])
+    raise ValueError(f"{name} 必须是正整数或方形尺寸 [N, N]")
+
+
+def _materialize_run_config(config):
+    """Expand dataset/run metadata into the legacy loader/model fields.
+
+    Dataset YAMLs intentionally contain no training choices.  Run YAMLs set
+    ``run.scale`` and ``run.hr_patch``; the existing training code continues to
+    receive ``data.scale``, ``data.patch_size`` and ``model.scale``.
+    """
+    dataset_cfg = config.get("dataset")
+    run_cfg = config.get("run")
+    if dataset_cfg is None and run_cfg is None:
+        # Keep reading older flat configs during the migration period.
+        return config
+    if not isinstance(dataset_cfg, dict):
+        raise ValueError("dataset 必须是 mapping")
+    if not isinstance(run_cfg, dict):
+        raise ValueError("run 必须是 mapping")
+
+    data_cfg = config.setdefault("data", {})
+    model_cfg = config.setdefault("model", {})
+    output_cfg = config.setdefault("output", {})
+    if not isinstance(data_cfg, dict) or not isinstance(model_cfg, dict):
+        raise ValueError("data 和 model 必须是 mapping")
+    if not isinstance(output_cfg, dict):
+        raise ValueError("output 必须是 mapping")
+
+    dataset_id = dataset_cfg.get("id")
+    if not isinstance(dataset_id, str) or not dataset_id.strip():
+        raise ValueError("dataset.id 必须是非空字符串")
+    dataset_root = dataset_cfg.get("root")
+    run_root = run_cfg.get("data_root")
+    if data_cfg.get("root") in (None, ""):
+        data_cfg["root"] = run_root if run_root not in (None, "") else dataset_root
+    if data_cfg.get("root") in (None, ""):
+        raise ValueError("数据集配置必须提供 dataset.root 或 run.data_root")
+
+    prepared_cfg = dataset_cfg.get("prepared", {})
+    if not isinstance(prepared_cfg, dict):
+        prepared_cfg = {}
+    scale = run_cfg.get("scale")
+    if scale is None:
+        scale = data_cfg.get("scale", dataset_cfg.get("default_scale", prepared_cfg.get("scale")))
+    if scale is None:
+        raise ValueError("run.scale 未设置，且数据集没有 default_scale")
+    patch_size = run_cfg.get("hr_patch")
+    if patch_size is None:
+        patch_size = data_cfg.get("patch_size")
+    if patch_size is None and prepared_cfg.get("hr_size") is not None:
+        patch_size = _size_scalar(prepared_cfg["hr_size"], "dataset.prepared.hr_size")
+    if patch_size is None:
+        raise ValueError("run.hr_patch 未设置，且数据集没有 prepared.hr_size")
+
+    # run.scale/hr_patch are authoritative.  This also makes a command-line
+    # override update all dependent fields in one place.
+    data_cfg["scale"] = scale
+    data_cfg["patch_size"] = patch_size
+    model_cfg["scale"] = scale
+
+    run_name = run_cfg.get("name")
+    if run_name is None:
+        run_name = f"{dataset_id}_x{scale}"
+    if not isinstance(run_name, str) or not run_name.strip():
+        raise ValueError("run.name 必须是非空字符串")
+    run_name = run_name.strip()
+    prefix = str(output_cfg.get("experiment_prefix", "refrwkv_sr")).strip() or "refrwkv_sr"
+    output_cfg.setdefault("experiment_name", run_name)
+    if not output_cfg.get("checkpoint_dir"):
+        checkpoint_root = output_cfg.get("checkpoint_root", "checkpoints")
+        output_cfg["checkpoint_dir"] = str(Path(checkpoint_root) / f"{prefix}_{run_name}")
+    if not output_cfg.get("log_dir"):
+        log_root = output_cfg.get("log_root", "logs")
+        output_cfg["log_dir"] = str(Path(log_root) / f"{prefix}_{run_name}")
+
+    # Prepared remote-sensing variants record their actual degradation scale.
+    # Check it when metadata is present, but keep custom datasets usable.
+    metadata_path = _resolve_path(data_cfg["root"]) / "metadata.json"
+    if metadata_path.is_file():
+        try:
+            with metadata_path.open("r", encoding="utf-8-sig") as file_obj:
+                metadata = json.load(file_obj)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"无法读取数据集 metadata.json: {metadata_path}: {exc}") from exc
+        actual_scale = metadata.get("scale") if isinstance(metadata, dict) else None
+        if actual_scale is not None and int(actual_scale) != int(scale):
+            raise ValueError(
+                f"数据目录 {data_cfg['root']} 是 {actual_scale}x 配对，"
+                f"但 run.scale={scale}；请使用对应的准备数据目录"
+            )
     return config
+
+
+def load_config(path, overrides=None):
+    config_path = _resolve_path(path, prefer_cwd=True)
+    config = _load_config_file(config_path)
+    config = _apply_overrides(config, overrides)
+    return _materialize_run_config(config)
 
 
 def _require_int(value, name, *, minimum=1):
@@ -78,7 +249,7 @@ def _require_number(value, name, *, minimum=None, maximum=None, maximum_inclusiv
 
 
 def validate_config(cfg):
-    """Validate assumptions imposed by the fixed HR/4 U-Net grid."""
+    """Validate assumptions imposed by the configured U-Net training grid."""
     if not isinstance(cfg, dict):
         raise ValueError("配置必须是 mapping")
     for section in ("data", "model"):
@@ -133,9 +304,29 @@ def validate_config(cfg):
     _require_int(mc.get("warmup_steps", 0), "model.warmup_steps", minimum=0)
     _require_number(mc.get("grad_clip_norm", 1.0), "model.grad_clip_norm", minimum=0.0)
     _require_number(mc.get("ema_decay", 0.999), "model.ema_decay", minimum=0.0, maximum=1.0, maximum_inclusive=False)
+    adam_betas = mc.get("adam_betas", [0.9, 0.999])
+    if (not isinstance(adam_betas, (list, tuple)) or len(adam_betas) != 2):
+        raise ValueError("model.adam_betas 必须包含两个数值")
+    for index, beta in enumerate(adam_betas):
+        _require_number(beta, f"model.adam_betas[{index}]", minimum=0.0, maximum=1.0, maximum_inclusive=False)
+    _require_number(mc.get("weight_decay", 0.0), "model.weight_decay", minimum=0.0)
     _require_number(mc.get("ssim_weight", 0.0), "model.ssim_weight", minimum=0.0)
     _require_number(mc.get("fft_weight", 0.0), "model.fft_weight", minimum=0.0)
     _require_number(mc.get("ref_drop_prob", 0.0), "model.ref_drop_prob", minimum=0.0, maximum=1.0)
+    reference_mode = str(dc.get("reference_mode", "paired")).lower()
+    if reference_mode in {"sisr", "lr", "lr_up", "bicubic_lr"}:
+        dc["reference_mode"] = "lr_up"
+    elif reference_mode != "paired":
+        raise ValueError("data.reference_mode 只能是 paired 或 lr_up")
+    # Normalize and validate the stage window schema before constructing the
+    # model.  Store the canonical form so train_config.yaml is self-contained.
+    mc["windows"] = normalize_window_config(
+        mc.get("windows"),
+        window_size=mc.get("window_size", 8),
+        shift_size=mc.get("shift_size", 3),
+        shift_cycle=mc.get("shift_cycle", 3),
+        phase_mode=mc.get("window_phase_mode"),
+    )
 
     root = dc.get("root")
     if not isinstance(root, (str, Path)) or not str(root):
@@ -161,11 +352,15 @@ def validate_config(cfg):
         raise ValueError("train 必须是 mapping")
     _require_number(dc.get("ref_gray_prob", 0.2), "data.ref_gray_prob", minimum=0.0, maximum=1.0)
     _require_int(dc.get("sample_seed", tc.get("seed", 42)), "data.sample_seed", minimum=0)
-    _require_int(tc.get("max_epochs", 200), "train.max_epochs")
+    max_epochs = tc.get("max_epochs", 200)
+    if max_epochs != -1:
+        _require_int(max_epochs, "train.max_epochs")
     _require_int(tc.get("accumulate_grad_batches", 1), "train.accumulate_grad_batches")
     if "max_steps" in tc:
         if isinstance(tc["max_steps"], bool) or not isinstance(tc["max_steps"], int) or tc["max_steps"] < -1:
             raise ValueError("train.max_steps 必须是 >= -1 的整数")
+    if max_epochs == -1 and tc.get("max_steps", -1) == -1:
+        raise ValueError("train.max_epochs 和 train.max_steps 不能同时为 -1")
     if "num_sanity_val_steps" in tc:
         _require_int(tc["num_sanity_val_steps"], "train.num_sanity_val_steps", minimum=-1)
     _require_int(tc.get("log_every_n_steps", 20), "train.log_every_n_steps")
@@ -175,7 +370,9 @@ def validate_config(cfg):
     if isinstance(interval, float) and interval > 1.0:
         raise ValueError("train.val_check_interval 为小数时必须位于 (0, 1]；整数批次数请使用整数")
     _require_int(tc.get("save_top_k", 3), "train.save_top_k", minimum=-1)
-    _require_int(tc.get("early_stopping_patience", 30), "train.early_stopping_patience", minimum=0)
+    early_stopping_patience = tc.get("early_stopping_patience", 30)
+    if early_stopping_patience is not None:
+        _require_int(early_stopping_patience, "train.early_stopping_patience", minimum=0)
     if "grad_clip_val" in tc and tc["grad_clip_val"] is not None:
         _require_number(tc["grad_clip_val"], "train.grad_clip_val", minimum=0.0)
     algorithm = str(tc.get("gradient_clip_algorithm", "norm")).lower()
@@ -280,6 +477,11 @@ def build_model(cfg):
         hr_size=hr_size,
         drop_path_rate=mc.get("drop_path_rate", 0.1),
         hidden_rate=mc.get("hidden_rate", 4),
+        windows=mc.get("windows"),
+        window_size=mc.get("window_size", 8),
+        shift_size=mc.get("shift_size", 3),
+        shift_cycle=mc.get("shift_cycle", 3),
+        window_phase_mode=mc.get("window_phase_mode"),
     )
     logger.info(
         "RefSRWKV 参数量: %.2fM (HR=%d, Internal=%d, scale=%d)",
@@ -288,7 +490,7 @@ def build_model(cfg):
         model.internal_size,
         data_scale,
     )
-    return LitRefSRWKV(
+    lit_model = LitRefSRWKV(
         model_sr=model,
         learning_rate=mc.get("learning_rate", 1e-4),
         lr_scheduler=mc.get("lr_scheduler", "plateau"),
@@ -300,13 +502,21 @@ def build_model(cfg):
         grad_clip_norm=mc.get("grad_clip_norm", 1.0),
         ema_decay=mc.get("ema_decay", 0.999),
         use_ema=mc.get("use_ema", True),
+        adam_betas=mc.get("adam_betas", [0.9, 0.999]),
+        weight_decay=mc.get("weight_decay", 0.0),
         ssim_weight=mc.get("ssim_weight", 0.0),
         fft_weight=mc.get("fft_weight", 0.0),
         ref_drop_prob=mc.get("ref_drop_prob", 0.0),
+        reference_mode=dc.get("reference_mode", "paired"),
         lr_key=lr_key,
         hr_key=hr_key,
         ref_key=ref_key,
     )
+    # Persist the data/grid contract with new checkpoints so an accidental
+    # cross-dataset --resume is rejected before Lightning restores optimizer
+    # state. Older checkpoints are checked through their nearby train_config.
+    lit_model._experiment_signature = _experiment_signature(cfg)
+    return lit_model
 
 
 _CKPT_PREFIXES = tuple(
@@ -368,6 +578,17 @@ def _load_state_dict(path: str) -> dict:
     return _extract_state_dict(_load_raw_checkpoint(path), path)
 
 
+def _load_hot_start_state_dict(path: str):
+    """Load EMA weights for transfer when the checkpoint provides them."""
+    checkpoint = _load_raw_checkpoint(path)
+    if isinstance(checkpoint, dict):
+        ema_state = checkpoint.get("ema_state_dict")
+        shadow = ema_state.get("shadow") if isinstance(ema_state, dict) else None
+        if isinstance(shadow, dict) and any(torch.is_tensor(value) for value in shadow.values()):
+            return shadow, "EMA"
+    return _extract_state_dict(checkpoint, path), "raw"
+
+
 def _normalise_state_dict(state_dict):
     """Strip wrapper prefixes while preferring the shortest original key."""
     normalized = {}
@@ -381,6 +602,80 @@ def _normalise_state_dict(state_dict):
             normalized[normalized_key] = value
             source_lengths[normalized_key] = key_length
     return normalized
+
+
+def _resume_values_equal(left, right):
+    """Compare checkpoint/config values without treating YAML lists as tuples."""
+    if isinstance(left, dict) or isinstance(right, dict):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        if set(left) != set(right):
+            return False
+        return all(_resume_values_equal(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        if not isinstance(left, (list, tuple)) or not isinstance(right, (list, tuple)):
+            return False
+        return len(left) == len(right) and all(
+            _resume_values_equal(item_left, item_right)
+            for item_left, item_right in zip(left, right)
+        )
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
+    return left == right
+
+
+_RESUME_HPARAM_KEYS = (
+    "learning_rate",
+    "lr_scheduler",
+    "lr_patience",
+    "lr_factor",
+    "lr_min",
+    "lr_threshold",
+    "warmup_steps",
+    "grad_clip_norm",
+    "ema_decay",
+    "use_ema",
+    "adam_betas",
+    "weight_decay",
+    "ssim_weight",
+    "fft_weight",
+    "ref_drop_prob",
+    "reference_mode",
+    "lr_key",
+    "hr_key",
+    "ref_key",
+)
+
+
+def _checkpoint_train_config(ckpt_path):
+    """Read the config saved next to a checkpoint when available."""
+    config_path = Path(ckpt_path).parent / "train_config.yaml"
+    if not config_path.is_file():
+        return None
+    try:
+        with config_path.open("r", encoding="utf-8-sig") as file_obj:
+            config = yaml.safe_load(file_obj)
+        return config if isinstance(config, dict) else None
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _experiment_signature(cfg):
+    data_cfg, model_cfg = cfg["data"], cfg["model"]
+    data_root = _resolve_path(data_cfg["root"])
+    return {
+        "data_root": str(data_root),
+        "patch_size": int(data_cfg.get("patch_size", 480)),
+        "scale": int(data_cfg.get("scale", 4)),
+        "reference_mode": str(data_cfg.get("reference_mode", "paired")),
+        "hr_size": int(data_cfg.get("patch_size", 480)),
+        "dim": int(model_cfg.get("dim", 48)),
+        "hidden_rate": float(model_cfg.get("hidden_rate", 4)),
+        "ref_channels": int(model_cfg.get("ref_channels", model_cfg.get("inp_channels", 3))),
+        "num_blocks": list(model_cfg.get("num_blocks", [4, 6, 6, 8])),
+        "num_refinement_blocks": int(model_cfg.get("num_refinement_blocks", 4)),
+        "windows": copy.deepcopy(model_cfg.get("windows")),
+    }
 
 
 def check_resume_compatible(ckpt_path: str, lit_model):
@@ -420,6 +715,77 @@ def check_resume_compatible(ckpt_path: str, lit_model):
                     "checkpoint 使用按 epoch 更新的 plateau 状态，无法恢复验证次数；"
                     "请使用 --load_weights 仅加载模型权重"
                 )
+
+    saved_hparams = checkpoint.get("hyper_parameters", {}) if isinstance(checkpoint, dict) else {}
+    current_hparams = getattr(lit_model, "hparams", {})
+    if hasattr(saved_hparams, "get") and hasattr(current_hparams, "get"):
+        for key in _RESUME_HPARAM_KEYS:
+            # Older checkpoints do not contain the newly added optimizer
+            # fields; absent keys retain their constructor defaults.
+            if key in saved_hparams and key in current_hparams:
+                if not _resume_values_equal(saved_hparams[key], current_hparams[key]):
+                    return False, (
+                        f"训练参数不兼容: {key}={saved_hparams[key]!r} vs "
+                        f"当前={current_hparams[key]!r}；请使用 --load_weights"
+                    )
+
+    current_signature = getattr(lit_model, "_experiment_signature", None)
+    saved_signature = (
+        checkpoint.get("refsrwkv_experiment_signature")
+        if isinstance(checkpoint, dict) else None
+    )
+    if isinstance(current_signature, dict):
+        if isinstance(saved_signature, dict):
+            for key in (
+                "data_root", "patch_size", "scale", "reference_mode", "hr_size", "dim",
+                "hidden_rate", "ref_channels", "num_blocks", "num_refinement_blocks", "windows",
+            ):
+                if (key in saved_signature and key in current_signature
+                        and not _resume_values_equal(saved_signature[key], current_signature[key])):
+                    return False, (
+                        f"实验结构不兼容: {key}={saved_signature[key]!r} vs "
+                        f"当前={current_signature[key]!r}；请使用 --load_weights"
+                    )
+
+        # The first checkpoints predate the signature field, but their saved
+        # train_config.yaml still records dataset and patch semantics.
+        saved_config = _checkpoint_train_config(ckpt_path)
+        if isinstance(saved_config, dict):
+            saved_data = saved_config.get("data", {})
+            saved_model = saved_config.get("model", {})
+            if isinstance(saved_data, dict):
+                saved_root = saved_data.get("root")
+                if saved_root is not None:
+                    saved_root = str(_resolve_path(saved_root))
+                    if saved_root != current_signature["data_root"]:
+                        return False, (
+                            f"数据集不兼容: checkpoint={saved_root} vs "
+                            f"当前={current_signature['data_root']}；请使用 --load_weights"
+                        )
+                for key in ("patch_size", "scale", "reference_mode"):
+                    if (key in saved_data
+                            and not _resume_values_equal(saved_data[key], current_signature[key])):
+                        return False, (
+                            f"数据参数不兼容: {key}={saved_data[key]!r} vs "
+                            f"当前={current_signature[key]!r}；请使用 --load_weights"
+                        )
+            if isinstance(saved_model, dict):
+                for key in ("dim", "hidden_rate", "ref_channels", "num_blocks", "num_refinement_blocks", "scale", "windows"):
+                    if key == "windows" and key not in saved_model:
+                        # A pre-window checkpoint has the historical global
+                        # 8/[0,3,6] behavior.  Do not silently resume it under
+                        # a newly configured local/hierarchical schedule.
+                        saved_value = normalize_window_config()
+                    elif key not in saved_model:
+                        continue
+                    else:
+                        saved_value = saved_model[key]
+                    if (not _resume_values_equal(saved_value, current_signature[key])):
+                        return False, (
+                            f"模型结构不兼容: {key}={saved_value!r} vs "
+                            f"当前={current_signature[key]!r}；请使用 --load_weights"
+                        )
+
     reference = _normalise_state_dict({key: value for key, value in lit_model.state_dict().items() if torch.is_tensor(value)})
     overlap = sorted(set(state_dict).intersection(reference))
     if not overlap:
@@ -442,7 +808,8 @@ def check_resume_compatible(ckpt_path: str, lit_model):
 
 
 def load_weights_filtered(lit_model, ckpt_path: str):
-    state_dict = _normalise_state_dict(_load_state_dict(ckpt_path))
+    state_dict, source = _load_hot_start_state_dict(ckpt_path)
+    state_dict = _normalise_state_dict(state_dict)
     reference = {key: value for key, value in lit_model.state_dict().items() if torch.is_tensor(value)}
     reference_by_normalized = {}
     for key in reference:
@@ -459,8 +826,9 @@ def load_weights_filtered(lit_model, ckpt_path: str):
             skipped.append(normalized_key)
     missing, _unexpected = lit_model.load_state_dict(matched, strict=False)
     logger.info(
-        "热启动 %s: 匹配 %d/%d | 形状不匹配跳过 %d | 缺失 %d",
+        "热启动 %s (%s): 匹配 %d/%d | 形状不匹配跳过 %d | 缺失 %d",
         ckpt_path,
+        source,
         len(matched),
         len(reference),
         len(skipped),
@@ -479,12 +847,18 @@ def _checkpoint_path(value):
 def main():
     parser = argparse.ArgumentParser(description="RefSRWKV SR Prior 训练")
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--overrides",
+        nargs="*",
+        default=None,
+        help="覆盖配置字段，如 data.scale=4 output.experiment_name=aid_x4",
+    )
     checkpoint_group = parser.add_mutually_exclusive_group()
     checkpoint_group.add_argument("--load_weights", type=str, default=None, help="仅加载匹配的模型权重，重新初始化优化器")
     checkpoint_group.add_argument("--resume", type=str, default=None, help="恢复完整 Lightning checkpoint（含 optimizer/EMA）")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, overrides=args.overrides)
     validate_config(cfg)
     # Keep all relative data/output paths anchored at the repository root.
     os.chdir(PROJECT_ROOT)
@@ -517,14 +891,16 @@ def main():
             mode="min",
             save_last=True,
         ),
-        EarlyStopping(
-            monitor="val_loss",
-            patience=tc.get("early_stopping_patience", 30),
-            mode="min",
-            verbose=True,
-        ),
         LearningRateMonitor(logging_interval="step"),
     ]
+    early_stopping_patience = tc.get("early_stopping_patience", 30)
+    if early_stopping_patience is not None:
+        callbacks.insert(1, EarlyStopping(
+            monitor="val_loss",
+            patience=early_stopping_patience,
+            mode="min",
+            verbose=True,
+        ))
 
     trainer_kwargs = dict(
         accelerator=accelerator,
@@ -574,8 +950,14 @@ def main():
                 logger.warning("%s 不兼容，已忽略，从头训练: %s\n  原因: %s", source, candidate, reason)
 
     logger.info("=" * 60)
-    logger.info("  RefSRWKV SR Prior 训练 (Fixed HR/scale Internal Resolution)")
+    logger.info("  RefSRWKV SR Prior 训练 (Dynamic Spatial Resolution)")
     logger.info("  数据: %s (patch_size=%d, scale=%d)", cfg["data"]["root"], cfg["data"].get("patch_size", 480), cfg["data"].get("scale", 4))
+    window_cfg = lit_model.model_sr.window_config
+    window_text = ", ".join(
+        f"{name}={spec['size']}/{list(spec['offsets'])}"
+        for name, spec in window_cfg["stages"].items()
+    )
+    logger.info("  Windows: phase=%s | %s", window_cfg["phase_mode"], window_text)
     logger.info("  Batch size: %d × accumulate %d = 等效 %d", cfg["data"].get("batch_size", 4), tc.get("accumulate_grad_batches", 1), cfg["data"].get("batch_size", 4) * tc.get("accumulate_grad_batches", 1))
     scheduler_name = str(mc.get("lr_scheduler", "plateau")).lower()
     if scheduler_name == "plateau":
@@ -589,7 +971,13 @@ def main():
         )
     else:
         logger.info("  LR: %.1e | cosine warmup: %d 步", mc.get("learning_rate", 1e-4), mc.get("warmup_steps", 0))
-    logger.info("  SSIM weight: %.2f | FFT weight: %.2f | Ref dropout: %.2f", mc.get("ssim_weight", 0.0), mc.get("fft_weight", 0.0), mc.get("ref_drop_prob", 0.0))
+    logger.info(
+        "  Loss: L1 + SSIM(%.2f) + FFT(%.2f) | Adam betas=%s | weight_decay=%.3g | Ref=%s | Ref dropout=%.2f",
+        mc.get("ssim_weight", 0.0), mc.get("fft_weight", 0.0),
+        tuple(mc.get("adam_betas", [0.9, 0.999])), mc.get("weight_decay", 0.0),
+        cfg["data"].get("reference_mode", "paired"),
+        mc.get("ref_drop_prob", 0.0),
+    )
     logger.info("  EMA: %s", "on (decay=%.4f)" % mc.get("ema_decay", 0.999) if mc.get("use_ema", True) else "off")
     if explicit_weights is not None:
         logger.info("  权重来源: 热启动 %s", explicit_weights)

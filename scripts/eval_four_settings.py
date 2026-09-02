@@ -5,10 +5,12 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.getcwd())
@@ -83,6 +85,45 @@ def load_weights(model, ckpt_path, use_ema):
         print(f"        示例: {real_miss[:10]}")
         sys.exit(1)
 
+
+def checkpoint_model_options(ckpt_path):
+    """Read model/grid metadata from a checkpoint or its nearby run config."""
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+    signature = ckpt.get("refsrwkv_experiment_signature") if isinstance(ckpt, dict) else None
+    options = {}
+    if isinstance(signature, dict):
+        if signature.get("hr_size") is not None:
+            options["hr_size"] = int(signature["hr_size"])
+        if signature.get("scale") is not None:
+            options["scale"] = int(signature["scale"])
+        if isinstance(signature.get("windows"), dict):
+            options["windows"] = signature["windows"]
+
+    # Checkpoints created before signatures still have the expanded config
+    # written next to them. This preserves their actual window behavior
+    # during evaluation instead of silently applying today's default windows.
+    config_path = Path(ckpt_path).parent / "train_config.yaml"
+    if config_path.is_file():
+        try:
+            with config_path.open("r", encoding="utf-8-sig") as file_obj:
+                train_cfg = yaml.safe_load(file_obj)
+        except (OSError, yaml.YAMLError):
+            train_cfg = None
+        if isinstance(train_cfg, dict):
+            data_cfg = train_cfg.get("data")
+            model_cfg = train_cfg.get("model")
+            if isinstance(data_cfg, dict):
+                if "hr_size" not in options and data_cfg.get("patch_size") is not None:
+                    options["hr_size"] = int(data_cfg["patch_size"])
+                if "scale" not in options and data_cfg.get("scale") is not None:
+                    options["scale"] = int(data_cfg["scale"])
+            if "windows" not in options and isinstance(model_cfg, dict) and isinstance(model_cfg.get("windows"), dict):
+                options["windows"] = model_cfg["windows"]
+    return options
+
 @torch.no_grad()
 def run_split(model, split, args, device):
     ds = RefPNGDataset(data_dir=args.data, mode=split, scale=args.scale,
@@ -147,7 +188,7 @@ def run_split(model, split, args, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="checkpoints/refrwkv_sr_hrms_scd_x4/last.ckpt")
+    ap.add_argument("--ckpt", required=True)
     ap.add_argument("--data", default="RefSR_data/HRMS_SCD")
     ap.add_argument("--splits", nargs="+", default=None,
                     help="默认优先使用 test；若数据集没有 test，则使用 test_easy/test_hard")
@@ -156,12 +197,17 @@ def main():
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--settings", nargs="+", choices=SETTINGS, default=SETTINGS,
                     help="要评测的设置；默认 bicubic、sisr_ref、dataset_ref、perfect_ref 全部执行")
-    ap.add_argument("--scale", type=int, default=4)
-    ap.add_argument("--hr_size", type=int, default=512,
-                    help="SR checkpoint 训练时的 HR patch 边长；Real-RefRSSRD ×10 配置使用 480")
+    ap.add_argument("--scale", type=int, default=None,
+                    help="SR scale; omit to read the checkpoint signature")
+    ap.add_argument("--hr_size", type=int, default=None,
+                    help="SR checkpoint 训练时的 HR patch 边长；省略时读取 checkpoint 签名")
     ap.add_argument("--patch", type=int, default=None,
                     help="评测时的 HR 裁剪边长；默认 None 表示全图")
     ap.add_argument("--raw", action="store_true", help="用原始权重而非 EMA")
+    ap.add_argument("--window-size", type=int, default=None)
+    ap.add_argument("--shift-size", type=int, default=None)
+    ap.add_argument("--shift-cycle", type=int, default=None)
+    ap.add_argument("--window-phase-mode", choices=("local", "global"), default=None)
     args = ap.parse_args()
 
     if args.splits is None:
@@ -174,11 +220,25 @@ def main():
                 f"未找到可用测试 split: {args.data}/test 或 test_easy/test_hard"
             )
 
+    ckpt_options = checkpoint_model_options(args.ckpt)
+    if args.hr_size is None:
+        args.hr_size = ckpt_options.get("hr_size", 512)
+    if args.scale is None:
+        args.scale = ckpt_options.get("scale", 4)
+    windows = ckpt_options.get("windows")
+    if (args.window_size is not None or args.shift_size is not None
+            or args.shift_cycle is not None or args.window_phase_mode is not None):
+        windows = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = RefSRWKV(inp_channels=3, out_channels=3, dim=48,
                      num_blocks=(4, 6, 6, 8), num_refinement_blocks=4,
                      scale=args.scale, hr_size=args.hr_size,
-                     drop_path_rate=0.1, hidden_rate=4)
+                     drop_path_rate=0.1, hidden_rate=4,
+                     windows=windows,
+                     window_size=args.window_size if args.window_size is not None else 8,
+                     shift_size=args.shift_size if args.shift_size is not None else 3,
+                     shift_cycle=args.shift_cycle if args.shift_cycle is not None else 3,
+                     window_phase_mode=args.window_phase_mode)
     load_weights(model, args.ckpt, use_ema=not args.raw)
     model.prepare_for_inference().to(device)
 

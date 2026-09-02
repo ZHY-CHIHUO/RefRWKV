@@ -17,6 +17,185 @@ import math
 
 _cuda_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda")
 
+
+# Window stages are named after the U-Net path.  Keeping the names here makes
+# the YAML schema and checkpoint signature independent of module attributes.
+_WINDOW_STAGE_NAMES = (
+    "enc1", "enc2", "enc3", "latent", "dec3", "dec2", "dec1", "refine",
+)
+_WINDOW_LEVEL_ALIASES = {
+    "level1": ("enc1", "dec1", "refine"),
+    "level2": ("enc2", "dec2"),
+    "level3": ("enc3", "dec3"),
+    "latent": ("latent",),
+}
+
+
+def _window_positive_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} 必须是正整数，得到 {value!r}")
+    return int(value)
+
+
+def _window_nonnegative_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} 必须是非负整数，得到 {value!r}")
+    return int(value)
+
+
+def _window_offsets(value, size, name):
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{name} 必须是非空整数列表")
+    offsets = []
+    for index, offset in enumerate(value):
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise ValueError(f"{name}[{index}] 必须是整数")
+        if offset < 0 or offset >= size:
+            raise ValueError(
+                f"{name}[{index}]={offset} 必须满足 0 <= offset < window_size({size})"
+            )
+        offsets.append(int(offset))
+    return tuple(offsets)
+
+
+def _parse_window_spec(raw, stage_name, *, fallback=None, default_size=8,
+                       default_shift=4, default_cycle=2):
+    """Parse one stage's compact window specification into canonical values."""
+    if raw is None:
+        raw = {}
+    elif isinstance(raw, int) and not isinstance(raw, bool):
+        raw = {"size": raw}
+    if not isinstance(raw, dict):
+        raise ValueError(f"windows.{stage_name} 必须是 mapping、整数或为空")
+    fallback = fallback or {}
+
+    size_given = "size" in raw or "window_size" in raw
+    size = raw.get("size", raw.get("window_size", fallback.get("size", default_size)))
+    size = _window_positive_int(size, f"windows.{stage_name}.size")
+
+    offsets = raw.get("offsets", raw.get("shift_offsets"))
+    if offsets is not None:
+        offsets = _window_offsets(offsets, size, f"windows.{stage_name}.offsets")
+    else:
+        raw_shift = raw.get("shift_size", raw.get("shift"))
+        raw_cycle = raw.get("shift_cycle", raw.get("cycle"))
+        if raw_shift is None and raw_cycle is None and not size_given and fallback:
+            # An omitted stage inherits the complete canonical default.
+            offsets = tuple(fallback["offsets"])
+        else:
+            if raw_shift is None:
+                if fallback and not size_given and "shift_size" in fallback:
+                    raw_shift = fallback["shift_size"]
+                else:
+                    raw_shift = size // 2 if size_given else default_shift
+            if raw_cycle is None:
+                if fallback and not size_given and "shift_cycle" in fallback:
+                    raw_cycle = fallback["shift_cycle"]
+                else:
+                    raw_cycle = default_cycle
+            raw_shift = _window_nonnegative_int(raw_shift, f"windows.{stage_name}.shift_size")
+            if isinstance(raw_cycle, bool) or not isinstance(raw_cycle, int) or raw_cycle < 1:
+                raise ValueError(f"windows.{stage_name}.shift_cycle 必须是正整数")
+            offsets = _window_offsets(
+                [index * raw_shift for index in range(raw_cycle)],
+                size,
+                f"windows.{stage_name}.offsets",
+            )
+
+    # Retain the generation fields only while resolving inherited stages.  The
+    # public canonical representation contains size and offsets only.
+    return {
+        "size": size,
+        "offsets": tuple(offsets),
+        "shift_size": raw.get("shift_size", raw.get("shift", fallback.get("shift_size"))),
+        "shift_cycle": raw.get("shift_cycle", raw.get("cycle", fallback.get("shift_cycle"))),
+    }
+
+
+def normalize_window_config(windows=None, *, window_size=8, shift_size=3,
+                            shift_cycle=3, phase_mode=None):
+    """Return canonical per-stage windows and phase indexing mode.
+
+    With no ``windows`` mapping this intentionally preserves the original
+    global phase sequence (for example 8/3/3 -> offsets [0, 3, 6]).  An
+    explicit mapping defaults to stage-local two-phase offsets, which is the
+    hierarchical mode used by the current training configs.
+    """
+    if windows is None:
+        size = _window_positive_int(window_size, "window_size")
+        shift = _window_nonnegative_int(shift_size, "shift_size")
+        if shift >= size:
+            raise ValueError("shift_size 必须小于 window_size")
+        if isinstance(shift_cycle, bool) or not isinstance(shift_cycle, int) or shift_cycle < 1:
+            raise ValueError("shift_cycle 必须是正整数")
+        offsets = _window_offsets(
+            [index * shift for index in range(shift_cycle)], size, "shift_offsets"
+        )
+        mode = "global" if phase_mode is None else str(phase_mode).lower()
+        stages = {
+            name: {"size": size, "offsets": offsets}
+            for name in _WINDOW_STAGE_NAMES
+        }
+    else:
+        mode = phase_mode
+        if isinstance(windows, (list, tuple)):
+            if len(windows) != 4:
+                raise ValueError("windows 列表必须按 level1、level2、level3、latent 提供四项")
+            windows = {
+                "level1": windows[0], "level2": windows[1],
+                "level3": windows[2], "latent": windows[3],
+            }
+        if not isinstance(windows, dict):
+            raise ValueError("windows 必须是 mapping 或四项列表")
+        if isinstance(windows.get("stages"), dict):
+            stage_map = dict(windows["stages"])
+            if mode is None:
+                mode = windows.get("phase_mode")
+        else:
+            stage_map = dict(windows)
+        if mode is None:
+            mode = windows.get("phase_mode") if isinstance(windows, dict) else None
+        mode = "local" if mode is None else str(mode).lower()
+
+        flat_keys = {"size", "window_size", "offsets", "shift_offsets", "shift_size", "shift", "shift_cycle", "cycle"}
+        default_raw = stage_map.get("default")
+        if default_raw is None and flat_keys.intersection(stage_map):
+            default_raw = {key: stage_map[key] for key in flat_keys if key in stage_map}
+        default = _parse_window_spec(
+            default_raw, "default", fallback=None,
+            default_size=window_size, default_shift=window_size // 2,
+            default_cycle=2,
+        ) if default_raw is not None else None
+
+        stages = {}
+        for stage_name in _WINDOW_STAGE_NAMES:
+            raw = stage_map.get(stage_name)
+            if raw is None:
+                for alias, stage_names in _WINDOW_LEVEL_ALIASES.items():
+                    if stage_name in stage_names and alias in stage_map:
+                        raw = stage_map[alias]
+                        break
+            if raw is None:
+                raw = default
+            parsed = _parse_window_spec(
+                raw, stage_name, fallback=default,
+                default_size=window_size, default_shift=window_size // 2,
+                default_cycle=2,
+            )
+            stages[stage_name] = {
+                "size": parsed["size"], "offsets": parsed["offsets"],
+            }
+
+    if mode in {"stage", "stage_local", "local"}:
+        mode = "local"
+    elif mode in {"global", "legacy"}:
+        mode = "global"
+    else:
+        raise ValueError("window phase_mode 只能是 local 或 global")
+    return {"phase_mode": mode, "stages": stages}
+
 # ═══════════════════════════════════════════════════════════
 # CUDA WKV 算子封装
 # ═══════════════════════════════════════════════════════════
@@ -118,7 +297,8 @@ class OmniShift(nn.Module):
 # RWKV 空间与通道混合模块
 # ═══════════════════════════════════════════════════════════
 class VRWKV_SpatialMix(nn.Module):
-    def __init__(self, n_embd, head_dim=64, window_size=8, shift_size=3, num_groups=None):
+    def __init__(self, n_embd, head_dim=64, window_size=8, shift_size=3,
+                 num_groups=None, shift_offsets=None, shift_cycle=3):
         super().__init__()
         if num_groups is None: num_groups = max(1, n_embd // 16)
         if not isinstance(num_groups, int) or num_groups < 1:
@@ -127,9 +307,19 @@ class VRWKV_SpatialMix(nn.Module):
             raise ValueError("window_size 和 shift_size 必须为整数")
         if n_embd < 16 or n_embd % num_groups != 0 or n_embd % 16 != 0:
             raise ValueError("n_embd 必须被 num_groups 整除，且至少为 16 和 16 的倍数")
-        if window_size < 1 or shift_size < 0 or shift_size >= window_size:
-            raise ValueError("window_size 必须为正数，且 0 <= shift_size < window_size")
+        if window_size < 1 or shift_size < 0:
+            raise ValueError("window_size 必须为正数，且 shift_size 必须非负")
+        if shift_offsets is None and shift_size >= window_size:
+            raise ValueError("未显式指定 shift_offsets 时必须满足 shift_size < window_size")
+        if shift_offsets is None:
+            if isinstance(shift_cycle, bool) or not isinstance(shift_cycle, int) or shift_cycle < 1:
+                raise ValueError("shift_cycle 必须是正整数")
+            offsets = [index * shift_size for index in range(shift_cycle)]
+        else:
+            offsets = shift_offsets
+        offsets = _window_offsets(offsets, window_size, "shift_offsets")
         self.n_embd, self.window_size, self.shift_size = n_embd, window_size, shift_size
+        self.shift_offsets = offsets
         self.num_groups, self.group_dim, self.recurrence = num_groups, n_embd // num_groups, 2
         self.omni_shift = OmniShift(dim=n_embd)
         self.key, self.value, self.receptance, self.output = [nn.Linear(n_embd, n_embd, bias=False) for _ in range(4)]
@@ -162,11 +352,13 @@ class VRWKV_SpatialMix(nn.Module):
 
     def forward(self, x, resolution, layer_idx=0):
         B, T, C = x.size()
-        h, w, ws, ss = resolution[0], resolution[1], self.window_size, self.shift_size
+        h, w, ws = resolution[0], resolution[1], self.window_size
         if T != h * w or C != self.n_embd:
             raise ValueError(f"SpatialMix 输入形状与 resolution 不一致: x={tuple(x.shape)}, resolution={resolution}")
         sr, k, v = self.jit_func(x, resolution)
-        shift_amt = (layer_idx % 3) * ss
+        if isinstance(layer_idx, bool) or not isinstance(layer_idx, int):
+            raise ValueError(f"layer_idx 必须是整数，得到 {layer_idx!r}")
+        shift_amt = self.shift_offsets[layer_idx % len(self.shift_offsets)]
         k, v, sr = [rearrange(t, "b (hh ww) c -> b hh ww c", hh=h, ww=w) for t in (k, v, sr)]
 
         # Shift the window origin without circular wrap-around.  Content is
@@ -201,10 +393,22 @@ class VRWKV_ChannelMix(nn.Module):
         return torch.sigmoid(self.receptance(x)) * self.value(torch.square(torch.relu(self.key(x))))
 
 class Block(nn.Module):
-    def __init__(self, n_embd, hidden_rate=4, drop_path=0.0, layer_idx=0):
+    def __init__(self, n_embd, hidden_rate=4, drop_path=0.0, layer_idx=0,
+                 window_size=8, shift_offsets=None):
         super().__init__()
+        if isinstance(layer_idx, bool) or not isinstance(layer_idx, int) or layer_idx < 0:
+            raise ValueError("layer_idx 必须是非负整数")
+        if shift_offsets is None:
+            # Preserve the historical direct-Block default, while making a
+            # custom window usable without having to spell out its phases.
+            shift_offsets = (0, 3, 6) if window_size == 8 else (0, window_size // 2)
         self.layer_idx, self.ln1, self.ln2 = layer_idx, nn.LayerNorm(n_embd), nn.LayerNorm(n_embd)
-        self.att, self.ffn = VRWKV_SpatialMix(n_embd), VRWKV_ChannelMix(n_embd, hidden_rate)
+        self.att = VRWKV_SpatialMix(
+            n_embd,
+            window_size=window_size,
+            shift_offsets=shift_offsets,
+        )
+        self.ffn = VRWKV_ChannelMix(n_embd, hidden_rate)
         self.gamma1, self.gamma2 = nn.Parameter(torch.ones(n_embd)), nn.Parameter(torch.ones(n_embd))
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
     def forward(self, x):
@@ -262,7 +466,9 @@ class RefSRWKV(nn.Module):
                  num_blocks: tuple = (4, 6, 6, 8), num_refinement_blocks: int = 4,
                  scale: int = 4, hr_size: int = 480,
                  drop_path_rate: float = 0.1, hidden_rate: int = 4,
-                 ref_channels: int = None):
+                 ref_channels: int = None, windows=None, window_size: int = 8,
+                 shift_size: int = 3, shift_cycle: int = 3,
+                 window_phase_mode: str = None):
         super().__init__()
         if not isinstance(num_blocks, (tuple, list)) or len(num_blocks) != 4:
             raise ValueError("num_blocks 必须包含四个编码器层的 block 数")
@@ -298,19 +504,26 @@ class RefSRWKV(nn.Module):
         if ref_channels != inp_channels:
             raise ValueError("当前颜色对齐路径要求 ref_channels == inp_channels")
 
-        # Three encoder PixelUnshuffle(2) stages and 8x8 WKV windows impose
-        # an internal spatial size divisible by 8.  The fixed 4x reference
-        # folding then requires HR patches divisible by 32.
+        # Three PixelUnshuffle(2) stages require the internal grid to be
+        # divisible by 8.  Windows pad dynamically, so their sizes do not add
+        # another input-size constraint.
         self.ref_down_factor = 4
         if hr_size % (self.ref_down_factor * 8) != 0:
             raise ValueError(
                 f"HR尺寸({hr_size}) 必须能被 {self.ref_down_factor * 8} 整除，"
-                "否则 U-Net 下采样或 8x8 窗口无法对齐"
+                "否则 U-Net 的三级下采样无法对齐"
             )
         self.scale, self.dim, self.out_channels = scale, dim, out_channels
         self.inp_channels, self.ref_channels = inp_channels, ref_channels
         self.hr_size = hr_size
         self.internal_size = hr_size // self.ref_down_factor
+        self.window_config = normalize_window_config(
+            windows,
+            window_size=window_size,
+            shift_size=shift_size,
+            shift_cycle=shift_cycle,
+            phase_mode=window_phase_mode,
+        )
         if inp_channels == out_channels:
             self.skip_proj = nn.Identity()
         else:
@@ -336,33 +549,56 @@ class RefSRWKV(nn.Module):
         total_blocks = sum(num_blocks)
         dp_rates = [drop_path_rate * i / max(1, total_blocks - 1) for i in range(total_blocks)]
         dp_idx, global_layer_idx = 0, 0
-        
-        self.encoder_level1 = nn.Sequential(*[Block(dim, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[0])])
-        global_layer_idx += num_blocks[0]; dp_idx += num_blocks[0]
+
+        def make_stage(stage_name, channels, count, *, drop_rates=None):
+            nonlocal global_layer_idx
+            spec = self.window_config["stages"][stage_name]
+            phase_base = global_layer_idx if self.window_config["phase_mode"] == "global" else 0
+            blocks = []
+            for local_idx in range(count):
+                drop_path = 0.0 if drop_rates is None else drop_rates[local_idx]
+                blocks.append(Block(
+                    channels,
+                    hidden_rate,
+                    drop_path,
+                    layer_idx=phase_base + local_idx,
+                    window_size=spec["size"],
+                    shift_offsets=spec["offsets"],
+                ))
+            global_layer_idx += count
+            return nn.Sequential(*blocks)
+
+        self.encoder_level1 = make_stage(
+            "enc1", dim, num_blocks[0], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[0]]
+        )
+        dp_idx += num_blocks[0]
         self.down1_2 = Downsample(dim)
-        self.encoder_level2 = nn.Sequential(*[Block(dim * 2, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[1])])
-        global_layer_idx += num_blocks[1]; dp_idx += num_blocks[1]
+        self.encoder_level2 = make_stage(
+            "enc2", dim * 2, num_blocks[1], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[1]]
+        )
+        dp_idx += num_blocks[1]
         self.down2_3 = Downsample(dim * 2)
-        self.encoder_level3 = nn.Sequential(*[Block(dim * 4, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[2])])
-        global_layer_idx += num_blocks[2]; dp_idx += num_blocks[2]
+        self.encoder_level3 = make_stage(
+            "enc3", dim * 4, num_blocks[2], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[2]]
+        )
+        dp_idx += num_blocks[2]
         self.down3_4 = Downsample(dim * 4)
-        self.latent = nn.Sequential(*[Block(dim * 8, hidden_rate, dp_rates[dp_idx + i], layer_idx=global_layer_idx + i) for i in range(num_blocks[3])])
-        global_layer_idx += num_blocks[3]; dp_idx += num_blocks[3]
+        self.latent = make_stage(
+            "latent", dim * 8, num_blocks[3], drop_rates=dp_rates[dp_idx:dp_idx + num_blocks[3]]
+        )
+        dp_idx += num_blocks[3]
         
         self.up4_3 = Upsample(dim * 8)
         self.reduce_chan_level3 = nn.Sequential(nn.Conv2d(dim * 8, dim * 4, 1, bias=False), nn.GroupNorm(_gn_groups(dim * 4), dim * 4))
-        self.decoder_level3 = nn.Sequential(*[Block(dim * 4, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_blocks[2])])
-        global_layer_idx += num_blocks[2]
+        self.decoder_level3 = make_stage("dec3", dim * 4, num_blocks[2])
         self.up3_2 = Upsample(dim * 4)
         self.reduce_chan_level2 = nn.Sequential(nn.Conv2d(dim * 4, dim * 2, 1, bias=False), nn.GroupNorm(_gn_groups(dim * 2), dim * 2))
-        self.decoder_level2 = nn.Sequential(*[Block(dim * 2, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_blocks[1])])
-        global_layer_idx += num_blocks[1]
+        self.decoder_level2 = make_stage("dec2", dim * 2, num_blocks[1])
         self.up2_1 = Upsample(dim * 2)
         self.reduce_chan_level1 = nn.Sequential(nn.Conv2d(dim * 2, dim, 1, bias=False), nn.GroupNorm(_gn_groups(dim), dim))
-        self.decoder_level1 = nn.Sequential(*[Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_blocks[0])])
-        global_layer_idx += num_blocks[0]
+        self.decoder_level1 = make_stage("dec1", dim, num_blocks[0])
         
-        self.refinement = nn.Sequential(*[Block(dim, hidden_rate, drop_path=0.0, layer_idx=global_layer_idx + i) for i in range(num_refinement_blocks)])
+        self.refinement = make_stage("refine", dim, num_refinement_blocks)
 
         # d1 lives at HR/4.  Learn the missing four spatial phases with two
         # PixelShuffle stages instead of bicubic-resizing a three-channel map.
@@ -429,16 +665,28 @@ class RefSRWKV(nn.Module):
         ref_aligned = self._match_color(ref, lr_hr_input)
         lr_hr = self.skip_proj(lr_hr_input)
         
-        int_size = self.internal_size
-        
-        if lr.shape[2] != int_size or lr.shape[3] != int_size:
-            lr_int = F.interpolate(lr, size=(int_size, int_size), mode="bicubic", align_corners=False)
+        if target_hr_h % self.ref_down_factor or target_hr_w % self.ref_down_factor:
+            raise ValueError(
+                f"ref 空间尺寸 {target_hr_h}x{target_hr_w} 必须能被 {self.ref_down_factor} 整除"
+            )
+        int_h, int_w = target_hr_h // self.ref_down_factor, target_hr_w // self.ref_down_factor
+        if int_h % 8 or int_w % 8:
+            raise ValueError(
+                f"内部网格 {int_h}x{int_w} 必须可被 8 整除，以通过三级 U-Net 下采样"
+            )
+
+        # The architecture is fully convolutional.  `hr_size` describes the
+        # training grid and checkpoint contract, while inference preserves the
+        # incoming HR/LR geometry instead of shrinking a larger test image to
+        # the training patch.
+        if lr.shape[2] != int_h or lr.shape[3] != int_w:
+            lr_int = F.interpolate(lr, size=(int_h, int_w), mode="bicubic", align_corners=False)
         else:
             lr_int = lr
 
-        target_ref_size = int_size * self.ref_down_factor
-        if ref_aligned.shape[2] != target_ref_size or ref_aligned.shape[3] != target_ref_size:
-            ref_int = F.interpolate(ref_aligned, size=(target_ref_size, target_ref_size), mode="bicubic", align_corners=False)
+        target_ref_size = (int_h * self.ref_down_factor, int_w * self.ref_down_factor)
+        if ref_aligned.shape[2:] != target_ref_size:
+            ref_int = F.interpolate(ref_aligned, size=target_ref_size, mode="bicubic", align_corners=False)
         else:
             ref_int = ref_aligned
             
@@ -550,9 +798,12 @@ class LitRefSRWKV(pl.LightningModule):
         grad_clip_norm: float = 1.0,
         ema_decay: float = 0.999,
         use_ema: bool = True,
+        adam_betas=(0.9, 0.999),
+        weight_decay: float = 0.0,
         ssim_weight: float = 0.0,
         fft_weight: float = 0.0,
         ref_drop_prob: float = 0.0,
+        reference_mode: str = "paired",
         loss_fn=None,
         lr_key: str = "lr",
         hr_key: str = "hr",
@@ -578,16 +829,31 @@ class LitRefSRWKV(pl.LightningModule):
             raise ValueError("warmup_steps 必须为非负整数")
         if grad_clip_norm is not None and float(grad_clip_norm) < 0:
             raise ValueError("grad_clip_norm 不能为负数")
+        if (not isinstance(adam_betas, (list, tuple)) or len(adam_betas) != 2
+                or any(isinstance(beta, bool) or not isinstance(beta, (int, float))
+                       or not math.isfinite(float(beta)) or not 0.0 <= float(beta) < 1.0
+                       for beta in adam_betas)):
+            raise ValueError("adam_betas 必须是两个位于 [0, 1) 的有限数值")
+        if not math.isfinite(float(weight_decay)) or float(weight_decay) < 0.0:
+            raise ValueError("weight_decay 必须是非负有限数值")
         if not 0.0 <= float(ssim_weight) or not 0.0 <= float(fft_weight):
             raise ValueError("ssim_weight 和 fft_weight 不能为负数")
         if not 0.0 <= float(ref_drop_prob) <= 1.0:
             raise ValueError("ref_drop_prob 必须位于 [0, 1]")
+        reference_mode = str(reference_mode).lower()
+        if reference_mode in {"sisr", "lr", "lr_up", "bicubic_lr"}:
+            reference_mode = "lr_up"
+        if reference_mode not in {"paired", "lr_up"}:
+            raise ValueError("reference_mode 只能是 paired 或 lr_up")
         for key in (lr_key, hr_key, ref_key):
             if not isinstance(key, str) or not key:
                 raise ValueError("batch key 必须是非空字符串")
         self.save_hyperparameters(ignore=["model_sr", "loss_fn"])
         self.model_sr = model_sr
+        self.adam_betas = tuple(float(beta) for beta in adam_betas)
+        self.weight_decay = float(weight_decay)
         self.ssim_weight, self.fft_weight = float(ssim_weight), float(fft_weight)
+        self.reference_mode = reference_mode
         self.criterion = loss_fn or nn.L1Loss()
         self.l1_loss = nn.L1Loss()
         self.ssim_loss_fn, self._ssim_backend = None, "manual"
@@ -639,6 +905,16 @@ class LitRefSRWKV(pl.LightningModule):
             replacement = torch.zeros_like(ref)
         drop = torch.rand(batch_size, 1, 1, 1, device=ref.device) < p
         return torch.where(drop, replacement, ref)
+
+    def _reference_input(self, ref, lr):
+        if self.reference_mode != "lr_up":
+            return ref
+        replacement = F.interpolate(lr, size=ref.shape[-2:], mode="bicubic", align_corners=False)
+        if replacement.shape[1] != ref.shape[1]:
+            raise ValueError(
+                f"lr_up reference 的通道数与 ref 不一致: {replacement.shape[1]} vs {ref.shape[1]}"
+            )
+        return replacement
 
     def forward(self, lr, ref): return self.model_sr(lr, ref)
 
@@ -702,7 +978,8 @@ class LitRefSRWKV(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-        output = self(lr, self._apply_ref_dropout(ref, lr=lr))
+        reference = self._reference_input(ref, lr)
+        output = self(lr, self._apply_ref_dropout(reference, lr=lr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
@@ -715,7 +992,7 @@ class LitRefSRWKV(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-        output = self(lr, ref)
+        output = self(lr, self._reference_input(ref, lr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch_size)
@@ -730,7 +1007,7 @@ class LitRefSRWKV(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-        output = self(lr, ref)
+        output = self(lr, self._reference_input(ref, lr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
         self.log("test_loss", loss, on_step=False, on_epoch=True, batch_size=batch_size)
@@ -842,7 +1119,12 @@ class LitRefSRWKV(pl.LightningModule):
         if not parameters:
             raise RuntimeError("没有可训练参数")
         learning_rate = float(self.hparams.learning_rate)
-        optimizer = torch.optim.Adam(parameters, lr=learning_rate)
+        optimizer = torch.optim.Adam(
+            parameters,
+            lr=learning_rate,
+            betas=tuple(self.hparams.adam_betas),
+            weight_decay=float(self.hparams.weight_decay),
+        )
         scheduler_name = str(self.hparams.lr_scheduler).lower()
         if scheduler_name == "plateau":
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -900,6 +1182,9 @@ class LitRefSRWKV(pl.LightningModule):
         if self.ema: checkpoint["ema_state_dict"] = self.ema.state_dict()
         if str(self.hparams.lr_scheduler).lower() == "plateau":
             checkpoint["plateau_step_unit"] = "validation"
+        signature = getattr(self, "_experiment_signature", None)
+        if isinstance(signature, dict):
+            checkpoint["refsrwkv_experiment_signature"] = dict(signature)
 
     def on_load_checkpoint(self, checkpoint):
         if self.ema and "ema_state_dict" in checkpoint: self.ema.load_state_dict(checkpoint["ema_state_dict"])

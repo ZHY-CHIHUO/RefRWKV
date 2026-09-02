@@ -1,0 +1,21 @@
+# AID dataset metadata. Training choices belong in configs/runs/.
+base: ../sr_prior_base.yaml
+
+dataset:
+  id: aid
+  name: AID (Aerial Image Dataset)
+  kind: synthetic_sisr
+  root: data/remote_sensing/prepared/AID
+  default_scale: 4
+  source:
+    image_size: [600, 600]
+    channels: 3
+    classes: 30
+    images: 10000
+  prepared:
+    hr_size: [512, 512]
+    lr_size: [128, 128]
+    ref_size: [512, 512]
+    scale: 4
+    splits: {train: 7000, val: 1507, test: 1493}
+  reference_policy: bicubic-upsampled LR at HR resolution

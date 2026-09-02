@@ -1,0 +1,76 @@
+# Shared defaults for RefSRWKV SR Prior runs.
+# Dataset files provide the data root and source dimensions; run files provide
+# the training grid and only the parameters that differ from these defaults.
+
+model:
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  # Stage-local phases are symmetric across the U-Net.  A window size only
+  # controls the CUDA WKV grouping; it does not change parameter shapes.
+  windows:
+    phase_mode: local
+    enc1: {size: 8, offsets: [0, 4]}
+    enc2: {size: 8, offsets: [0, 4]}
+    enc3: {size: 4, offsets: [0, 2]}
+    latent: {size: 4, offsets: [0, 2]}
+    dec3: {size: 4, offsets: [0, 2]}
+    dec2: {size: 8, offsets: [0, 4]}
+    dec1: {size: 8, offsets: [0, 4]}
+    refine: {size: 8, offsets: [0, 4]}
+  drop_path_rate: 0.1
+  hidden_rate: 4
+  # scale is materialized from run.scale.
+  learning_rate: 1.0e-4
+  lr_scheduler: plateau
+  lr_patience: 2
+  lr_factor: 0.5
+  lr_min: 1.0e-7
+  lr_threshold: 1.0e-4
+  warmup_steps: 0
+  grad_clip_norm: 1.0
+  ema_decay: 0.999
+  use_ema: true
+  adam_betas: [0.9, 0.999]
+  weight_decay: 0.0
+  ssim_weight: 0.3
+  fft_weight: 0.2
+  ref_drop_prob: 0.2
+
+data:
+  # root, patch_size and scale are materialized from the dataset/run files.
+  # paired uses Ref PNG; lr_up derives the reference from the current LR.
+  reference_mode: paired
+  augment: true
+  augment_ref: false
+  ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
+  ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
+  ref_gray_prob: 0.2
+  batch_size: 4
+  val_batch_size: 1
+  num_workers: 8
+  val_num_workers: 2
+  prefetch_factor: 4
+  pin_memory: true
+  max_samples_train: null
+  max_samples_val: null
+  max_samples_test: null
+
+train:
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+  max_epochs: 50
+  val_check_interval: 0.2
+  accumulate_grad_batches: 2
+  log_every_n_steps: 20
+  save_top_k: 3
+  early_stopping_patience: 10
+  seed: 42
+
+output:
+  checkpoint_root: checkpoints
+  log_root: logs
+  experiment_prefix: refrwkv_sr

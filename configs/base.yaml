@@ -67,9 +67,23 @@ model:
     num_blocks: [4, 6, 6, 8]
     num_refinement_blocks: 4
     scale: 10
+    # Keep SR inference aligned with the hierarchical RefSRWKV checkpoints.
+    windows:
+      phase_mode: local
+      enc1: {size: 8, offsets: [0, 4]}
+      enc2: {size: 8, offsets: [0, 4]}
+      enc3: {size: 4, offsets: [0, 2]}
+      latent: {size: 4, offsets: [0, 2]}
+      dec3: {size: 4, offsets: [0, 2]}
+      dec2: {size: 8, offsets: [0, 4]}
+      dec1: {size: 8, offsets: [0, 4]}
+      refine: {size: 8, offsets: [0, 4]}
     drop_path_rate: 0.1
     hidden_rate: 4
-    ckpt_path: "checkpoints/refrwkv_sr/new.ckpt"   # 本机实际文件；服务器若不同请用 --overrides 改
+    # Set this to the SR checkpoint produced by the current SR training run.
+    # Keeping it null prevents an obsolete local checkpoint from being used
+    # accidentally when starting a diffusion stage.
+    ckpt_path: null
 
   # ── 门控 ──
   use_confidence_gate: false
