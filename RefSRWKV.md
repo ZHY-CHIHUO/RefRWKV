@@ -1,6 +1,6 @@
 # RefSRWKV
 
-RefSRWKV 是面向 RGB 图像的参考引导超分辨率先验网络。模型以窗口化双向 RWKV 为骨干，结合多尺度参考特征融合与残差重建头；数据集输入和输出的数值范围均为 `[-1, 1]`。
+RefSRWKV 是面向 RGB 图像的参考引导超分辨率先验网络。模型以窗口化双向 RWKV 为骨干，结合多尺度特征融合与残差重建头；数据集输入和输出的数值范围均为 `[-1, 1]`。当前的单图超分（SISR）数据管线把 bicubic 上采样的 LR 作为 Ref，不依赖同类或外部语义参考图。
 
 ## 输入与尺寸约定
 
@@ -10,7 +10,7 @@ ref:  [B, C_in, H_ref, W_ref]
 out:  [B, C_out, H_ref, W_ref]
 ```
 
-- `ref_channels` 必须等于 `inp_channels`，因为参考图颜色统计以 LR 图像为目标进行对齐。
+- `ref_channels` 必须等于 `inp_channels`，因为参考图颜色统计以 LR 上采样图为目标进行对齐。
 - `dim` 必须是 16 的倍数，以满足 CUDA Bi-WKV 算子的通道约束。
 - `hr_size` 是训练 HR patch 的边长，用于定义模型内部网格，必须能被 32 整除。
 - `scale` 定义数据集裁剪时的 LR/HR 尺寸关系；网络内部始终使用固定网格，因此可用于任意整数倍率的数据。
@@ -33,7 +33,7 @@ clamp(bicubic(lr) + residual, -1, 1)
 lr_feature + gate(fused) * confidence * fused
 ```
 
-训练时可通过 `ref_drop_prob` 随机替换参考图，以增强无可靠参考场景下的恢复能力。批量大小为 1 时，替换图像为双三次上采样的 LR 图像。
+训练时可通过 `ref_drop_prob` 随机替换参考图，以增强 SISR 场景下的恢复能力。每个样本独立决定是否替换，和 batch size 无关；替换值始终是该样本 LR 的双三次上采样。`configs/sr_prior_4.yaml` 当前设置为 `ref_drop_prob: 0.2`。
 
 ## CUDA 环境
 
@@ -64,7 +64,52 @@ PNG 数据集按同名文件配对：
 <data_root>/<split>/Ref/*.png
 ```
 
-图像以 RGB 读取并归一化到 `[-1, 1]`。随机裁剪先采样整数 LR 坐标，再按 `data.scale` 映射到 HR 与参考图坐标，以保持空间对齐。
+图像以 RGB 读取并归一化到 `[-1, 1]`。随机裁剪先采样整数 LR 坐标，再按 `data.scale` 映射到 HR 与 Ref 坐标，以保持空间对齐。`RefPNGDataset` 读取的是上述三目录配对格式，不能直接读取 UC Merced/AID 的原始分类目录。
+
+### UC Merced 与 AID
+
+这两个公开数据集原本用于遥感场景分类，并不提供 SR 的 LR/HR 配对。仓库中的准备脚本先按类别做固定种子的 `70%/15%/15%` 分层切分，再从每张原图中心裁剪 HR，使用 PIL bicubic 生成 LR，并把 LR 再 bicubic 上采样到 HR 尺寸写入 Ref：
+
+```text
+Ref = bicubic(LR, HR.size)  # SISR reference
+```
+
+已下载的原始压缩包（均位于 `data/remote_sensing/raw/`，该目录已被 git 忽略）：
+
+| 数据集 | 文件 | 原始规模 | 准备后 split（train/val/test）与尺寸（scale=4） |
+| --- | --- | ---: | --- |
+| UC Merced | `uc_merced_land_use.zip` | 21 类 / 2100 张 | `1470/315/315`；HR/Ref `256x256`，LR `64x64` |
+| AID | `aid_scene_classification.zip` | 30 类 / 10000 张 | `7000/1507/1493`；HR/Ref `512x512`，LR `128x128` |
+
+来源：UC Merced 原始数据集 [UCMerced Land Use](http://weegee.vision.ucmerced.edu/datasets/landuse.html)（本地下载使用 [Kaggle 镜像](https://www.kaggle.com/datasets/abdulhasibuddin/uc-merced-land-use-dataset)）；AID 原始数据集 [AID](http://captain.whu.edu.cn/AID/)（本地下载使用 [Kaggle 镜像](https://www.kaggle.com/datasets/jiayuanchengala/aid-scene-classification-datasets)）。准备数据：
+
+```bash
+mkdir -p data/remote_sensing/raw
+curl -L 'https://www.kaggle.com/api/v1/datasets/download/abdulhasibuddin/uc-merced-land-use-dataset' \
+  -o data/remote_sensing/raw/uc_merced_land_use.zip
+curl -L 'https://www.kaggle.com/api/v1/datasets/download/jiayuanchengala/aid-scene-classification-datasets' \
+  -o data/remote_sensing/raw/aid_scene_classification.zip
+
+mkdir -p data/remote_sensing/raw/ucmerced_extracted data/remote_sensing/raw/aid_extracted
+unzip -q data/remote_sensing/raw/uc_merced_land_use.zip -d data/remote_sensing/raw/ucmerced_extracted
+unzip -q data/remote_sensing/raw/aid_scene_classification.zip -d data/remote_sensing/raw/aid_extracted
+
+conda run -n rwkv7 python scripts/prepare_remote_sensing.py \
+  --dataset ucmerced \
+  --source-dir data/remote_sensing/raw/ucmerced_extracted/UCMerced_LandUse/Images \
+  --output-dir data/remote_sensing/prepared/UC_Merced \
+  --source-archive data/remote_sensing/raw/uc_merced_land_use.zip \
+  --workers 8
+
+conda run -n rwkv7 python scripts/prepare_remote_sensing.py \
+  --dataset aid \
+  --source-dir data/remote_sensing/raw/aid_extracted/AID \
+  --output-dir data/remote_sensing/prepared/AID \
+  --source-archive data/remote_sensing/raw/aid_scene_classification.zip \
+  --workers 8
+```
+
+脚本会写出 `metadata.json` 和 `manifest.jsonl`，并校验每个 split 的 RGB、尺寸和三目录同名配对。由于两个数据集的 HR 尺寸不同，训练时要使用对应配置，不能把 UC Merced 的 `hr_size=256` 与 AID 的 `hr_size=512` 混在同一个固定网格实验中。
 
 ## 训练
 
@@ -73,20 +118,24 @@ PNG 数据集按同名文件配对：
 ```bash
 conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_4.yaml
 conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_10.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_ucmerced.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/sr_prior_aid.yaml
 ```
 
 | 配置 | HR patch | LR patch | 倍率 | 内部网格 | batch size |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `configs/sr_prior_4.yaml` | 512 | 128 | 4 | 128 | 4 |
 | `configs/sr_prior_10.yaml` | 480 | 48 | 10 | 120 | 4 |
+| `configs/sr_prior_ucmerced.yaml` | 256 | 64 | 4 | 64 | 4 |
+| `configs/sr_prior_aid.yaml` | 512 | 128 | 4 | 128 | 4 |
 
-两个配置均使用 BF16 混合精度与梯度累积。RTX 5060 Ti（16 GiB）已完成上述配置的单次 batch=4 前向、反向与优化器更新。
+表中配置均使用 BF16 混合精度与梯度累积；两个新增配置将验证采样上限设为 `300`，训练集和测试集仍保留全部样本。UC Merced 配置的 HR 网格较小，适合先做快速验证。RTX 5060 Ti（16 GiB）已完成上述配置的单次 batch=4 前向、反向与优化器更新。
 
 训练模块由 L1 损失与可选 SSIM、FFT 损失组成；EMA 仅在真实 optimizer step 后更新，并在验证和测试期间临时应用。学习率默认使用 `ReduceLROnPlateau`，调度器在每次验证运行结束时读取本次聚合后的 `val_loss`，而不是只在 epoch 末读取一次。
 
 ### 学习率调度
 
-两个独立训练配置都使用以下 plateau 规则（具体初始学习率、衰减因子和下限以对应 YAML 为准）：
+上述训练配置都使用以下 plateau 规则（具体初始学习率、衰减因子和下限以对应 YAML 为准）：
 
 | 参数 | 含义 |
 | --- | --- |
@@ -117,16 +166,18 @@ conda run -n rwkv7 python scripts/train_sr_prior.py \
 
 ## 评测
 
-`scripts/eval_four_settings.py` 评估 bicubic、无参考、真实参考和理想参考四种设置。`--hr_size` 必须与 checkpoint 训练时的 HR patch 一致：
+`scripts/eval_four_settings.py` 可在同一测试集上对比 bicubic、准备好的 SISR Ref 和 HR 作为上限参考。准备好的遥感数据只有 `train/val/test`，因此显式指定 `--splits test`；`--hr_size` 必须与 checkpoint 训练时的 HR patch 一致：
 
 ```bash
 conda run -n rwkv7 python scripts/eval_four_settings.py \
   --ckpt checkpoints/refrwkv_sr_4/last.ckpt \
+  --data data/remote_sensing/prepared/AID \
+  --splits test \
   --scale 4 \
   --hr_size 512
 ```
 
-10x checkpoint 使用 `--scale 10 --hr_size 480`。评测默认加载 EMA 权重，并在推理前调用 `prepare_for_inference()`。
+UC Merced 使用 `--data data/remote_sensing/prepared/UC_Merced --hr_size 256`。评测默认加载 EMA 权重，并在推理前调用 `prepare_for_inference()`；`Ref` 设定就是 SISR 的实际测试路径，`perfect_ref` 仅用于诊断参考信息的理论上限。
 
 ## 扩散阶段集成
 

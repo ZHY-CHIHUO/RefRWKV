@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""RefSRWKV 四设定评测：bicubic、无参考、真实参考、理想参考。"""
+"""RefSRWKV SISR 评测：bicubic、LR 上采样 Ref，以及 HR 参考上限。"""
 import argparse
 import os
 import sys
@@ -18,7 +18,7 @@ from RefSR_data.RefDataset import RefPNGDataset
 PREFIXES = ("model_sr.", "model.", "generator.sr_model.", "sr_model.", "module.")
 # EMA shadow 不含 buffer，这些键缺失属正常
 BUFFER_SUFFIXES = ("conv5x5_reparam_weight", ".scale")
-SETTINGS = ["bicubic", "no_ref", "real_ref", "perfect_ref"]
+SETTINGS = ["bicubic", "sisr_ref", "perfect_ref"]
 
 def strip_prefix(sd):
     out = {}
@@ -72,13 +72,13 @@ def run_split(model, split, args, device):
         it = ds[i]
         lr = it["lr"].unsqueeze(0).to(device)
         hr = it["hr"].unsqueeze(0).to(device)
-        ref = it["ref"].unsqueeze(0).to(device)
+        # The SISR setting is defined by the runtime bicubic LR upsample,
+        # independent of interpolation details or stale Ref files.
         H, W = hr.shape[2:]
         lr_up = F.interpolate(lr, size=(H, W), mode="bicubic", align_corners=False)
         outs = {
             "bicubic": lr_up,
-            "no_ref": model(lr, lr_up).clamp(-1, 1),
-            "real_ref": model(lr, ref).clamp(-1, 1),
+            "sisr_ref": model(lr, lr_up).clamp(-1, 1),
             "perfect_ref": model(lr, hr).clamp(-1, 1),
         }
         for s, o in outs.items():
@@ -95,7 +95,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/refrwkv_sr_4/last.ckpt")
     ap.add_argument("--data", default="RefSR_data/HRMS_SCD")
-    ap.add_argument("--splits", nargs="+", default=["test_easy", "test_hard"])
+    ap.add_argument("--splits", nargs="+", default=None,
+                    help="默认优先使用 test；若数据集没有 test，则使用 test_easy/test_hard")
     ap.add_argument("--n", type=int, default=500)
     ap.add_argument("--scale", type=int, default=4)
     ap.add_argument("--hr_size", type=int, default=512,
@@ -104,6 +105,16 @@ def main():
                     help="评测时的 HR 裁剪边长；默认 None 表示全图")
     ap.add_argument("--raw", action="store_true", help="用原始权重而非 EMA")
     args = ap.parse_args()
+
+    if args.splits is None:
+        available = {name for name in ("test", "test_easy", "test_hard")
+                     if os.path.isdir(os.path.join(args.data, name))}
+        args.splits = (["test"] if "test" in available else
+                       [name for name in ("test_easy", "test_hard") if name in available])
+        if not args.splits:
+            raise FileNotFoundError(
+                f"未找到可用测试 split: {args.data}/test 或 test_easy/test_hard"
+            )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = RefSRWKV(inp_channels=3, out_channels=3, dim=48,
@@ -120,8 +131,7 @@ def main():
     print("\n===== 汇总（Δ vs bicubic）=====")
     for sp, r in results.items():
         b = r["bicubic"]
-        print(f"  {sp}: bicubic {b:.2f} | no_ref {r['no_ref']:.2f} ({r['no_ref'] - b:+.2f}) "
-              f"| real_ref {r['real_ref']:.2f} ({r['real_ref'] - b:+.2f}) "
+        print(f"  {sp}: bicubic {b:.2f} | sisr_ref {r['sisr_ref']:.2f} ({r['sisr_ref'] - b:+.2f}) "
               f"| perfect_ref {r['perfect_ref']:.2f} ({r['perfect_ref'] - b:+.2f})")
 if __name__ == "__main__":
     main()

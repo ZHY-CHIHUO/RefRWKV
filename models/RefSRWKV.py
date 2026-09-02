@@ -629,11 +629,9 @@ class LitRefSRWKV(pl.LightningModule):
         if p <= 0 or not self.training:
             return ref
         batch_size = ref.size(0)
-        if batch_size >= 2:
-            # A one-position roll is a derangement, so a dropped sample can
-            # never accidentally receive its own reference image.
-            replacement = torch.roll(ref, shifts=1, dims=0)
-        elif lr is not None:
+        if lr is not None:
+            # Dropped references follow the single-image SR path for every
+            # batch size: use the current sample's bicubic-upsampled LR.
             replacement = F.interpolate(lr, size=ref.shape[-2:], mode="bicubic", align_corners=False)
             if replacement.shape[1] != ref.shape[1]:
                 replacement = torch.zeros_like(ref)

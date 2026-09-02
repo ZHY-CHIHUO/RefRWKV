@@ -26,6 +26,7 @@ logs/
 scripts/*
 !scripts/train_sd2_gan.py
 !scripts/train_sr_prior.py
+!scripts/prepare_remote_sensing.py
 
 # ===== 结果文件 (按需保留，如果不需要可取消注释) =====
 results/
