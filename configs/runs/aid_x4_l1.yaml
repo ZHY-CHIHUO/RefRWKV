@@ -19,10 +19,8 @@ data:
   # bicubic-upsampled LR instead of the stored Ref PNG.
   reference_mode: lr_up
   ref_gray_prob: 0.0
-  batch_size: 32
-  # Validation is inference-only. Keeping 32 evaluates the fixed 300-image
-  # subset in about 10 batches per validation pass.
-  val_batch_size: 32
+  batch_size: 16
+  val_batch_size: 16
   max_samples_val: 300
 
 train:
@@ -31,6 +29,6 @@ train:
   # Validate about ten times per epoch. The deterministic 300-image subset
   # keeps every plateau update comparable.
   val_check_interval: 0.1
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2
   log_every_n_steps: 50
   early_stopping_patience: null
