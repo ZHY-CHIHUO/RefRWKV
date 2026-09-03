@@ -1,6 +1,6 @@
 # RefRWKV — Reference-Guided Remote Sensing Super-Resolution
 
-基于 RWKV + Stable Diffusion 2.1 的参考引导遥感图像超分辨率重建框架。SR Prior 根据数据集配置支持 4× 和 10× 超分。
+基于 RWKV + Stable Diffusion 2.1 的参考引导遥感图像超分辨率重建框架。SR Prior 在原生 LR 网格上运行，由物理超分倍率控制参考折叠和输出重建。
 
 ## 核心链路
 
@@ -64,7 +64,7 @@ configs/
 │   ├── hrms_scd.yaml
 │   ├── real_refrssrd.yaml
 │   └── ucmerced.yaml
-├── runs/                     # SR Prior 训练网格和实验差异
+├── runs/                     # SR Prior 原生 LR crop 和实验差异
 │   ├── aid_x4_l1.yaml
 │   ├── hrms_scd_x4.yaml
 │   ├── real_refrssrd_x10.yaml
@@ -90,27 +90,28 @@ configs/
 
 ### SR Prior 独立训练
 
-SR Prior（RefSRWKV）可独立于四阶段扩散课程训练，用于生成 SR 图像和结构先验。按数据集选择配置：
+RefSRWKV 在原生 LR 网格上训练：每个 run 定义 `run.scale` 和
+`run.lr_patch`，HR crop 自动为 `lr_patch * scale`。U-Net 不会把全图缩回训练
+尺寸；Ref 使用 `PixelUnshuffle(scale)` 折叠，残差在 `LR * scale` 网格重建，
+验证与测试保留原生全图尺寸。
 
-| 数据集 | 配置 | 存储 HR/LR | 训练 HR/LR | 倍率 | 输出目录 |
+| 数据集 | 配置 | 存储 HR/LR | 训练 HR/LR | 倍率 | 输出头 |
 | --- | --- | ---: | ---: | ---: | --- |
-| HRMS-SCD | `configs/runs/hrms_scd_x4.yaml` | 512/128 | 512/128 | 4× | `checkpoints/refrwkv_sr_hrms_scd_x4` |
-| Real-RefRSSRD | `configs/runs/real_refrssrd_x10.yaml` | 480/48 | 480/48 | 10× | `checkpoints/refrwkv_sr_real_refrssrd_x10` |
-| UC Merced | `configs/runs/ucmerced_x4.yaml` | 256/64 | 256/64 | 4× | `checkpoints/refrwkv_sr_ucmerced_x4` |
-| AID | `configs/runs/aid_x4_l1.yaml` | 512/128 | 256/64 | 4× | `checkpoints/refrwkv_sr_aid_x4_l1` |
+| HRMS-SCD | `configs/runs/hrms_scd_x4.yaml` | 512/128 | 192/48 | 4× | progressive |
+| Real-RefRSSRD | `configs/runs/real_refrssrd_x10.yaml` | 480/48 | 480/48 | 10× | direct |
+| UC Merced | `configs/runs/ucmerced_x4.yaml` | 256/64 | 192/48 | 4× | progressive |
+| AID | `configs/runs/aid_x4_l1.yaml` | 512/128 | 192/48 | 4× | progressive |
 
-启动命令（使用 `rwkv7` 环境）：
+启动 AID x4 从头训练：
 
 ```bash
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/hrms_scd_x4.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/real_refrssrd_x10.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/ucmerced_x4.yaml
-conda run -n rwkv7 python scripts/train_sr_prior.py --config configs/runs/aid_x4_l1.yaml
+conda run -n rwkv7 python scripts/train_sr_prior.py \
+  --config configs/runs/aid_x4_l1.yaml
 ```
 
-数据集 YAML 只记录数据集根目录、原始/准备后图像尺寸、类别和 split 等信息；训练 YAML 通过 `base:` 继承数据集配置，只记录 `run.scale`、`run.hr_patch` 以及与公共默认值不同的训练参数。脚本会把它们自动展开为 loader/model 所需的 `data.scale`、`data.patch_size` 和 `model.scale`，并按 `run.name` 生成独立的日志和 checkpoint 目录。
+数据集 YAML 只记录数据集事实和路径；run YAML 记录倍率、LR crop、损失和与默认值不同的训练参数。AID 使用纯 L1、物理 batch 8、累积 4（有效 batch 32）和 50,000 optimizer steps。验证使用固定的 200 张原生全图、batch 1；EMA、`ReduceLROnPlateau`、checkpoint 和 early stopping 全部读取聚合后的全图 `val_loss`。
 
-所有 SR Prior 配置使用 EMA、验证驱动的 `ReduceLROnPlateau`、梯度裁剪及可选的 SSIM/FFT 损失；AID run 使用 HR 256/LR 64、batch=32、纯 L1 和 50,000 个 optimizer steps。改变倍率时可直接用 `--overrides run.scale=... run.hr_patch=...`，但必须使用按该倍率生成的 LR/HR 配对目录。
+`configs/sr_prior_base.yaml` 的窗口为 `8/[0,4]`（level1/2）、`4/[0,2]`（level3）和 `3/[0,1]`（latent）。卷积与参考分支采用逐像素通道 RMSNorm，`GatedFusion` 采用逐像素 1x1 gate；`model.color_match: global|none` 控制唯一可选的全图 Ref 颜色统计。详见 [RefSRWKV.md](RefSRWKV.md)。
 
 ### 关键开关速查
 
@@ -242,7 +243,7 @@ TensorBoard 指标一览（logs/sd2_ref_gan/）：
 
 ## 已知限制
 
-- 当前 SR Prior 配置覆盖 4×（HRMS-SCD、UC Merced、AID）和 10×（Real-RefRSSRD）；显存需求随数据集尺寸和 batch size 变化。
+- 当前 SR Prior 配置提供 4×（HRMS-SCD、UC Merced、AID）和 10×（Real-RefRSSRD）示例；新倍率需要对应倍率生成的 LR/HR PNG 配对，并由 `run.scale` 与 `run.lr_patch` 定义训练契约。
 - CUDA WKV 算子需要 CUDA/NVCC，不支持纯 CPU 推理（空间 RWKV 路径）。
 - SelfSimTransfer 全局 affinity 为 O(N²)，高分辨率下需注意显存（Stage 3/4 开启）。
 - 数据加载器暂不支持断点续训的 epoch 内恢复（中断后重新遍历）。

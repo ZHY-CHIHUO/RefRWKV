@@ -40,6 +40,21 @@ _WINDOW_LEVEL_ALIASES = {
 }
 
 
+def _pixel_shuffle_factors(factor):
+    """Factor an integer reconstruction ratio into practical shuffle stages."""
+    if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1:
+        raise ValueError(f"重建倍率必须为正整数，得到 {factor!r}")
+    factors = []
+    remainder = factor
+    for prime in (2, 3):
+        while remainder % prime == 0:
+            factors.append(prime)
+            remainder //= prime
+    if remainder > 1:
+        factors.append(remainder)
+    return tuple(factors)
+
+
 def _window_positive_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} 必须是正整数，得到 {value!r}")
@@ -644,27 +659,51 @@ class Upsample(nn.Module):
         return self.body(x)
 
 
-def _gn_groups(num_channels: int, max_groups: int = 32) -> int:
-    for g in range(min(max_groups, num_channels), 0, -1):
-        if num_channels % g == 0:
-            return g
-    return 1
+class RMSNorm2d(nn.Module):
+    """Per-pixel RMS normalization over channels only.
+
+    Unlike GroupNorm, this has no spatial reduction, so a model trained on
+    48x48 LR crops sees the same normalization rule on an arbitrary full image.
+    RMS normalization deliberately does not subtract the channel mean because
+    low-frequency/DC colour information matters for super-resolution.
+    """
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        if not isinstance(num_channels, int) or num_channels < 1:
+            raise ValueError("RMSNorm2d 的 num_channels 必须为正整数")
+        if not math.isfinite(float(eps)) or float(eps) <= 0:
+            raise ValueError("RMSNorm2d 的 eps 必须为正有限数")
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.eps = float(eps)
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.weight.numel():
+            raise ValueError(
+                "RMSNorm2d 输入必须是匹配通道数的 NCHW 张量，"
+                f"得到 {tuple(x.shape)}"
+            )
+        input_dtype = x.dtype
+        x_float = x.float()
+        rms = x_float.square().mean(dim=1, keepdim=True).add(self.eps).rsqrt()
+        normalized = x_float * rms * self.weight.float().view(1, -1, 1, 1)
+        return normalized.to(input_dtype)
 
 
 class GatedFusion(nn.Module):
     def __init__(self, dim, reduction=4):
         super().__init__()
         self.fuse_conv = nn.Conv2d(dim * 2, dim, 1, bias=False)
-        self.norm = nn.GroupNorm(_gn_groups(dim), dim)
+        self.norm = RMSNorm2d(dim)
+        gate_hidden = max(dim // reduction, 8)
         self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, max(dim // reduction, 8), 1),
+            nn.Conv2d(dim, gate_hidden, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(max(dim // reduction, 8), dim, 1),
+            nn.Conv2d(gate_hidden, dim, 1),
             nn.Sigmoid(),
         )
         nn.init.trunc_normal_(self.fuse_conv.weight, std=0.02)
-        nn.init.constant_(self.gate[-2].bias, 0.0)
+        nn.init.constant_(self.gate[2].bias, 0.0)
 
     def forward(self, lr_feat, ref_feat):
         sim = F.cosine_similarity(lr_feat, ref_feat, dim=1).unsqueeze(1)
@@ -686,7 +725,8 @@ class RefSRWKV(nn.Module):
         num_blocks: tuple = (4, 6, 6, 8),
         num_refinement_blocks: int = 4,
         scale: int = 4,
-        hr_size: int = 480,
+        upsampler: str = "progressive",
+        color_match: str = "global",
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
         ref_channels: int = None,
@@ -710,8 +750,12 @@ class RefSRWKV(nn.Module):
             raise ValueError("dim 必须是至少 16 的 16 倍数，以适配 CUDA WKV")
         if not isinstance(scale, int) or scale < 1:
             raise ValueError("scale 必须为正整数")
-        if not isinstance(hr_size, int) or hr_size <= 0:
-            raise ValueError("hr_size 必须为正整数")
+        upsampler = str(upsampler).lower()
+        if upsampler not in {"progressive", "direct"}:
+            raise ValueError("upsampler 只能是 progressive 或 direct")
+        color_match = str(color_match).lower()
+        if color_match not in {"global", "none"}:
+            raise ValueError("color_match 只能是 global 或 none")
         if (
             not math.isfinite(float(drop_path_rate))
             or not 0.0 <= float(drop_path_rate) < 1.0
@@ -738,19 +782,15 @@ class RefSRWKV(nn.Module):
         if ref_channels != inp_channels:
             raise ValueError("当前颜色对齐路径要求 ref_channels == inp_channels")
 
-        # Three PixelUnshuffle(2) stages require the internal grid to be
-        # divisible by 8.  Windows pad dynamically, so their sizes do not add
-        # another input-size constraint.
-        self.ref_down_factor = 4
-        if hr_size % (self.ref_down_factor * 8) != 0:
-            raise ValueError(
-                f"HR尺寸({hr_size}) 必须能被 {self.ref_down_factor * 8} 整除，"
-                "否则 U-Net 的三级下采样无法对齐"
-            )
+        # The U-Net lives on the incoming LR grid.  ``scale`` is therefore the
+        # only fold/reconstruction ratio: Ref is folded with PixelUnshuffle(x
+        # scale), and the residual is reconstructed by the chosen output head.
+        self.ref_down_factor = scale
+        self.reconstruction_factor = scale
+        self.reconstruction_factors = _pixel_shuffle_factors(scale)
         self.scale, self.dim, self.out_channels = scale, dim, out_channels
         self.inp_channels, self.ref_channels = inp_channels, ref_channels
-        self.hr_size = hr_size
-        self.internal_size = hr_size // self.ref_down_factor
+        self.upsampler, self.color_match = upsampler, color_match
         self.window_config = normalize_window_config(
             windows,
             window_size=window_size,
@@ -765,33 +805,35 @@ class RefSRWKV(nn.Module):
 
         self.lr_up = nn.Sequential(
             nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False),
-            nn.GroupNorm(_gn_groups(dim), dim),
+            RMSNorm2d(dim),
             nn.ReLU(inplace=True),
             nn.Conv2d(dim, dim, 3, padding=1, bias=False),
-            nn.GroupNorm(_gn_groups(dim), dim),
+            RMSNorm2d(dim),
             nn.ReLU(inplace=True),
             nn.Conv2d(dim, dim, 3, padding=2, dilation=2, bias=False),
-            nn.GroupNorm(_gn_groups(dim), dim),
+            RMSNorm2d(dim),
             nn.ReLU(inplace=True),
         )
 
         self.ref_to_level1 = nn.Sequential(
-            nn.PixelUnshuffle(self.ref_down_factor),
-            nn.Conv2d(ref_channels * (self.ref_down_factor**2), dim, 1, bias=False),
-            nn.GroupNorm(_gn_groups(dim), dim),
+            nn.PixelUnshuffle(scale),
+            nn.Conv2d(
+                ref_channels * (scale**2), dim, 1, bias=False
+            ),
+            RMSNorm2d(dim),
             nn.ReLU(inplace=True),
         )
         self.ref_down2 = nn.Sequential(
             nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(_gn_groups(dim * 2), dim * 2),
+            RMSNorm2d(dim * 2),
         )
         self.ref_down3 = nn.Sequential(
             nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(_gn_groups(dim * 4), dim * 4),
+            RMSNorm2d(dim * 4),
         )
         self.ref_down4 = nn.Sequential(
             nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(_gn_groups(dim * 8), dim * 8),
+            RMSNorm2d(dim * 8),
         )
 
         self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
@@ -864,36 +906,56 @@ class RefSRWKV(nn.Module):
         self.up4_3 = Upsample(dim * 8)
         self.reduce_chan_level3 = nn.Sequential(
             nn.Conv2d(dim * 8, dim * 4, 1, bias=False),
-            nn.GroupNorm(_gn_groups(dim * 4), dim * 4),
+            RMSNorm2d(dim * 4),
         )
         self.decoder_level3 = make_stage("dec3", dim * 4, num_blocks[2])
         self.up3_2 = Upsample(dim * 4)
         self.reduce_chan_level2 = nn.Sequential(
             nn.Conv2d(dim * 4, dim * 2, 1, bias=False),
-            nn.GroupNorm(_gn_groups(dim * 2), dim * 2),
+            RMSNorm2d(dim * 2),
         )
         self.decoder_level2 = make_stage("dec2", dim * 2, num_blocks[1])
         self.up2_1 = Upsample(dim * 2)
         self.reduce_chan_level1 = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1, bias=False), nn.GroupNorm(_gn_groups(dim), dim)
+            nn.Conv2d(dim * 2, dim, 1, bias=False), RMSNorm2d(dim)
         )
         self.decoder_level1 = make_stage("dec1", dim, num_blocks[0])
 
         self.refinement = make_stage("refine", dim, num_refinement_blocks)
 
-        # d1 lives at HR/4.  Learn the missing four spatial phases with two
-        # PixelShuffle stages instead of bicubic-resizing a three-channel map.
-        # The final residual is zero-initialized so training starts from the
-        # actual bicubic skip connection.
-        self.up_final = nn.Sequential(
-            nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
-            nn.PixelShuffle(2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim * 4, 3, padding=1, bias=False),
-            nn.PixelShuffle(2),
-            nn.ReLU(inplace=True),
-        )
-        self.output_conv = nn.Conv2d(dim, out_channels, 3, padding=1, bias=False)
+        # The progressive head preserves the conventional x4 x2+x2 path.  The
+        # direct head keeps all expensive activations on the LR grid and only
+        # expands channels in the final convolution, which is preferable for
+        # high factors such as x10.
+        if self.upsampler == "progressive":
+            up_layers = []
+            for shuffle_factor in self.reconstruction_factors:
+                up_layers.extend(
+                    [
+                        nn.Conv2d(
+                            dim,
+                            dim * (shuffle_factor**2),
+                            3,
+                            padding=1,
+                            bias=False,
+                        ),
+                        nn.PixelShuffle(shuffle_factor),
+                        nn.ReLU(inplace=True),
+                    ]
+                )
+            self.up_final = (
+                nn.Sequential(*up_layers) if up_layers else nn.Identity()
+            )
+            self.output_conv = nn.Conv2d(
+                dim, out_channels, 3, padding=1, bias=False
+            )
+            self.output_shuffle = nn.Identity()
+        else:
+            self.up_final = nn.Identity()
+            self.output_conv = nn.Conv2d(
+                dim, out_channels * (scale**2), 3, padding=1, bias=False
+            )
+            self.output_shuffle = nn.PixelShuffle(scale)
         self.apply(self._init_weights)
         if isinstance(self.skip_proj, nn.Conv2d):
             # Preserve the available channels at initialization; the learned
@@ -910,11 +972,15 @@ class RefSRWKV(nn.Module):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+        elif isinstance(m, nn.LayerNorm):
             nn.init.zeros_(m.bias)
+            nn.init.ones_(m.weight)
+        elif isinstance(m, RMSNorm2d):
             nn.init.ones_(m.weight)
 
     def _match_color(self, ref, target):
+        if self.color_match == "none":
+            return ref
         # Keep statistics in float32: bf16/half spatial reductions can lose
         # enough precision to create visible colour shifts on flat patches.
         input_dtype = ref.dtype
@@ -946,47 +1012,47 @@ class RefSRWKV(nn.Module):
             raise ValueError(f"ref 通道数应为 {self.ref_channels}，得到 {ref.shape[1]}")
         if lr.shape[2] < 1 or lr.shape[3] < 1 or ref.shape[2] < 1 or ref.shape[3] < 1:
             raise ValueError("lr/ref 的空间尺寸必须为正数")
-        target_hr_h, target_hr_w = ref.shape[2], ref.shape[3]
+        target_hr_h, target_hr_w = lr.shape[2] * self.scale, lr.shape[3] * self.scale
+        if ref.shape[2:] != (target_hr_h, target_hr_w):
+            raise ValueError(
+                "Ref 尺寸必须严格等于 LR x scale；"
+                f"得到 LR={tuple(lr.shape[2:])}, scale=x{self.scale}, "
+                f"Ref={tuple(ref.shape[2:])}"
+            )
         lr_hr_input = F.interpolate(
             lr, size=(target_hr_h, target_hr_w), mode="bicubic", align_corners=False
         )
         ref_aligned = self._match_color(ref, lr_hr_input)
-        lr_hr = self.skip_proj(lr_hr_input)
 
-        if target_hr_h % self.ref_down_factor or target_hr_w % self.ref_down_factor:
-            raise ValueError(
-                f"ref 空间尺寸 {target_hr_h}x{target_hr_w} 必须能被 {self.ref_down_factor} 整除"
+        # Three PixelUnshuffle downsampling stages require an LR multiple of
+        # eight.  Pad only the bottom/right edge, and pad Ref by exactly the
+        # physical scale so PixelUnshuffle(scale) remains phase-aligned.
+        lr_h, lr_w = lr.shape[2:]
+        pad_h, pad_w = (-lr_h) % 8, (-lr_w) % 8
+        if pad_h or pad_w:
+            lr_internal = F.pad(lr, (0, pad_w, 0, pad_h), mode="replicate")
+            ref_internal = F.pad(
+                ref_aligned,
+                (0, pad_w * self.scale, 0, pad_h * self.scale),
+                mode="replicate",
             )
-        int_h, int_w = (
-            target_hr_h // self.ref_down_factor,
-            target_hr_w // self.ref_down_factor,
+        else:
+            lr_internal, ref_internal = lr, ref_aligned
+        padded_hr_size = (
+            lr_internal.shape[2] * self.scale,
+            lr_internal.shape[3] * self.scale,
         )
-        if int_h % 8 or int_w % 8:
-            raise ValueError(
-                f"内部网格 {int_h}x{int_w} 必须可被 8 整除，以通过三级 U-Net 下采样"
+        lr_hr = self.skip_proj(
+            F.interpolate(
+                lr_internal,
+                size=padded_hr_size,
+                mode="bicubic",
+                align_corners=False,
             )
+        )
 
-        # The architecture is fully convolutional.  `hr_size` describes the
-        # training grid and checkpoint contract, while inference preserves the
-        # incoming HR/LR geometry instead of shrinking a larger test image to
-        # the training patch.
-        if lr.shape[2] != int_h or lr.shape[3] != int_w:
-            lr_int = F.interpolate(
-                lr, size=(int_h, int_w), mode="bicubic", align_corners=False
-            )
-        else:
-            lr_int = lr
-
-        target_ref_size = (int_h * self.ref_down_factor, int_w * self.ref_down_factor)
-        if ref_aligned.shape[2:] != target_ref_size:
-            ref_int = F.interpolate(
-                ref_aligned, size=target_ref_size, mode="bicubic", align_corners=False
-            )
-        else:
-            ref_int = ref_aligned
-
-        fea = self.lr_up(lr_int)
-        ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_int)
+        fea = self.lr_up(lr_internal)
+        ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_internal)
 
         e1 = self.encoder_level1(self.fuse1(fea, ref_1))
         e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
@@ -1004,16 +1070,15 @@ class RefSRWKV(nn.Module):
         )
         d1 = self.refinement(d1)
 
-        out_feat = self.output_conv(self.up_final(d1))
-        if out_feat.shape[2] != target_hr_h or out_feat.shape[3] != target_hr_w:
-            out_feat = F.interpolate(
-                out_feat,
-                size=(target_hr_h, target_hr_w),
-                mode="bicubic",
-                align_corners=False,
+        out_feat = self.output_shuffle(self.output_conv(self.up_final(d1)))
+        if out_feat.shape[2:] != padded_hr_size:
+            raise RuntimeError(
+                "输出头没有按 scale 重建到 LR x scale: "
+                f"{tuple(out_feat.shape[2:])} vs {padded_hr_size}"
             )
-
-        return torch.clamp(lr_hr + out_feat, min=-1.0, max=1.0)
+        output = lr_hr + out_feat
+        output = output[:, :, :target_hr_h, :target_hr_w]
+        return torch.clamp(output, min=-1.0, max=1.0)
 
     def prepare_for_inference(self):
         self.eval()

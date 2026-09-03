@@ -1,15 +1,14 @@
-# AID x4 SISR fine-tuning with the L1-only 50,000-step recipe.
-# Prepared files are HR/LR 512/128; the training grid is HR/LR 256/64.
+# AID x4 SISR from scratch. The model trains on native LR48/HR192 crops and
+# validates on full LR128/HR512 images.
 base: ../datasets/aid.yaml
 
 run:
   name: aid_x4_l1
   scale: 4
-  hr_patch: 256
+  lr_patch: 48
   recipe: l1
 
 model:
-  learning_rate: 2.0e-5
   ssim_weight: 0.0
   fft_weight: 0.0
   ref_drop_prob: 0.0
@@ -17,14 +16,14 @@ model:
 data:
   reference_mode: lr_up
   ref_gray_prob: 0.0
-  batch_size: 32
-  val_batch_size: 16
-  max_samples_val: 300
+  batch_size: 8
+  val_batch_size: 1
+  max_samples_val: 200
 
 train:
   max_epochs: -1
   max_steps: 50000
   val_check_interval: 1.0
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 4
   log_every_n_steps: 50
   early_stopping_patience: null

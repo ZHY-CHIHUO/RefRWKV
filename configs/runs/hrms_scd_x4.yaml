@@ -5,10 +5,11 @@ base: ../datasets/hrms_scd.yaml
 run:
   name: hrms_scd_x4
   scale: 4
-  hr_patch: 512
+  lr_patch: 48
 
 data:
   reference_mode: paired
+  val_batch_size: 1
   max_samples_val: 300
 
 model:

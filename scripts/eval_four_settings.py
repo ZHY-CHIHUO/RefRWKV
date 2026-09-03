@@ -14,7 +14,8 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, os.getcwd())
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.RefSRWKV import RefSRWKV
 from RefSR_data.RefDataset import RefPNGDataset
@@ -104,7 +105,7 @@ def load_weights(model, ckpt_path, use_ema):
 
 
 def checkpoint_model_options(ckpt_path):
-    """Read model/grid metadata from a checkpoint or its nearby run config."""
+    """Read the native-LR model contract saved with a checkpoint."""
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     except TypeError:
@@ -114,16 +115,24 @@ def checkpoint_model_options(ckpt_path):
     )
     options = {}
     if isinstance(signature, dict):
-        if signature.get("hr_size") is not None:
-            options["hr_size"] = int(signature["hr_size"])
-        if signature.get("scale") is not None:
-            options["scale"] = int(signature["scale"])
-        if isinstance(signature.get("windows"), dict):
-            options["windows"] = signature["windows"]
+        for key in (
+            "scale",
+            "inp_channels",
+            "out_channels",
+            "dim",
+            "hidden_rate",
+            "ref_channels",
+            "num_blocks",
+            "num_refinement_blocks",
+            "upsampler",
+            "color_match",
+            "windows",
+        ):
+            if signature.get(key) is not None:
+                options[key] = signature[key]
 
-    # Checkpoints created before signatures still have the expanded config
-    # written next to them. This preserves their actual window behavior
-    # during evaluation instead of silently applying today's default windows.
+    # ``train_config.yaml`` is retained beside checkpoints as a readable
+    # fallback, but native-LR checkpoints write the same contract in-signature.
     config_path = Path(ckpt_path).parent / "train_config.yaml"
     if config_path.is_file():
         try:
@@ -135,16 +144,25 @@ def checkpoint_model_options(ckpt_path):
             data_cfg = train_cfg.get("data")
             model_cfg = train_cfg.get("model")
             if isinstance(data_cfg, dict):
-                if "hr_size" not in options and data_cfg.get("patch_size") is not None:
-                    options["hr_size"] = int(data_cfg["patch_size"])
                 if "scale" not in options and data_cfg.get("scale") is not None:
                     options["scale"] = int(data_cfg["scale"])
-            if (
-                "windows" not in options
-                and isinstance(model_cfg, dict)
-                and isinstance(model_cfg.get("windows"), dict)
-            ):
-                options["windows"] = model_cfg["windows"]
+            if isinstance(model_cfg, dict):
+                for key in (
+                    "inp_channels",
+                    "out_channels",
+                    "ref_channels",
+                    "dim",
+                    "num_blocks",
+                    "num_refinement_blocks",
+                    "hidden_rate",
+                    "upsampler",
+                    "color_match",
+                    "windows",
+                ):
+                    if key not in options and model_cfg.get(key) is not None:
+                        options[key] = model_cfg[key]
+    if "scale" not in options:
+        raise ValueError("checkpoint 未记录原生 LR scale，无法安全评测")
     return options
 
 
@@ -181,6 +199,11 @@ def run_split(model, split, args, device):
         # The SISR setting is defined by the runtime bicubic LR upsample,
         # independent of interpolation details or stale Ref files.
         H, W = hr.shape[2:]
+        if (H, W) != (lr.shape[2] * args.scale, lr.shape[3] * args.scale):
+            raise ValueError(
+                "数据的 HR 尺寸必须严格等于 LR x scale: "
+                f"LR={tuple(lr.shape[2:])}, HR={(H, W)}, scale=x{args.scale}"
+            )
         lr_up = F.interpolate(lr, size=(H, W), mode="bicubic", align_corners=False)
         outs = {"bicubic": lr_up}
         if "sisr_ref" in args.settings:
@@ -247,12 +270,6 @@ def main():
         help="SR scale; omit to read the checkpoint signature",
     )
     ap.add_argument(
-        "--hr_size",
-        type=int,
-        default=None,
-        help="SR checkpoint 训练时的 HR patch 边长；省略时读取 checkpoint 签名",
-    )
-    ap.add_argument(
         "--patch",
         type=int,
         default=None,
@@ -262,6 +279,8 @@ def main():
     ap.add_argument("--window-size", type=int, default=None)
     ap.add_argument("--shift-size", type=int, default=None)
     ap.add_argument("--shift-cycle", type=int, default=None)
+    ap.add_argument("--upsampler", choices=("progressive", "direct"), default=None)
+    ap.add_argument("--color-match", choices=("global", "none"), default=None)
     ap.add_argument("--window-phase-mode", choices=("local", "global"), default=None)
     args = ap.parse_args()
 
@@ -282,8 +301,6 @@ def main():
             )
 
     ckpt_options = checkpoint_model_options(args.ckpt)
-    if args.hr_size is None:
-        args.hr_size = ckpt_options.get("hr_size", 512)
     if args.scale is None:
         args.scale = ckpt_options.get("scale", 4)
     windows = ckpt_options.get("windows")
@@ -296,20 +313,37 @@ def main():
         windows = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = RefSRWKV(
-        inp_channels=3,
-        out_channels=3,
-        dim=48,
-        num_blocks=(4, 6, 6, 8),
-        num_refinement_blocks=4,
+        inp_channels=ckpt_options.get("inp_channels", 3),
+        out_channels=ckpt_options.get("out_channels", 3),
+        ref_channels=ckpt_options.get("ref_channels", 3),
+        dim=ckpt_options.get("dim", 48),
+        num_blocks=tuple(ckpt_options.get("num_blocks", [4, 6, 6, 8])),
+        num_refinement_blocks=ckpt_options.get("num_refinement_blocks", 4),
         scale=args.scale,
-        hr_size=args.hr_size,
+        upsampler=(
+            args.upsampler
+            if args.upsampler is not None
+            else ckpt_options.get("upsampler", "progressive")
+        ),
+        color_match=(
+            args.color_match
+            if args.color_match is not None
+            else ckpt_options.get("color_match", "global")
+        ),
         drop_path_rate=0.1,
-        hidden_rate=4,
+        hidden_rate=ckpt_options.get("hidden_rate", 4),
         windows=windows,
         window_size=args.window_size if args.window_size is not None else 8,
         shift_size=args.shift_size if args.shift_size is not None else 3,
         shift_cycle=args.shift_cycle if args.shift_cycle is not None else 3,
         window_phase_mode=args.window_phase_mode,
+    )
+    print(
+        "[model] "
+        f"native LR grid | scale=x{args.scale} | "
+        f"ref/output=x{model.ref_down_factor} | head={model.upsampler} | "
+        f"color_match={model.color_match}",
+        flush=True,
     )
     load_weights(model, args.ckpt, use_ema=not args.raw)
     model.prepare_for_inference().to(device)

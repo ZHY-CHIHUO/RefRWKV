@@ -2,7 +2,7 @@
 """Prepare UC Merced or AID images for RefPNGDataset.
 
 The source datasets contain single high-resolution images arranged by class.
-This tool creates a deterministic stratified split and synthetic 4x SR pairs:
+This tool creates a deterministic stratified split and synthetic SR pairs.
 
     output/<split>/HR/*.png
     output/<split>/LR/*.png
@@ -272,8 +272,6 @@ def prepare(
 ) -> None:
     if hr_size % scale != 0:
         raise ValueError(f"--hr-size {hr_size} must be divisible by --scale {scale}")
-    if hr_size % 32 != 0:
-        raise ValueError("--hr-size must be divisible by 32 for RefSRWKV")
     if any(ratio <= 0 for ratio in ratios) or not math.isclose(
         sum(ratios), 1.0, abs_tol=1e-6
     ):

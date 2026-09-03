@@ -105,7 +105,6 @@ def build_sr_model(cfg: dict, resume_ckpt_path: Optional[str] = None):
 
     sr_cfg = mc.get("sr", {})
     sr_fixed = mc.get("sr_fixed", True)
-    sr_hr_size = sr_cfg.get("hr_size", cfg.get("data", {}).get("patch_size", 480))
 
     model = RefSRWKV(
         inp_channels=sr_cfg.get("inp_channels", 3),
@@ -114,7 +113,8 @@ def build_sr_model(cfg: dict, resume_ckpt_path: Optional[str] = None):
         num_blocks=tuple(sr_cfg.get("num_blocks", [4, 6, 6, 8])),
         num_refinement_blocks=sr_cfg.get("num_refinement_blocks", 4),
         scale=sr_cfg.get("scale", 10),
-        hr_size=sr_hr_size,
+        upsampler=sr_cfg.get("upsampler", "progressive"),
+        color_match=sr_cfg.get("color_match", "global"),
         drop_path_rate=sr_cfg.get("drop_path_rate", 0.1),
         hidden_rate=sr_cfg.get("hidden_rate", 4),
         windows=sr_cfg.get("windows"),
@@ -144,10 +144,30 @@ def build_sr_model(cfg: dict, resume_ckpt_path: Optional[str] = None):
                 state_dict[k] = v
             ckpt = state_dict
         missing, unexpected = model.load_state_dict(ckpt, strict=False)
-        if missing:
-            logger.warning("SR prior 缺失键 (%d): %s", len(missing), missing[:3])
-        if unexpected:
-            logger.warning("SR prior 多余键 (%d): %s", len(unexpected), unexpected[:3])
+        # These buffers are reconstructed by prepare_for_inference() and do
+        # not change the learned SR function when absent. A missing learned
+        # parameter means scale, output head, window schedule, or architecture
+        # does not match the selected SR checkpoint.
+        runtime_buffer_suffixes = ("conv5x5_reparam_weight", ".scale")
+        missing_parameters = [
+            key for key in missing if not key.endswith(runtime_buffer_suffixes)
+        ]
+        unexpected_parameters = [
+            key for key in unexpected if not key.endswith(runtime_buffer_suffixes)
+        ]
+        if missing_parameters or unexpected_parameters:
+            raise ValueError(
+                "SR checkpoint 与 model.sr 空间契约不一致；请使 "
+                "model.sr.scale、upsampler、窗口和网络结构 "
+                f"与 checkpoint 对齐。missing={missing_parameters[:3]}, "
+                f"unexpected={unexpected_parameters[:3]}"
+            )
+        if missing or unexpected:
+            logger.info(
+                "SR runtime buffers: missing=%d, unexpected=%d",
+                len(missing),
+                len(unexpected),
+            )
         logger.info("SR 权重加载完成（%s）: %s", desc, path)
 
     sr_ckpt = sr_cfg.get("ckpt_path")

@@ -29,7 +29,11 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 
-from RefRWKV.models.RefSRWKV import LitRefSRWKV, RefSRWKV, normalize_window_config
+from RefRWKV.models.RefSRWKV import (
+    LitRefSRWKV,
+    RefSRWKV,
+    normalize_window_config,
+)
 from RefRWKV.RefSR_data.RefDataset import RefPNGDataset
 
 logging.basicConfig(
@@ -122,28 +126,8 @@ def _load_config_file(path, stack=()):
     return _deep_merge(merged, config)
 
 
-def _size_scalar(value, name):
-    """Return a square size from an integer or a two-item size list."""
-    if isinstance(value, bool):
-        raise ValueError(f"{name} 不能是布尔值")
-    if isinstance(value, int):
-        if value < 1:
-            raise ValueError(f"{name} 必须为正整数")
-        return value
-    if isinstance(value, (list, tuple)) and len(value) == 2:
-        if all(isinstance(item, int) and not isinstance(item, bool) for item in value):
-            if value[0] == value[1] and value[0] > 0:
-                return int(value[0])
-    raise ValueError(f"{name} 必须是正整数或方形尺寸 [N, N]")
-
-
 def _materialize_run_config(config):
-    """Expand dataset/run metadata into the legacy loader/model fields.
-
-    Dataset YAMLs intentionally contain no training choices.  Run YAMLs set
-    ``run.scale`` and ``run.hr_patch``; the existing training code continues to
-    receive ``data.scale``, ``data.patch_size`` and ``model.scale``.
-    """
+    """Expand dataset metadata and a native-LR run into loader/model fields."""
     dataset_cfg = config.get("dataset")
     run_cfg = config.get("run")
     if dataset_cfg is None and run_cfg is None:
@@ -182,18 +166,23 @@ def _materialize_run_config(config):
         )
     if scale is None:
         raise ValueError("run.scale 未设置，且数据集没有 default_scale")
-    patch_size = run_cfg.get("hr_patch")
-    if patch_size is None:
-        patch_size = data_cfg.get("patch_size")
-    if patch_size is None and prepared_cfg.get("hr_size") is not None:
-        patch_size = _size_scalar(prepared_cfg["hr_size"], "dataset.prepared.hr_size")
-    if patch_size is None:
-        raise ValueError("run.hr_patch 未设置，且数据集没有 prepared.hr_size")
+    lr_patch = run_cfg.get("lr_patch", data_cfg.get("train_lr_patch"))
+    if lr_patch is None:
+        raise ValueError("原生尺度训练必须显式设置 run.lr_patch")
+    _require_int(lr_patch, "run.lr_patch")
+    _require_int(scale, "run.scale")
+    hr_patch = int(lr_patch) * int(scale)
 
-    # run.scale/hr_patch are authoritative.  This also makes a command-line
-    # override update all dependent fields in one place.
+    # ``data.patch_size`` remains the dataset constructor's HR crop argument.
+    # The explicit names are saved too, so a checkpoint records the actual
+    # native LR grid rather than an opaque HR-side size.
     data_cfg["scale"] = scale
-    data_cfg["patch_size"] = patch_size
+    data_cfg["train_lr_patch"] = int(lr_patch)
+    data_cfg["train_hr_patch"] = hr_patch
+    data_cfg["patch_size"] = hr_patch
+    data_cfg["val_patch_size"] = run_cfg.get(
+        "val_hr_patch", data_cfg.get("val_patch_size")
+    )
     model_cfg["scale"] = scale
 
     run_name = run_cfg.get("name")
@@ -265,7 +254,7 @@ def _require_number(value, name, *, minimum=None, maximum=None, maximum_inclusiv
 
 
 def validate_config(cfg):
-    """Validate assumptions imposed by the configured U-Net training grid."""
+    """Validate the native-LR crop, full-image validation, and model contract."""
     if not isinstance(cfg, dict):
         raise ValueError("配置必须是 mapping")
     for section in ("data", "model"):
@@ -273,23 +262,51 @@ def validate_config(cfg):
             raise ValueError(f"配置缺少 mapping: {section}")
 
     dc, mc = cfg["data"], cfg["model"]
-    patch_size = dc.get("patch_size", 480)
+    patch_size = dc.get("train_hr_patch", dc.get("patch_size", 480))
+    lr_patch = dc.get("train_lr_patch")
     scale = dc.get("scale", 4)
     _require_int(patch_size, "data.patch_size")
     _require_int(scale, "data.scale")
-    if patch_size % scale != 0:
+    if lr_patch is None:
+        if patch_size % scale:
+            raise ValueError(
+                f"data.patch_size ({patch_size}) 必须能被 data.scale ({scale}) 整除"
+            )
+        lr_patch = patch_size // scale
+        dc["train_lr_patch"] = lr_patch
+    _require_int(lr_patch, "data.train_lr_patch")
+    if patch_size != lr_patch * scale:
         raise ValueError(
-            f"data.patch_size ({patch_size}) 必须能被 data.scale ({scale}) 整除"
+            "data.train_hr_patch/patch_size 必须等于 "
+            "data.train_lr_patch x data.scale: "
+            f"{patch_size} vs {lr_patch} x {scale}"
         )
-    if patch_size % 32 != 0:
-        raise ValueError(
-            "data.patch_size 必须能被 32 整除（HR/4 网格再经过三次 x2 下采样和 8x8 窗口）"
-        )
+    for obsolete_key in ("internal_size", "internal_down_factor"):
+        if mc.get(obsolete_key) is not None:
+            raise ValueError(
+                f"model.{obsolete_key} 已不属于原生 LR 架构；请删除该字段并使用 run.lr_patch"
+            )
+    declared_factor = mc.get("ref_down_factor")
+    if declared_factor is not None:
+        _require_int(declared_factor, "model.ref_down_factor")
+        if declared_factor != scale:
+            raise ValueError(
+                f"model.ref_down_factor 必须等于 data.scale: {declared_factor} vs {scale}"
+            )
+    mc["ref_down_factor"] = scale
 
     model_scale = mc.get("scale", scale)
     _require_int(model_scale, "model.scale")
     if model_scale != scale:
         raise ValueError(f"model.scale ({model_scale}) 与 data.scale ({scale}) 不一致")
+    upsampler = str(mc.get("upsampler", "progressive")).lower()
+    if upsampler not in {"progressive", "direct"}:
+        raise ValueError("model.upsampler 只能是 progressive 或 direct")
+    mc["upsampler"] = upsampler
+    color_match = str(mc.get("color_match", "global")).lower()
+    if color_match not in {"global", "none"}:
+        raise ValueError("model.color_match 只能是 global 或 none")
+    mc["color_match"] = color_match
     _require_int(mc.get("inp_channels", 3), "model.inp_channels")
     _require_int(mc.get("out_channels", 3), "model.out_channels")
     ref_channels = mc.get("ref_channels", mc.get("inp_channels", 3))
@@ -388,6 +405,15 @@ def validate_config(cfg):
             f"data.{name}",
             minimum=minimum,
         )
+    val_patch_size = dc.get("val_patch_size")
+    if val_patch_size is not None:
+        _require_int(val_patch_size, "data.val_patch_size")
+        if val_patch_size % scale:
+            raise ValueError("data.val_patch_size 必须能被 data.scale 整除")
+    elif dc.get("val_batch_size", 1) != 1:
+        raise ValueError(
+            "全图验证要求 data.val_batch_size=1；不同图像尺寸不能安全拼成 batch"
+        )
     _require_int(dc.get("prefetch_factor", 4), "data.prefetch_factor")
     for name in ("max_samples_train", "max_samples_val", "max_samples_test"):
         value = dc.get(name)
@@ -432,7 +458,7 @@ def validate_config(cfg):
             tc["num_sanity_val_steps"], "train.num_sanity_val_steps", minimum=-1
         )
     _require_int(tc.get("log_every_n_steps", 20), "train.log_every_n_steps")
-    interval = tc.get("val_check_interval", 0.1)
+    interval = tc.get("val_check_interval", 1.0)
     if (
         isinstance(interval, bool)
         or not isinstance(interval, (int, float))
@@ -480,7 +506,6 @@ def build_dataloaders(cfg):
     data_root = _resolve_path(dc["root"])
     common = dict(
         data_dir=str(data_root),
-        patch_size=dc.get("patch_size", 480),
         scale=dc.get("scale", 4),
         ref_aug_strengths=dc.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
         ref_aug_probs=dc.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
@@ -497,11 +522,18 @@ def build_dataloaders(cfg):
     )
     train_ds = RefPNGDataset(
         mode="train",
+        patch_size=dc.get("train_hr_patch", dc.get("patch_size", 480)),
         augment=dc.get("augment", True),
         augment_ref=dc.get("augment_ref", True),
         **common,
     )
-    val_ds = RefPNGDataset(mode="val", augment=False, augment_ref=False, **common)
+    val_ds = RefPNGDataset(
+        mode="val",
+        patch_size=dc.get("val_patch_size"),
+        augment=False,
+        augment_ref=False,
+        **common,
+    )
     if len(train_ds) == 0:
         raise ValueError("训练数据集为空")
     if len(val_ds) == 0:
@@ -555,7 +587,8 @@ def build_model(cfg):
         dc.get("hr_key", "hr"),
         dc.get("ref_key", "ref"),
     )
-    hr_size = dc.get("patch_size", 480)
+    train_lr_patch = dc.get("train_lr_patch")
+    train_hr_patch = dc.get("train_hr_patch", dc.get("patch_size", 480))
     data_scale = dc.get("scale", 4)
     model = RefSRWKV(
         inp_channels=mc.get("inp_channels", 3),
@@ -565,7 +598,8 @@ def build_model(cfg):
         num_blocks=tuple(mc.get("num_blocks", [4, 6, 6, 8])),
         num_refinement_blocks=mc.get("num_refinement_blocks", 4),
         scale=data_scale,
-        hr_size=hr_size,
+        upsampler=mc.get("upsampler", "progressive"),
+        color_match=mc.get("color_match", "global"),
         drop_path_rate=mc.get("drop_path_rate", 0.1),
         hidden_rate=mc.get("hidden_rate", 4),
         windows=mc.get("windows"),
@@ -575,11 +609,12 @@ def build_model(cfg):
         window_phase_mode=mc.get("window_phase_mode"),
     )
     logger.info(
-        "RefSRWKV 参数量: %.2fM (HR=%d, Internal=%d, scale=%d)",
+        "RefSRWKV 参数量: %.2fM (train LR=%d, train HR=%d, ref-fold=x%d, output=%s)",
         sum(parameter.numel() for parameter in model.parameters()) / 1e6,
-        hr_size,
-        model.internal_size,
-        data_scale,
+        train_lr_patch,
+        train_hr_patch,
+        model.ref_down_factor,
+        model.upsampler,
     )
     lit_model = LitRefSRWKV(
         model_sr=model,
@@ -762,35 +797,34 @@ _RESUME_HPARAM_KEYS = (
 )
 
 
-def _checkpoint_train_config(ckpt_path):
-    """Read the config saved next to a checkpoint when available."""
-    config_path = Path(ckpt_path).parent / "train_config.yaml"
-    if not config_path.is_file():
-        return None
-    try:
-        with config_path.open("r", encoding="utf-8-sig") as file_obj:
-            config = yaml.safe_load(file_obj)
-        return config if isinstance(config, dict) else None
-    except (OSError, yaml.YAMLError):
-        return None
-
-
 def _experiment_signature(cfg):
     data_cfg, model_cfg = cfg["data"], cfg["model"]
     data_root = _resolve_path(data_cfg["root"])
+    scale = int(data_cfg.get("scale", 4))
+    train_lr_patch = int(data_cfg["train_lr_patch"])
+    train_hr_patch = int(data_cfg["train_hr_patch"])
     return {
+        "architecture": "native_lr_v1",
         "data_root": str(data_root),
-        "patch_size": int(data_cfg.get("patch_size", 480)),
-        "scale": int(data_cfg.get("scale", 4)),
+        "scale": scale,
         "reference_mode": str(data_cfg.get("reference_mode", "paired")),
-        "hr_size": int(data_cfg.get("patch_size", 480)),
+        "train_lr_patch": train_lr_patch,
+        "train_hr_patch": train_hr_patch,
+        "val_patch_size": data_cfg.get("val_patch_size"),
+        "inp_channels": int(model_cfg.get("inp_channels", 3)),
+        "out_channels": int(model_cfg.get("out_channels", 3)),
         "dim": int(model_cfg.get("dim", 48)),
         "hidden_rate": float(model_cfg.get("hidden_rate", 4)),
+        "drop_path_rate": float(model_cfg.get("drop_path_rate", 0.1)),
         "ref_channels": int(
             model_cfg.get("ref_channels", model_cfg.get("inp_channels", 3))
         ),
         "num_blocks": list(model_cfg.get("num_blocks", [4, 6, 6, 8])),
         "num_refinement_blocks": int(model_cfg.get("num_refinement_blocks", 4)),
+        "ref_down_factor": scale,
+        "upsampler": str(model_cfg.get("upsampler", "progressive")),
+        "color_match": str(model_cfg.get("color_match", "global")),
+        "normalization": "rmsnorm2d",
         "windows": copy.deepcopy(model_cfg.get("windows")),
     }
 
@@ -856,80 +890,40 @@ def check_resume_compatible(ckpt_path: str, lit_model):
         if isinstance(checkpoint, dict)
         else None
     )
-    if isinstance(current_signature, dict):
-        if isinstance(saved_signature, dict):
-            for key in (
-                "data_root",
-                "patch_size",
-                "scale",
-                "reference_mode",
-                "hr_size",
-                "dim",
-                "hidden_rate",
-                "ref_channels",
-                "num_blocks",
-                "num_refinement_blocks",
-                "windows",
-            ):
-                if (
-                    key in saved_signature
-                    and key in current_signature
-                    and not _resume_values_equal(
-                        saved_signature[key], current_signature[key]
-                    )
-                ):
-                    return False, (
-                        f"实验结构不兼容: {key}={saved_signature[key]!r} vs "
-                        f"当前={current_signature[key]!r}；请使用 --load_weights"
-                    )
-
-        # The first checkpoints predate the signature field, but their saved
-        # train_config.yaml still records dataset and patch semantics.
-        saved_config = _checkpoint_train_config(ckpt_path)
-        if isinstance(saved_config, dict):
-            saved_data = saved_config.get("data", {})
-            saved_model = saved_config.get("model", {})
-            if isinstance(saved_data, dict):
-                saved_root = saved_data.get("root")
-                if saved_root is not None:
-                    saved_root = str(_resolve_path(saved_root))
-                    if saved_root != current_signature["data_root"]:
-                        return False, (
-                            f"数据集不兼容: checkpoint={saved_root} vs "
-                            f"当前={current_signature['data_root']}；请使用 --load_weights"
-                        )
-                for key in ("patch_size", "scale", "reference_mode"):
-                    if key in saved_data and not _resume_values_equal(
-                        saved_data[key], current_signature[key]
-                    ):
-                        return False, (
-                            f"数据参数不兼容: {key}={saved_data[key]!r} vs "
-                            f"当前={current_signature[key]!r}；请使用 --load_weights"
-                        )
-            if isinstance(saved_model, dict):
-                for key in (
-                    "dim",
-                    "hidden_rate",
-                    "ref_channels",
-                    "num_blocks",
-                    "num_refinement_blocks",
-                    "scale",
-                    "windows",
-                ):
-                    if key == "windows" and key not in saved_model:
-                        # A pre-window checkpoint has the historical global
-                        # 8/[0,3,6] behavior.  Do not silently resume it under
-                        # a newly configured local/hierarchical schedule.
-                        saved_value = normalize_window_config()
-                    elif key not in saved_model:
-                        continue
-                    else:
-                        saved_value = saved_model[key]
-                    if not _resume_values_equal(saved_value, current_signature[key]):
-                        return False, (
-                            f"模型结构不兼容: {key}={saved_value!r} vs "
-                            f"当前={current_signature[key]!r}；请使用 --load_weights"
-                        )
+    if not isinstance(current_signature, dict):
+        return False, "当前运行缺少原生 LR 实验签名"
+    if not isinstance(saved_signature, dict):
+        return False, "checkpoint 没有原生 LR 实验签名；请使用 --load_weights 或从头训练"
+    if saved_signature.get("architecture") != "native_lr_v1":
+        return False, "checkpoint 不是原生 LR 架构；不能 --resume，请使用 --load_weights"
+    for key in (
+        "data_root",
+        "scale",
+        "reference_mode",
+        "train_lr_patch",
+        "train_hr_patch",
+        "val_patch_size",
+        "inp_channels",
+        "out_channels",
+        "dim",
+        "hidden_rate",
+        "drop_path_rate",
+        "ref_channels",
+        "num_blocks",
+        "num_refinement_blocks",
+        "ref_down_factor",
+        "upsampler",
+        "color_match",
+        "normalization",
+        "windows",
+    ):
+        if key not in saved_signature:
+            return False, f"checkpoint 签名缺少 {key}；请使用 --load_weights"
+        if not _resume_values_equal(saved_signature[key], current_signature[key]):
+            return False, (
+                f"实验结构不兼容: {key}={saved_signature[key]!r} vs "
+                f"当前={current_signature[key]!r}；请使用 --load_weights"
+            )
 
     reference = _normalise_state_dict(
         {
@@ -976,10 +970,11 @@ def load_weights_filtered(lit_model, ckpt_path: str):
     for key in reference:
         reference_by_normalized.setdefault(_strip_prefix(key), key)
 
-    matched, skipped = {}, []
+    matched, skipped, absent = {}, [], []
     for normalized_key, value in state_dict.items():
         target_key = reference_by_normalized.get(normalized_key)
         if target_key is None:
+            absent.append(normalized_key)
             continue
         if tuple(value.shape) == tuple(reference[target_key].shape):
             matched[target_key] = value
@@ -987,16 +982,19 @@ def load_weights_filtered(lit_model, ckpt_path: str):
             skipped.append(normalized_key)
     missing, _unexpected = lit_model.load_state_dict(matched, strict=False)
     logger.info(
-        "热启动 %s (%s): 匹配 %d/%d | 形状不匹配跳过 %d | 缺失 %d",
+        "热启动 %s (%s): 目标匹配 %d/%d | 源权重未使用 %d | 形状不匹配 %d | 目标缺失 %d",
         ckpt_path,
         source,
         len(matched),
         len(reference),
+        len(absent),
         len(skipped),
         len(missing),
     )
     if skipped:
         logger.warning("  形状不匹配（保持随机初始化）示例: %s", skipped[:5])
+    if absent:
+        logger.info("  当前模型未使用的源权重示例: %s", absent[:5])
     if not matched:
         raise RuntimeError(f"热启动失败：checkpoint 没有匹配到任何参数 ({ckpt_path})")
 
@@ -1086,7 +1084,7 @@ def main():
         precision=tc.get("precision", "bf16-mixed"),
         max_epochs=tc.get("max_epochs", 200),
         log_every_n_steps=tc.get("log_every_n_steps", 20),
-        val_check_interval=tc.get("val_check_interval", 0.1),
+        val_check_interval=tc.get("val_check_interval", 1.0),
         gradient_clip_val=tc.get("grad_clip_val", mc.get("grad_clip_norm", 1.0)),
         gradient_clip_algorithm=str(tc.get("gradient_clip_algorithm", "norm")).lower(),
         callbacks=callbacks,
@@ -1133,12 +1131,19 @@ def main():
                 )
 
     logger.info("=" * 60)
-    logger.info("  RefSRWKV SR Prior 训练 (Dynamic Spatial Resolution)")
+    logger.info("  RefSRWKV SR Prior 训练 (Native LR Grid)")
     logger.info(
-        "  数据: %s (patch_size=%d, scale=%d)",
+        "  数据: %s (train LR=%d, train HR=%d, scale=x%d)",
         cfg["data"]["root"],
-        cfg["data"].get("patch_size", 480),
+        cfg["data"].get("train_lr_patch"),
+        cfg["data"].get("train_hr_patch", cfg["data"].get("patch_size", 480)),
         cfg["data"].get("scale", 4),
+    )
+    logger.info(
+        "  验证: %s | Ref fold / output reconstruction: x%d | output head=%s",
+        "full image" if cfg["data"].get("val_patch_size") is None else f"HR {cfg['data']['val_patch_size']}",
+        lit_model.model_sr.ref_down_factor,
+        lit_model.model_sr.upsampler,
     )
     window_cfg = lit_model.model_sr.window_config
     window_text = ", ".join(
