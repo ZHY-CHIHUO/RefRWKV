@@ -32,11 +32,15 @@ _WINDOW_STAGE_NAMES = (
     "dec1",
     "refine",
 )
-_WINDOW_LEVEL_ALIASES = {
-    "level1": ("enc1", "dec1", "refine"),
-    "level2": ("enc2", "dec2"),
-    "level3": ("enc3", "dec3"),
-    "latent": ("latent",),
+_DEFAULT_WINDOW_SPECS = {
+    "enc1": {"size": 8, "offsets": (0, 4)},
+    "enc2": {"size": 8, "offsets": (0, 4)},
+    "enc3": {"size": 4, "offsets": (0, 2)},
+    "latent": {"size": 3, "offsets": (0, 1)},
+    "dec3": {"size": 4, "offsets": (0, 2)},
+    "dec2": {"size": 8, "offsets": (0, 4)},
+    "dec1": {"size": 8, "offsets": (0, 4)},
+    "refine": {"size": 8, "offsets": (0, 4)},
 }
 
 
@@ -61,12 +65,6 @@ def _window_positive_int(value, name):
     return int(value)
 
 
-def _window_nonnegative_int(value, name):
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} 必须是非负整数，得到 {value!r}")
-    return int(value)
-
-
 def _window_offsets(value, size, name):
     if isinstance(value, int) and not isinstance(value, bool):
         value = [value]
@@ -84,180 +82,66 @@ def _window_offsets(value, size, name):
     return tuple(offsets)
 
 
-def _parse_window_spec(
-    raw, stage_name, *, fallback=None, default_size=8, default_shift=4, default_cycle=2
-):
-    """Parse one stage's compact window specification into canonical values."""
-    if raw is None:
-        raw = {}
-    elif isinstance(raw, int) and not isinstance(raw, bool):
-        raw = {"size": raw}
+def _parse_window_spec(raw, stage_name):
+    """Validate one explicit stage window specification."""
     if not isinstance(raw, dict):
-        raise ValueError(f"windows.{stage_name} 必须是 mapping、整数或为空")
-    fallback = fallback or {}
-
-    size_given = "size" in raw or "window_size" in raw
-    size = raw.get("size", raw.get("window_size", fallback.get("size", default_size)))
-    size = _window_positive_int(size, f"windows.{stage_name}.size")
-
-    offsets = raw.get("offsets", raw.get("shift_offsets"))
-    if offsets is not None:
-        offsets = _window_offsets(offsets, size, f"windows.{stage_name}.offsets")
-    else:
-        raw_shift = raw.get("shift_size", raw.get("shift"))
-        raw_cycle = raw.get("shift_cycle", raw.get("cycle"))
-        if raw_shift is None and raw_cycle is None and not size_given and fallback:
-            # An omitted stage inherits the complete canonical default.
-            offsets = tuple(fallback["offsets"])
-        else:
-            if raw_shift is None:
-                if fallback and not size_given and "shift_size" in fallback:
-                    raw_shift = fallback["shift_size"]
-                else:
-                    raw_shift = size // 2 if size_given else default_shift
-            if raw_cycle is None:
-                if fallback and not size_given and "shift_cycle" in fallback:
-                    raw_cycle = fallback["shift_cycle"]
-                else:
-                    raw_cycle = default_cycle
-            raw_shift = _window_nonnegative_int(
-                raw_shift, f"windows.{stage_name}.shift_size"
-            )
-            if (
-                isinstance(raw_cycle, bool)
-                or not isinstance(raw_cycle, int)
-                or raw_cycle < 1
-            ):
-                raise ValueError(f"windows.{stage_name}.shift_cycle 必须是正整数")
-            offsets = _window_offsets(
-                [index * raw_shift for index in range(raw_cycle)],
-                size,
-                f"windows.{stage_name}.offsets",
-            )
-
-    # Retain the generation fields only while resolving inherited stages.  The
-    # public canonical representation contains size and offsets only.
+        raise ValueError(f"windows.{stage_name} 必须是包含 size 和 offsets 的 mapping")
+    unknown = set(raw).difference({"size", "offsets"})
+    if unknown:
+        raise ValueError(
+            f"windows.{stage_name} 包含未知字段: {', '.join(sorted(unknown))}"
+        )
+    missing = {"size", "offsets"}.difference(raw)
+    if missing:
+        raise ValueError(
+            f"windows.{stage_name} 缺少字段: {', '.join(sorted(missing))}"
+        )
+    size = _window_positive_int(raw["size"], f"windows.{stage_name}.size")
     return {
         "size": size,
-        "offsets": tuple(offsets),
-        "shift_size": raw.get(
-            "shift_size", raw.get("shift", fallback.get("shift_size"))
-        ),
-        "shift_cycle": raw.get(
-            "shift_cycle", raw.get("cycle", fallback.get("shift_cycle"))
+        "offsets": _window_offsets(
+            raw["offsets"], size, f"windows.{stage_name}.offsets"
         ),
     }
 
 
-def normalize_window_config(
-    windows=None, *, window_size=8, shift_size=3, shift_cycle=3, phase_mode=None
-):
-    """Return canonical per-stage windows and phase indexing mode.
-
-    With no ``windows`` mapping this intentionally preserves the original
-    global phase sequence (for example 8/3/3 -> offsets [0, 3, 6]).  An
-    explicit mapping defaults to stage-local two-phase offsets, which is the
-    hierarchical mode used by the current training configs.
-    """
+def normalize_window_config(windows=None):
+    """Return the canonical explicit per-stage window configuration."""
     if windows is None:
-        size = _window_positive_int(window_size, "window_size")
-        shift = _window_nonnegative_int(shift_size, "shift_size")
-        if shift >= size:
-            raise ValueError("shift_size 必须小于 window_size")
-        if (
-            isinstance(shift_cycle, bool)
-            or not isinstance(shift_cycle, int)
-            or shift_cycle < 1
-        ):
-            raise ValueError("shift_cycle 必须是正整数")
-        offsets = _window_offsets(
-            [index * shift for index in range(shift_cycle)], size, "shift_offsets"
-        )
-        mode = "global" if phase_mode is None else str(phase_mode).lower()
-        stages = {
-            name: {"size": size, "offsets": offsets} for name in _WINDOW_STAGE_NAMES
-        }
+        windows = {"phase_mode": "local", "stages": _DEFAULT_WINDOW_SPECS}
+    if not isinstance(windows, dict):
+        raise ValueError("windows 必须是分层 mapping")
+
+    if "stages" in windows:
+        unknown = set(windows).difference({"phase_mode", "stages"})
+        if unknown:
+            raise ValueError(f"windows 包含未知字段: {', '.join(sorted(unknown))}")
+        stage_map = windows["stages"]
     else:
-        mode = phase_mode
-        if isinstance(windows, (list, tuple)):
-            if len(windows) != 4:
-                raise ValueError(
-                    "windows 列表必须按 level1、level2、level3、latent 提供四项"
-                )
-            windows = {
-                "level1": windows[0],
-                "level2": windows[1],
-                "level3": windows[2],
-                "latent": windows[3],
-            }
-        if not isinstance(windows, dict):
-            raise ValueError("windows 必须是 mapping 或四项列表")
-        if isinstance(windows.get("stages"), dict):
-            stage_map = dict(windows["stages"])
-            if mode is None:
-                mode = windows.get("phase_mode")
-        else:
-            stage_map = dict(windows)
-        if mode is None:
-            mode = windows.get("phase_mode") if isinstance(windows, dict) else None
-        mode = "local" if mode is None else str(mode).lower()
+        stage_map = {key: value for key, value in windows.items() if key != "phase_mode"}
+    if not isinstance(stage_map, dict):
+        raise ValueError("windows.stages 必须是 mapping")
 
-        flat_keys = {
-            "size",
-            "window_size",
-            "offsets",
-            "shift_offsets",
-            "shift_size",
-            "shift",
-            "shift_cycle",
-            "cycle",
-        }
-        default_raw = stage_map.get("default")
-        if default_raw is None and flat_keys.intersection(stage_map):
-            default_raw = {key: stage_map[key] for key in flat_keys if key in stage_map}
-        default = (
-            _parse_window_spec(
-                default_raw,
-                "default",
-                fallback=None,
-                default_size=window_size,
-                default_shift=window_size // 2,
-                default_cycle=2,
-            )
-            if default_raw is not None
-            else None
-        )
+    missing = set(_WINDOW_STAGE_NAMES).difference(stage_map)
+    unknown = set(stage_map).difference(_WINDOW_STAGE_NAMES)
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append(f"缺少: {', '.join(sorted(missing))}")
+        if unknown:
+            details.append(f"未知: {', '.join(sorted(unknown))}")
+        raise ValueError("windows 阶段配置无效（" + "；".join(details) + "）")
 
-        stages = {}
-        for stage_name in _WINDOW_STAGE_NAMES:
-            raw = stage_map.get(stage_name)
-            if raw is None:
-                for alias, stage_names in _WINDOW_LEVEL_ALIASES.items():
-                    if stage_name in stage_names and alias in stage_map:
-                        raw = stage_map[alias]
-                        break
-            if raw is None:
-                raw = default
-            parsed = _parse_window_spec(
-                raw,
-                stage_name,
-                fallback=default,
-                default_size=window_size,
-                default_shift=window_size // 2,
-                default_cycle=2,
-            )
-            stages[stage_name] = {
-                "size": parsed["size"],
-                "offsets": parsed["offsets"],
-            }
-
-    if mode in {"stage", "stage_local", "local"}:
-        mode = "local"
-    elif mode in {"global", "legacy"}:
-        mode = "global"
-    else:
-        raise ValueError("window phase_mode 只能是 local 或 global")
-    return {"phase_mode": mode, "stages": stages}
+    mode = str(windows.get("phase_mode", "local")).lower()
+    if mode not in {"local", "global"}:
+        raise ValueError("windows.phase_mode 只能是 local 或 global")
+    return {
+        "phase_mode": mode,
+        "stages": {
+            stage_name: _parse_window_spec(stage_map[stage_name], stage_name)
+            for stage_name in _WINDOW_STAGE_NAMES
+        },
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -431,46 +315,28 @@ class VRWKV_SpatialMix(nn.Module):
     def __init__(
         self,
         n_embd,
-        head_dim=64,
         window_size=8,
-        shift_size=3,
         num_groups=None,
         shift_offsets=None,
-        shift_cycle=3,
     ):
         super().__init__()
         if num_groups is None:
             num_groups = max(1, n_embd // 16)
         if not isinstance(num_groups, int) or num_groups < 1:
             raise ValueError("num_groups 必须为正整数")
-        if not isinstance(window_size, int) or not isinstance(shift_size, int):
-            raise ValueError("window_size 和 shift_size 必须为整数")
+        if not isinstance(window_size, int):
+            raise ValueError("window_size 必须为整数")
         if n_embd < 16 or n_embd % num_groups != 0 or n_embd % 16 != 0:
             raise ValueError("n_embd 必须被 num_groups 整除，且至少为 16 和 16 的倍数")
-        if window_size < 1 or shift_size < 0:
-            raise ValueError("window_size 必须为正数，且 shift_size 必须非负")
-        if shift_offsets is None and shift_size >= window_size:
-            raise ValueError(
-                "未显式指定 shift_offsets 时必须满足 shift_size < window_size"
-            )
+        if window_size < 1:
+            raise ValueError("window_size 必须为正数")
         if shift_offsets is None:
-            if (
-                isinstance(shift_cycle, bool)
-                or not isinstance(shift_cycle, int)
-                or shift_cycle < 1
-            ):
-                raise ValueError("shift_cycle 必须是正整数")
-            offsets = [index * shift_size for index in range(shift_cycle)]
-        else:
-            offsets = shift_offsets
-        offsets = _window_offsets(offsets, window_size, "shift_offsets")
-        self.n_embd, self.window_size, self.shift_size = n_embd, window_size, shift_size
+            raise ValueError("shift_offsets 必须由所属阶段的窗口配置提供")
+        offsets = _window_offsets(shift_offsets, window_size, "shift_offsets")
+        group_dim = n_embd // num_groups
+        self.n_embd, self.window_size = n_embd, window_size
         self.shift_offsets = offsets
-        self.num_groups, self.group_dim, self.recurrence = (
-            num_groups,
-            n_embd // num_groups,
-            2,
-        )
+        self.recurrence = 2
         self.omni_shift = OmniShift(dim=n_embd)
         self.key, self.value, self.receptance, self.output = [
             nn.Linear(n_embd, n_embd, bias=False) for _ in range(4)
@@ -481,7 +347,7 @@ class VRWKV_SpatialMix(nn.Module):
             # The CUDA kernel expects a positive distance-decay coefficient.
             for g in range(num_groups):
                 target_decay = 0.5 * (g + 1)
-                decay_init[:, g * self.group_dim : (g + 1) * self.group_dim] = math.log(
+                decay_init[:, g * group_dim : (g + 1) * group_dim] = math.log(
                     math.expm1(target_decay)
                 )
             self.spatial_decay, self.spatial_first = nn.Parameter(
@@ -600,8 +466,7 @@ class Block(nn.Module):
         ):
             raise ValueError("layer_idx 必须是非负整数")
         if shift_offsets is None:
-            # Preserve the historical direct-Block default, while making a
-            # custom window usable without having to spell out its phases.
+            # Standalone users of Block receive a valid explicit phase list.
             shift_offsets = (0, 3, 6) if window_size == 8 else (0, window_size // 2)
         self.layer_idx, self.ln1, self.ln2 = (
             layer_idx,
@@ -731,10 +596,6 @@ class RefSRWKV(nn.Module):
         hidden_rate: int = 4,
         ref_channels: int = None,
         windows=None,
-        window_size: int = 8,
-        shift_size: int = 3,
-        shift_cycle: int = 3,
-        window_phase_mode: str = None,
     ):
         super().__init__()
         if not isinstance(num_blocks, (tuple, list)) or len(num_blocks) != 4:
@@ -782,22 +643,13 @@ class RefSRWKV(nn.Module):
         if ref_channels != inp_channels:
             raise ValueError("当前颜色对齐路径要求 ref_channels == inp_channels")
 
-        # The U-Net lives on the incoming LR grid.  ``scale`` is therefore the
-        # only fold/reconstruction ratio: Ref is folded with PixelUnshuffle(x
-        # scale), and the residual is reconstructed by the chosen output head.
-        self.ref_down_factor = scale
-        self.reconstruction_factor = scale
-        self.reconstruction_factors = _pixel_shuffle_factors(scale)
-        self.scale, self.dim, self.out_channels = scale, dim, out_channels
+        # The U-Net lives on the incoming LR grid. ``scale`` controls both Ref
+        # folding and residual reconstruction.
+        shuffle_factors = _pixel_shuffle_factors(scale)
+        self.scale = scale
         self.inp_channels, self.ref_channels = inp_channels, ref_channels
         self.upsampler, self.color_match = upsampler, color_match
-        self.window_config = normalize_window_config(
-            windows,
-            window_size=window_size,
-            shift_size=shift_size,
-            shift_cycle=shift_cycle,
-            phase_mode=window_phase_mode,
-        )
+        self.window_config = normalize_window_config(windows)
         if inp_channels == out_channels:
             self.skip_proj = nn.Identity()
         else:
@@ -929,7 +781,7 @@ class RefSRWKV(nn.Module):
         # high factors such as x10.
         if self.upsampler == "progressive":
             up_layers = []
-            for shuffle_factor in self.reconstruction_factors:
+            for shuffle_factor in shuffle_factors:
                 up_layers.extend(
                     [
                         nn.Conv2d(

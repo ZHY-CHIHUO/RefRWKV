@@ -6,7 +6,6 @@ run:
   name: aid_x4_l1
   scale: 4
   lr_patch: 48
-  recipe: l1
 
 model:
   ssim_weight: 0.0

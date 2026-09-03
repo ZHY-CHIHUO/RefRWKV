@@ -183,7 +183,6 @@ def _materialize_run_config(config):
     data_cfg["val_patch_size"] = run_cfg.get(
         "val_hr_patch", data_cfg.get("val_patch_size")
     )
-    model_cfg["scale"] = scale
 
     run_name = run_cfg.get("name")
     if run_name is None:
@@ -281,24 +280,6 @@ def validate_config(cfg):
             "data.train_lr_patch x data.scale: "
             f"{patch_size} vs {lr_patch} x {scale}"
         )
-    for obsolete_key in ("internal_size", "internal_down_factor"):
-        if mc.get(obsolete_key) is not None:
-            raise ValueError(
-                f"model.{obsolete_key} 已不属于原生 LR 架构；请删除该字段并使用 run.lr_patch"
-            )
-    declared_factor = mc.get("ref_down_factor")
-    if declared_factor is not None:
-        _require_int(declared_factor, "model.ref_down_factor")
-        if declared_factor != scale:
-            raise ValueError(
-                f"model.ref_down_factor 必须等于 data.scale: {declared_factor} vs {scale}"
-            )
-    mc["ref_down_factor"] = scale
-
-    model_scale = mc.get("scale", scale)
-    _require_int(model_scale, "model.scale")
-    if model_scale != scale:
-        raise ValueError(f"model.scale ({model_scale}) 与 data.scale ({scale}) 不一致")
     upsampler = str(mc.get("upsampler", "progressive")).lower()
     if upsampler not in {"progressive", "direct"}:
         raise ValueError("model.upsampler 只能是 progressive 或 direct")
@@ -387,13 +368,7 @@ def validate_config(cfg):
         raise ValueError("data.reference_mode 只能是 paired 或 lr_up")
     # Normalize and validate the stage window schema before constructing the
     # model.  Store the canonical form so train_config.yaml is self-contained.
-    mc["windows"] = normalize_window_config(
-        mc.get("windows"),
-        window_size=mc.get("window_size", 8),
-        shift_size=mc.get("shift_size", 3),
-        shift_cycle=mc.get("shift_cycle", 3),
-        phase_mode=mc.get("window_phase_mode"),
-    )
+    mc["windows"] = normalize_window_config(mc.get("windows"))
 
     root = dc.get("root")
     if not isinstance(root, (str, Path)) or not str(root):
@@ -599,17 +574,13 @@ def build_model(cfg):
         drop_path_rate=mc.get("drop_path_rate", 0.1),
         hidden_rate=mc.get("hidden_rate", 4),
         windows=mc.get("windows"),
-        window_size=mc.get("window_size", 8),
-        shift_size=mc.get("shift_size", 3),
-        shift_cycle=mc.get("shift_cycle", 3),
-        window_phase_mode=mc.get("window_phase_mode"),
     )
     logger.info(
-        "RefSRWKV 参数量: %.2fM (train LR=%d, train HR=%d, ref-fold=x%d, output=%s)",
+        "RefSRWKV 参数量: %.2fM (train LR=%d, train HR=%d, scale=x%d, output=%s)",
         sum(parameter.numel() for parameter in model.parameters()) / 1e6,
         train_lr_patch,
         train_hr_patch,
-        model.ref_down_factor,
+        data_scale,
         model.upsampler,
     )
     lit_model = LitRefSRWKV(
@@ -817,7 +788,6 @@ def _experiment_signature(cfg):
         ),
         "num_blocks": list(model_cfg.get("num_blocks", [4, 6, 6, 8])),
         "num_refinement_blocks": int(model_cfg.get("num_refinement_blocks", 4)),
-        "ref_down_factor": scale,
         "upsampler": str(model_cfg.get("upsampler", "progressive")),
         "color_match": str(model_cfg.get("color_match", "global")),
         "normalization": "rmsnorm2d",
@@ -907,7 +877,6 @@ def check_resume_compatible(ckpt_path: str, lit_model):
         "ref_channels",
         "num_blocks",
         "num_refinement_blocks",
-        "ref_down_factor",
         "upsampler",
         "color_match",
         "normalization",
@@ -1136,9 +1105,9 @@ def main():
         cfg["data"].get("scale", 4),
     )
     logger.info(
-        "  验证: %s | Ref fold / output reconstruction: x%d | output head=%s",
+        "  验证: %s | scale=x%d | output head=%s",
         "full image" if cfg["data"].get("val_patch_size") is None else f"HR {cfg['data']['val_patch_size']}",
-        lit_model.model_sr.ref_down_factor,
+        cfg["data"].get("scale", 4),
         lit_model.model_sr.upsampler,
     )
     window_cfg = lit_model.model_sr.window_config

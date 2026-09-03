@@ -118,10 +118,6 @@ def build_sr_model(cfg: dict, resume_ckpt_path: Optional[str] = None):
         drop_path_rate=sr_cfg.get("drop_path_rate", 0.1),
         hidden_rate=sr_cfg.get("hidden_rate", 4),
         windows=sr_cfg.get("windows"),
-        window_size=sr_cfg.get("window_size", 8),
-        shift_size=sr_cfg.get("shift_size", 3),
-        shift_cycle=sr_cfg.get("shift_cycle", 3),
-        window_phase_mode=sr_cfg.get("window_phase_mode"),
     )
 
     def _load_into(model, path, desc):

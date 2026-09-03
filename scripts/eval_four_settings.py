@@ -264,24 +264,13 @@ def main():
         help="要评测的设置；默认 bicubic、sisr_ref、dataset_ref、perfect_ref 全部执行",
     )
     ap.add_argument(
-        "--scale",
-        type=int,
-        default=None,
-        help="SR scale; omit to read the checkpoint signature",
-    )
-    ap.add_argument(
         "--patch",
         type=int,
         default=None,
         help="评测时的 HR 裁剪边长；默认 None 表示全图",
     )
     ap.add_argument("--raw", action="store_true", help="用原始权重而非 EMA")
-    ap.add_argument("--window-size", type=int, default=None)
-    ap.add_argument("--shift-size", type=int, default=None)
-    ap.add_argument("--shift-cycle", type=int, default=None)
-    ap.add_argument("--upsampler", choices=("progressive", "direct"), default=None)
     ap.add_argument("--color-match", choices=("global", "none"), default=None)
-    ap.add_argument("--window-phase-mode", choices=("local", "global"), default=None)
     args = ap.parse_args()
 
     if args.splits is None:
@@ -301,16 +290,7 @@ def main():
             )
 
     ckpt_options = checkpoint_model_options(args.ckpt)
-    if args.scale is None:
-        args.scale = ckpt_options.get("scale", 4)
-    windows = ckpt_options.get("windows")
-    if (
-        args.window_size is not None
-        or args.shift_size is not None
-        or args.shift_cycle is not None
-        or args.window_phase_mode is not None
-    ):
-        windows = None
+    args.scale = int(ckpt_options["scale"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = RefSRWKV(
         inp_channels=ckpt_options.get("inp_channels", 3),
@@ -320,11 +300,7 @@ def main():
         num_blocks=tuple(ckpt_options.get("num_blocks", [4, 6, 6, 8])),
         num_refinement_blocks=ckpt_options.get("num_refinement_blocks", 4),
         scale=args.scale,
-        upsampler=(
-            args.upsampler
-            if args.upsampler is not None
-            else ckpt_options.get("upsampler", "progressive")
-        ),
+        upsampler=ckpt_options.get("upsampler", "progressive"),
         color_match=(
             args.color_match
             if args.color_match is not None
@@ -332,16 +308,12 @@ def main():
         ),
         drop_path_rate=0.1,
         hidden_rate=ckpt_options.get("hidden_rate", 4),
-        windows=windows,
-        window_size=args.window_size if args.window_size is not None else 8,
-        shift_size=args.shift_size if args.shift_size is not None else 3,
-        shift_cycle=args.shift_cycle if args.shift_cycle is not None else 3,
-        window_phase_mode=args.window_phase_mode,
+        windows=ckpt_options.get("windows"),
     )
     print(
         "[model] "
         f"native LR grid | scale=x{args.scale} | "
-        f"ref/output=x{model.ref_down_factor} | head={model.upsampler} | "
+        f"head={model.upsampler} | "
         f"color_match={model.color_match}",
         flush=True,
     )
