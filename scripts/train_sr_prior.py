@@ -410,10 +410,6 @@ def validate_config(cfg):
         _require_int(val_patch_size, "data.val_patch_size")
         if val_patch_size % scale:
             raise ValueError("data.val_patch_size 必须能被 data.scale 整除")
-    elif dc.get("val_batch_size", 1) != 1:
-        raise ValueError(
-            "全图验证要求 data.val_batch_size=1；不同图像尺寸不能安全拼成 batch"
-        )
     _require_int(dc.get("prefetch_factor", 4), "data.prefetch_factor")
     for name in ("max_samples_train", "max_samples_val", "max_samples_test"):
         value = dc.get(name)

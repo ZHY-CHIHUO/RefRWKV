@@ -104,7 +104,7 @@ conda run -n rwkv7 python scripts/train_sr_prior.py \
   --config configs/runs/aid_x4_l1.yaml
 ```
 
-checkpoint 写入 `checkpoints/refrwkv_sr_aid_x4_l1/`，TensorBoard 写入 `logs/refrwkv_sr/aid_x4_l1/`。该 run 使用纯 L1、物理 batch 8、梯度累积 4（有效 batch 32）和 50,000 个 optimizer step。全图验证使用固定 200 张图片、batch 1。
+checkpoint 写入 `checkpoints/refrwkv_sr_aid_x4_l1/`，TensorBoard 写入 `logs/refrwkv_sr/aid_x4_l1/`。该 run 使用纯 L1 和 50,000 个 optimizer step。全图验证使用固定数量的图片；预处理后尺寸一致的数据集可提高验证 batch，混合尺寸数据集保持 batch 1。
 
 `ReduceLROnPlateau`、checkpoint 选择和可选 early stopping 都使用聚合后的全图 `val_loss`。`lr_patience` 的单位是验证次数，`lr_threshold` 是最小绝对有效改善量。AID 默认每个 epoch 验证一次。
 
