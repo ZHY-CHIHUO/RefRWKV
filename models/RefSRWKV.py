@@ -1493,10 +1493,15 @@ class LitRefSRWKV(pl.LightningModule):
             return [optimizer], [
                 {
                     "scheduler": scheduler,
-                    "monitor": "val_loss",
+                    # ``on_validation_epoch_end`` owns the only real
+                    # scheduler.step(val_loss) call.  Do not register this
+                    # as Lightning's automatic plateau scheduler: when
+                    # validation is intentionally skipped for an epoch,
+                    # Lightning would otherwise require a nonexistent
+                    # ``val_loss`` at that epoch boundary.
+                    "reduce_on_plateau": False,
                     "interval": "epoch",
                     "frequency": 1,
-                    "strict": True,
                 }
             ]
 
