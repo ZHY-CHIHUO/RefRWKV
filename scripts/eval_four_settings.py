@@ -19,6 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.RefSRWKV import RefSRWKV
 from RefSR_data.RefDataset import RefPNGDataset
+from SR_data.SRDataset import SRPNGDataset
 
 PREFIXES = ("model_sr.", "model.", "generator.sr_model.", "sr_model.", "module.")
 # EMA shadow 不含 buffer，这些键缺失属正常
@@ -168,14 +169,17 @@ def checkpoint_model_options(ckpt_path):
 
 @torch.no_grad()
 def run_split(model, split, args, device):
-    ds = RefPNGDataset(
+    dataset_class = RefPNGDataset if "dataset_ref" in args.settings else SRPNGDataset
+    dataset_kwargs = dict(
         data_dir=args.data,
         mode=split,
         scale=args.scale,
         patch_size=args.patch,
         augment=False,
-        augment_ref=False,
     )
+    if dataset_class is RefPNGDataset:
+        dataset_kwargs["augment_ref"] = False
+    ds = dataset_class(**dataset_kwargs)
     n = min(args.n, len(ds))
     loader = DataLoader(
         ds,

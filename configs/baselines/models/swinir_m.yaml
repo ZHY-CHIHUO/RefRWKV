@@ -1,0 +1,19 @@
+# SwinIR-M classical x4 architecture used for from-scratch SISR comparison.
+model:
+  name: swinir
+  variant: swinir_m
+  img_size: 48
+  window_size: 8
+  embed_dim: 180
+  depths: [6, 6, 6, 6, 6, 6]
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2.0
+  qkv_bias: true
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.0
+  ape: false
+  patch_norm: true
+  use_checkpoint: false
+  upsampler: pixelshuffle
+  resi_connection: 1conv

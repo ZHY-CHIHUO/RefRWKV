@@ -9,7 +9,7 @@ from PIL import Image, ImageEnhance
 
 class RefPNGDataset(Dataset):
     """
-    PNG 参考超分配对数据集（仅文件夹模式）。
+    PNG 参考超分配对数据集（仅文件夹模式，严格要求 Ref）。
 
     目录结构:
         data_dir/
@@ -42,6 +42,17 @@ class RefPNGDataset(Dataset):
             ref_aug_strengths = [0.12, 0.12, 0.12, 0.03]
         if ref_aug_probs is None:
             ref_aug_probs = [0.5, 0.5, 0.5, 0.5]
+
+        if isinstance(scale, bool) or not isinstance(scale, int) or scale < 1:
+            raise ValueError(f"scale 必须是正整数，得到 {scale!r}")
+        if patch_size is not None and (
+            isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size < 1
+        ):
+            raise ValueError(f"patch_size 必须是正整数或 None，得到 {patch_size!r}")
+        if patch_size is not None and patch_size % scale:
+            raise ValueError(
+                f"patch_size ({patch_size}) 必须能被 scale ({scale}) 整除"
+            )
 
         self.data_dir = Path(data_dir)
         self.mode = mode
@@ -178,6 +189,18 @@ class RefPNGDataset(Dataset):
 
         return lr_crop, hr_crop, ref_crop
 
+    def _validate_geometry(self, lr, hr, ref, name):
+        expected_hr = (lr.shape[0] * self.scale, lr.shape[1] * self.scale)
+        if hr.shape[:2] != expected_hr:
+            raise ValueError(
+                f"LR/HR 尺寸不匹配: {name}: LR={lr.shape[:2]}, "
+                f"HR={hr.shape[:2]}, scale=x{self.scale}"
+            )
+        if ref.shape[:2] != hr.shape[:2]:
+            raise ValueError(
+                f"Ref/HR 尺寸不匹配: {name}: Ref={ref.shape[:2]}, HR={hr.shape[:2]}"
+            )
+
     def _augment(self, lr, hr, ref):
         """输入为 (C, H, W) 格式的 numpy 数组。"""
         if random.random() > 0.5:
@@ -203,10 +226,12 @@ class RefPNGDataset(Dataset):
 
         lr = self._load_image(self.lr_dir / f"{name}.png")
         hr = self._load_image(self.hr_dir / f"{name}.png")
-        ref_pil = Image.open(self.ref_dir / f"{name}.png").convert("RGB")
+        ref_path = self.ref_dir / f"{name}.png"
+        ref_pil = Image.open(ref_path).convert("RGB")
         if self.augment_ref:
             ref_pil = self._augment_ref(ref_pil)
         ref = (np.array(ref_pil, dtype=np.float32) / 127.5) - 1.0
+        self._validate_geometry(lr, hr, ref, name)
 
         if self.patch_size is not None:
             # Validation/test crops must be repeatable: val_loss then measures

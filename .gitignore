@@ -7,15 +7,30 @@ dist/
 build/
 
 # ===== 数据集 =====
-RefSR_data/ALL_2/
+# Keep dataset documentation and loader code in Git.  Image data, archives,
+# manifests, and generated metadata remain local only.
+/SR_data/**
+!/SR_data/**/
+!/SR_data/__init__.py
+!/SR_data/SRDataset.py
+!/SR_data/**/*.md
+
+/RefSR_data/ALL_2/**
+!/RefSR_data/ALL_2/**/
+!/RefSR_data/ALL_2/**/*.md
 RefSR_data/ALL_2_zip/
 RefSR_data/CUFED/
 RefSR_data/CUFED5/
-RefSR_data/HRMS_SCD/
-data/
+/RefSR_data/HRMS_SCD/**
+!/RefSR_data/HRMS_SCD/**/
+!/RefSR_data/HRMS_SCD/**/*.md
 
 # ===== 模型权重 (太大,不上传) =====
 checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
 
 # ===== 训练日志 =====
 logs/
@@ -26,6 +41,8 @@ scripts/*
 !scripts/train_sd2_gan.py
 !scripts/train_sr_prior.py
 !scripts/prepare_remote_sensing.py
+!scripts/train_baseline.py
+!scripts/eval_baseline.py
 
 # ===== 结果文件 (按需保留，如果不需要可取消注释) =====
 results/

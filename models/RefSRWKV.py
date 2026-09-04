@@ -1122,17 +1122,18 @@ class LitRefSRWKV(pl.LightningModule):
 
     def _unpack_batch(self, batch):
         if isinstance(batch, dict):
-            missing = [
-                key
-                for key in (self.lr_key, self.hr_key, self.ref_key)
-                if key not in batch
-            ]
+            required = (self.lr_key, self.hr_key)
+            if self.reference_mode == "paired":
+                required = (*required, self.ref_key)
+            missing = [key for key in required if key not in batch]
             if missing:
                 raise KeyError(f"batch 缺少字段: {missing}")
-            return batch[self.lr_key], batch[self.hr_key], batch[self.ref_key]
-        if not isinstance(batch, (tuple, list)) or len(batch) < 3:
-            raise ValueError("batch 必须是包含 lr/hr/ref 的字典或序列")
-        return batch[0], batch[1], batch[2]
+            return batch[self.lr_key], batch[self.hr_key], batch.get(self.ref_key)
+        minimum_items = 3 if self.reference_mode == "paired" else 2
+        if not isinstance(batch, (tuple, list)) or len(batch) < minimum_items:
+            required_text = "lr/hr/ref" if minimum_items == 3 else "lr/hr"
+            raise ValueError(f"batch 必须是包含 {required_text} 的字典或序列")
+        return batch[0], batch[1], batch[2] if len(batch) > 2 else None
 
     def _apply_ref_dropout(self, ref, lr=None):
         p = self.hparams.ref_drop_prob
@@ -1152,17 +1153,23 @@ class LitRefSRWKV(pl.LightningModule):
         drop = torch.rand(batch_size, 1, 1, 1, device=ref.device) < p
         return torch.where(drop, replacement, ref)
 
-    def _reference_input(self, ref, lr):
-        if self.reference_mode != "lr_up":
-            return ref
-        replacement = F.interpolate(
-            lr, size=ref.shape[-2:], mode="bicubic", align_corners=False
+    def _reference_input(self, ref, lr, hr=None):
+        """Return the HR-grid reference for paired and SISR data contracts."""
+        expected_size = (
+            lr.shape[-2] * self.model_sr.scale,
+            lr.shape[-1] * self.model_sr.scale,
         )
-        if replacement.shape[1] != ref.shape[1]:
+        if hr is not None and hr.shape[-2:] != expected_size:
             raise ValueError(
-                f"lr_up reference 的通道数与 ref 不一致: {replacement.shape[1]} vs {ref.shape[1]}"
+                "HR 尺寸必须严格等于 LR x scale；"
+                f"得到 LR={tuple(lr.shape[-2:])}, HR={tuple(hr.shape[-2:])}, "
+                f"scale=x{self.model_sr.scale}"
             )
-        return replacement
+        if self.reference_mode == "lr_up":
+            return F.interpolate(lr, size=expected_size, mode="bicubic", align_corners=False)
+        if ref is None:
+            raise ValueError("paired reference 模式需要 batch 中的 ref")
+        return ref
 
     def forward(self, lr, ref):
         return self.model_sr(lr, ref)
@@ -1255,7 +1262,7 @@ class LitRefSRWKV(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-        reference = self._reference_input(ref, lr)
+        reference = self._reference_input(ref, lr, hr)
         output = self(lr, self._apply_ref_dropout(reference, lr=lr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
@@ -1294,7 +1301,7 @@ class LitRefSRWKV(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-        output = self(lr, self._reference_input(ref, lr))
+        output = self(lr, self._reference_input(ref, lr, hr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
         self.log(
@@ -1336,7 +1343,7 @@ class LitRefSRWKV(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         lr, hr, ref = self._unpack_batch(batch)
-        output = self(lr, self._reference_input(ref, lr))
+        output = self(lr, self._reference_input(ref, lr, hr))
         loss, metrics = self._compute_loss(output, hr)
         batch_size = hr.size(0)
         self.log("test_loss", loss, on_step=False, on_epoch=True, batch_size=batch_size)

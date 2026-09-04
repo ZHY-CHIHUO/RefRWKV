@@ -1,0 +1,15 @@
+# AID x4 SwinIR-M from scratch.  LR48/HR192 train crops, full-image validation.
+base:
+  - ../base.yaml
+  - ../models/swinir_m.yaml
+
+dataset:
+  config: ../../datasets/aid.yaml
+
+run:
+  name: aid_x4_swinir_m_l1
+  scale: 4
+  lr_patch: 48
+
+data:
+  max_samples_val: 300

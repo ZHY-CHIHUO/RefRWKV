@@ -5,7 +5,7 @@ dataset:
   id: ucmerced
   name: UC Merced Land Use
   kind: synthetic_sisr
-  root: data/remote_sensing/prepared/UC_Merced
+  root: SR_data/remote_sensing/prepared/UC_Merced
   default_scale: 4
   source:
     image_size: [256, 256]
@@ -15,7 +15,6 @@ dataset:
   prepared:
     hr_size: [256, 256]
     lr_size: [64, 64]
-    ref_size: [256, 256]
     scale: 4
     splits: {train: 1470, val: 315, test: 315}
-  reference_policy: bicubic-upsampled LR at HR resolution
+  reference_policy: none on disk; RefSRWKV lr_up derives bicubic LR at runtime

@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from RefSR_data.RefDataset import RefPNGDataset
+from SR_data.SRDataset import SRPNGDataset
 from models.RefSRWKV import RefSRWKV
 from eval_four_settings import checkpoint_model_options, gaussian_ssim, load_weights
 
@@ -55,15 +56,18 @@ def usable_names(dataset, hr_patch, limit):
 @torch.no_grad()
 def evaluate(model, data_root, split, scale, lr_size, n, workers, reference):
     hr_patch = None if lr_size is None else lr_size * scale
-    dataset = RefPNGDataset(
+    dataset_class = RefPNGDataset if reference == "dataset" else SRPNGDataset
+    dataset_kwargs = dict(
         data_dir=data_root,
         mode=split,
         scale=scale,
         patch_size=hr_patch,
         augment=False,
-        augment_ref=False,
         max_samples=(None, None, n),
     )
+    if dataset_class is RefPNGDataset:
+        dataset_kwargs["augment_ref"] = False
+    dataset = dataset_class(**dataset_kwargs)
     names = usable_names(dataset, hr_patch, n)
     if not names:
         return None, "source images are smaller than the requested HR crop"

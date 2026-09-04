@@ -31,10 +31,17 @@ Ref (H×W) ────────────────→ RWKV Adapter ─�
 
 ## 数据准备
 
-目录结构（默认 PNG 模式，主训练脚本使用 RefPNGDataset）：
+PNG 数据按任务分成两个明确的加载契约：
 
 ```
-<data_dir>/
+# 单图超分：SR_data/SRDataset.py
+<sisr_data_dir>/
+├── train/{HR,LR}/*.png
+├── val/{HR,LR}/*.png
+└── test/{HR,LR}/*.png
+
+# 参考超分：RefSR_data/RefDataset.py
+<refsr_data_dir>/
 ├── train/{HR,LR,Ref}/*.png
 ├── val/{HR,LR,Ref}/*.png
 └── test/{HR,LR,Ref}/*.png
@@ -43,11 +50,11 @@ Ref (H×W) ────────────────→ RWKV Adapter ─�
 - 图像尺寸和倍率由配置决定：HRMS-SCD / UC Merced / AID 为 4×，Real-RefRSSRD 为 10×；文件名一一对应。
 - 当前本地数据尺寸：HRMS-SCD `512/128`、UC Merced `256/64`、AID `512/128`、Real-RefRSSRD `480/48`（HR/LR）。
 - 值域在数据集内部统一为 [-1, 1]。
-- 裁剪先采 LR 整数坐标再乘 scale 映射 HR/Ref，保证严格对齐。
+- 裁剪先采 LR 整数坐标再乘 scale 映射 HR（以及配对 Ref），保证严格对齐。
 
-数据集说明：[`RefSR_data/HRMS_SCD/RefSR-HRMS.md`](RefSR_data/HRMS_SCD/RefSR-HRMS.md)、[`RefSR_data/ALL_2/Real-RefRSSRD.md`](RefSR_data/ALL_2/Real-RefRSSRD.md)、[`data/remote_sensing/prepared/UC_Merced/介绍.md`](data/remote_sensing/prepared/UC_Merced/介绍.md)、[`data/remote_sensing/prepared/AID/介绍.md`](data/remote_sensing/prepared/AID/介绍.md)。图像和压缩包均由 `.gitignore` 排除，GitHub 只保留这些说明和代码。
+数据集说明：[`RefSR_data/HRMS_SCD/RefSR-HRMS.md`](RefSR_data/HRMS_SCD/RefSR-HRMS.md)、[`RefSR_data/ALL_2/Real-RefRSSRD.md`](RefSR_data/ALL_2/Real-RefRSSRD.md)、[`SR_data/remote_sensing/prepared/UC_Merced/介绍.md`](SR_data/remote_sensing/prepared/UC_Merced/介绍.md)、[`SR_data/remote_sensing/prepared/AID/介绍.md`](SR_data/remote_sensing/prepared/AID/介绍.md)。图像、压缩包和生成元数据均由 `.gitignore` 排除，GitHub 只保留这些说明和代码。
 
-训练和评估统一读取 PNG 文件夹中的同名 `HR`、`LR`、`Ref` 三元组。
+UC Merced 和 AID 是 SISR 数据，磁盘上仅保留 `HR/LR`；RefSRWKV 的 `reference_mode: lr_up` 在前向中从当前 LR 生成 bicubic 参考。HRMS-SCD 和 Real-RefRSSRD 保留真实配对 `Ref`，只能由严格的 `RefPNGDataset` 读取。
 
 ## 训练
 
@@ -69,6 +76,10 @@ configs/
 │   ├── hrms_scd_x4.yaml
 │   ├── real_refrssrd_x10.yaml
 │   └── ucmerced_x4.yaml
+├── baselines/                # 统一 SISR baseline 协议
+│   ├── base.yaml
+│   ├── models/swinir_m.yaml
+│   └── runs/aid_x4_swinir_m_l1.yaml
 ├── stage1_baseline.yaml      # Stage 1 覆盖
 ├── stage2_semantic.yaml      # Stage 2 覆盖
 ├── stage3_texture.yaml       # Stage 3 覆盖
@@ -112,6 +123,27 @@ conda run -n rwkv7 python scripts/train_sr_prior.py \
 数据集 YAML 只记录数据集事实和路径；run YAML 记录倍率、LR crop、损失和与默认值不同的训练参数。AID 使用纯 L1 和 50,000 optimizer steps。验证使用固定数量的原生全图；`val_check_interval: 1.0` 配合 `check_val_every_n_epoch: 10` 表示每 10 个 epoch 在 epoch 末验证一次（不能把 `val_check_interval` 写成整数 10，那表示每 10 个训练 batch）。已统一为同一尺寸的数据集可以增大 `val_batch_size`，混合尺寸数据集则保持 1。EMA、`ReduceLROnPlateau`、checkpoint 和 early stopping 全部读取聚合后的全图 `val_loss`。
 
 `configs/sr_prior_base.yaml` 的窗口为 `8/[0,4]`（level1/2）、`4/[0,2]`（level3）和 `3/[0,1]`（latent）。卷积与参考分支采用逐像素通道 RMSNorm，`GatedFusion` 采用逐像素 1x1 gate；`model.color_match: global|none` 控制唯一可选的全图 Ref 颜色统计。详见 [RefSRWKV.md](RefSRWKV.md)。
+
+### SISR Baseline 对比
+
+`baselines/` 只承载 HR/LR 单图超分模型，当前已接入 SwinIR-M。所有 baseline 共用 `SRPNGDataset`、`[-1,1]` 值域、L1/EMA、按实际验证次数更新的 Plateau scheduler、checkpoint 命名和 JSON 评测结果；后续 RCAN、EDSR 等模型只需新增一个 adapter 并添加模型 YAML，不应另写数据加载或指标脚本。
+
+从头训练 AID x4 SwinIR-M：
+
+```bash
+conda run -n rwkv7 python scripts/train_baseline.py \
+  --config configs/baselines/runs/aid_x4_swinir_m_l1.yaml
+```
+
+使用最佳或 `last.ckpt` 在 AID test 全图评测（默认 EMA），同时输出 bicubic、PSNR、SSIM、模型前向耗时和峰值显存：
+
+```bash
+conda run -n rwkv7 python scripts/eval_baseline.py \
+  --checkpoint checkpoints/baselines/aid_x4_swinir_m_l1/last.ckpt \
+  --split test --batch-size 1
+```
+
+评测 JSON 默认写入 `results/baselines/`。该目录、日志和 checkpoint 均被忽略；run YAML 与数据集 Markdown 是可复现实验并提交 GitHub 的来源。
 
 ### 关键开关速查
 
@@ -203,8 +235,10 @@ RefRWKV/
 │   ├── cuda/           # bi_wkv.cpp / bi_wkv_kernel.cu
 │   └── RefDiffRWKV/    # generator / adapter / semantic / discriminator / gan system / sampler
 ├── scripts/            # train_sd2_gan.py / train_sr_prior.py / test.py
+├── baselines/          # SISR registry、SwinIR adapter、共享训练工具
 ├── evaluation/         # eval_pyiqa.py / eval_sewar.py
-├── RefSR_data/         # RefDataset.py（PNG loader）
+├── RefSR_data/         # RefDataset.py（严格 HR/LR/Ref loader）
+├── SR_data/            # SRDataset.py（HR/LR loader；仅提交代码和说明）
 └── checkpoints/        # 模型权重
 ```
 

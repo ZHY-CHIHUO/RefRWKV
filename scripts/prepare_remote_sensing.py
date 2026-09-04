@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Prepare UC Merced or AID images for RefPNGDataset.
+"""Prepare UC Merced or AID images for the HR/LR SISR data contract.
 
 The source datasets contain single high-resolution images arranged by class.
 This tool creates a deterministic stratified split and synthetic SR pairs.
 
     output/<split>/HR/*.png
     output/<split>/LR/*.png
-    output/<split>/Ref/*.png
-
-The Ref image is the bicubic-upsampled LR image.  This matches the SISR
-fallback used during training when ``ref_drop_prob`` replaces a reference.
 """
 
 from __future__ import annotations
@@ -29,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image, ImageChops
+from PIL import Image
 
 DATASET_DEFAULTS = {
     "ucmerced": {
@@ -195,42 +191,30 @@ def _validate_output(
     for split in SPLITS:
         hr_dir = output_dir / split / "HR"
         lr_dir = output_dir / split / "LR"
-        ref_dir = output_dir / split / "Ref"
         names = sorted(path.stem for path in lr_dir.glob("*.png"))
         if not names:
             raise RuntimeError(f"prepared split is empty: {split}")
         directory_counts = {
             directory: len(list((output_dir / split / directory).glob("*.png")))
-            for directory in ("LR", "HR", "Ref")
+            for directory in ("LR", "HR")
         }
         if len(set(directory_counts.values())) != 1:
             raise RuntimeError(
                 f"split directories have different counts: {split}: {directory_counts}"
             )
         for name in names:
-            paths = [
-                hr_dir / f"{name}.png",
-                lr_dir / f"{name}.png",
-                ref_dir / f"{name}.png",
-            ]
+            paths = [hr_dir / f"{name}.png", lr_dir / f"{name}.png"]
             if not all(path.is_file() for path in paths):
                 raise RuntimeError(f"incomplete pair for {split}/{name}")
-            with Image.open(paths[0]) as hr, Image.open(paths[1]) as lr, Image.open(
-                paths[2]
-            ) as ref:
-                if hr.mode != "RGB" or lr.mode != "RGB" or ref.mode != "RGB":
+            with Image.open(paths[0]) as hr, Image.open(paths[1]) as lr:
+                if hr.mode != "RGB" or lr.mode != "RGB":
                     raise RuntimeError(f"non-RGB output for {split}/{name}")
-                if hr.size != expected_sizes["hr"] or ref.size != expected_sizes["hr"]:
+                if hr.size != expected_sizes["hr"]:
                     raise RuntimeError(
-                        f"bad HR/Ref size for {split}/{name}: {hr.size}, {ref.size}"
+                        f"bad HR size for {split}/{name}: {hr.size}"
                     )
                 if lr.size != expected_sizes["lr"]:
                     raise RuntimeError(f"bad LR size for {split}/{name}: {lr.size}")
-                expected_ref = lr.resize(hr.size, Image.Resampling.BICUBIC)
-                if ImageChops.difference(ref, expected_ref).getbbox() is not None:
-                    raise RuntimeError(
-                        f"Ref is not bicubic-upsampled LR for {split}/{name}"
-                    )
         counts[split] = len(names)
     return counts
 
@@ -241,20 +225,13 @@ def _prepare_item(
     record, name, output_dir, split, hr_size, lr_size = args
     hr = _open_hr(record.path, hr_size)
     lr = hr.resize((lr_size, lr_size), Image.Resampling.BICUBIC)
-    # The prepared reference intentionally follows the SISR path: it
-    # contains no external semantic information and is exactly the LR input
-    # resized back to the HR grid.
-    ref = lr.resize((hr_size, hr_size), Image.Resampling.BICUBIC)
     _write_image(output_dir / split / "HR" / f"{name}.png", hr)
     _write_image(output_dir / split / "LR" / f"{name}.png", lr)
-    _write_image(output_dir / split / "Ref" / f"{name}.png", ref)
     return {
         "name": name,
         "split": split,
         "class": record.class_name,
         "source": str(record.path),
-        "reference_source": None,
-        "reference_policy": "bicubic-upsampled LR",
     }
 
 
@@ -347,9 +324,8 @@ def prepare(
         "split_counts": split_counts,
         "validated_counts": validated,
         "class_counts": dict(sorted(class_counts.items())),
-        "reference_policy": "bicubic-upsampled LR at HR resolution (SISR mode)",
         "degradation": "PIL bicubic downsampling from HR to LR",
-        "loader": "RefSR_data.RefDataset.RefPNGDataset",
+        "loader": "SR_data.SRDataset.SRPNGDataset",
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"

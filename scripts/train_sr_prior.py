@@ -35,6 +35,7 @@ from RefRWKV.models.RefSRWKV import (
     normalize_window_config,
 )
 from RefRWKV.RefSR_data.RefDataset import RefPNGDataset
+from RefRWKV.SR_data.SRDataset import SRPNGDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -491,9 +492,6 @@ def build_dataloaders(cfg):
     common = dict(
         data_dir=str(data_root),
         scale=dc.get("scale", 4),
-        ref_aug_strengths=dc.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
-        ref_aug_probs=dc.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
-        ref_gray_prob=dc.get("ref_gray_prob", 0.2),
         max_samples=(
             dc.get("max_samples_train"),
             dc.get("max_samples_val"),
@@ -502,22 +500,41 @@ def build_dataloaders(cfg):
         sample_seed=dc.get("sample_seed", tc.get("seed", 42)),
         lr_key=dc.get("lr_key", "lr"),
         hr_key=dc.get("hr_key", "hr"),
-        ref_key=dc.get("ref_key", "ref"),
     )
-    train_ds = RefPNGDataset(
+    train_kwargs = dict(
         mode="train",
         patch_size=dc.get("train_hr_patch", dc.get("patch_size", 480)),
         augment=dc.get("augment", True),
-        augment_ref=dc.get("augment_ref", True),
         **common,
     )
-    val_ds = RefPNGDataset(
+    val_kwargs = dict(
         mode="val",
         patch_size=dc.get("val_patch_size"),
         augment=False,
-        augment_ref=False,
         **common,
     )
+    if dc.get("reference_mode") == "lr_up":
+        # Synthetic SISR datasets have only aligned HR/LR images.  The
+        # Lightning module creates the bicubic HR-grid reference from LR.
+        dataset_class = SRPNGDataset
+    else:
+        dataset_class = RefPNGDataset
+        train_kwargs.update(
+            augment_ref=dc.get("augment_ref", True),
+            ref_aug_strengths=dc.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
+            ref_aug_probs=dc.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
+            ref_gray_prob=dc.get("ref_gray_prob", 0.2),
+            ref_key=dc.get("ref_key", "ref"),
+        )
+        val_kwargs.update(
+            augment_ref=False,
+            ref_aug_strengths=dc.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
+            ref_aug_probs=dc.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
+            ref_gray_prob=dc.get("ref_gray_prob", 0.2),
+            ref_key=dc.get("ref_key", "ref"),
+        )
+    train_ds = dataset_class(**train_kwargs)
+    val_ds = dataset_class(**val_kwargs)
     if len(train_ds) == 0:
         raise ValueError("训练数据集为空")
     if len(val_ds) == 0:

@@ -21,6 +21,8 @@ bicubic(LR, LR * scale) + 残差  -> 输出
 
 前向会严格断言 `ref.shape[-2:] == lr.shape[-2:] * scale`，不会静默缩放尺寸错误的参考图。为通过三级 U-Net 下采样，LR 仅在右侧和下侧 replicate padding 到 8 的倍数；Ref 同步补齐 `scale` 倍像素。输出随后裁回原始 `LR * scale` 尺寸。因此训练 crop、任意全图和非 8 倍尺寸推理都遵守同一几何规则。
 
+数据加载按 `data.reference_mode` 分开：`paired` 使用 `RefSR_data.RefDataset.RefPNGDataset`，严格读取同名 `HR/LR/Ref`；`lr_up` 使用 `SR_data.SRDataset.SRPNGDataset`，只读取 `HR/LR`，再在模块内从当前 LR 生成 bicubic HR 网格参考。AID 和 UC Merced 属于后者，因此不会因为缺失或陈旧的磁盘 `Ref` 影响 SISR 训练与评测。
+
 训练统一使用 `run.lr_patch: 48`，HR crop 自动为 `48 * scale`：
 
 | 倍率 | 训练 LR | 训练 HR | Ref 折叠 | 默认输出头 |
@@ -117,7 +119,7 @@ checkpoint 写入 `checkpoints/refrwkv_sr_aid_x4_l1/`，TensorBoard 写入 `logs
 ```bash
 conda run -n rwkv7 python scripts/eval_four_settings.py \
   --ckpt checkpoints/refrwkv_sr_aid_x4_l1/last.ckpt \
-  --data data/remote_sensing/prepared/AID \
+  --data SR_data/remote_sensing/prepared/AID \
   --splits test \
   --settings bicubic sisr_ref \
   --batch-size 1
@@ -128,7 +130,7 @@ conda run -n rwkv7 python scripts/eval_four_settings.py \
 ```bash
 conda run -n rwkv7 python scripts/eval_size_generalization.py \
   --ckpt checkpoints/refrwkv_sr_aid_x4_l1/last.ckpt \
-  --data data/remote_sensing/prepared/AID \
+  --data SR_data/remote_sensing/prepared/AID \
   --split test \
   --reference sisr \
   --lr-sizes 48 64 96 150 full
