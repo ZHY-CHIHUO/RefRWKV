@@ -106,7 +106,7 @@ conda run -n rwkv7 python scripts/train_sr_prior.py \
 
 checkpoint 写入 `checkpoints/refrwkv_sr_aid_x4_l1/`，TensorBoard 写入 `logs/refrwkv_sr/aid_x4_l1/`。该 run 使用纯 L1 和 50,000 个 optimizer step。全图验证使用固定数量的图片；预处理后尺寸一致的数据集可提高验证 batch，混合尺寸数据集保持 batch 1。
 
-`ReduceLROnPlateau`、checkpoint 选择和可选 early stopping 都使用聚合后的全图 `val_loss`。`lr_patience` 的单位是验证次数，`lr_threshold` 是最小绝对有效改善量。AID 默认每个 epoch 验证一次。
+`ReduceLROnPlateau`、checkpoint 选择和可选 early stopping 都使用聚合后的全图 `val_loss`。`lr_patience` 的单位是验证次数，`lr_threshold` 是最小绝对有效改善量。若要每 10 个 epoch 验证一次，保持 `val_check_interval: 1.0`，并设置 `check_val_every_n_epoch: 10`；不要把前者写成整数 `10`，那表示每 10 个训练 batch。此时 `lr_patience: 3` 对应连续 3 次验证（约 30 个 epoch）无有效改善。
 
 `--resume` 仅用于完全相同的原生 LR run，并恢复 optimizer、scheduler 与 EMA。切换数据集、倍率、输出头、crop 策略或窗口调度时使用 `--load_weights`；它只加载名称和形状均一致的张量，并重新初始化 optimizer、scheduler 与 EMA。
 

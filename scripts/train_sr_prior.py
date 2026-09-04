@@ -441,6 +441,19 @@ def validate_config(cfg):
         raise ValueError(
             "train.val_check_interval 为小数时必须位于 (0, 1]；整数批次数请使用整数"
         )
+    check_val_every_n_epoch = tc.get("check_val_every_n_epoch", 1)
+    _require_int(
+        check_val_every_n_epoch,
+        "train.check_val_every_n_epoch",
+        minimum=1,
+    )
+    if check_val_every_n_epoch > 1 and not (
+        isinstance(interval, float) and float(interval) == 1.0
+    ):
+        raise ValueError(
+            "按 epoch 间隔验证时，train.val_check_interval 必须保持为 1.0；"
+            "整数 10 表示每 10 个训练 batch，而不是每 10 个 epoch"
+        )
     _require_int(tc.get("save_top_k", 3), "train.save_top_k", minimum=-1)
     early_stopping_patience = tc.get("early_stopping_patience", 30)
     if early_stopping_patience is not None:
@@ -1050,6 +1063,7 @@ def main():
         max_epochs=tc.get("max_epochs", 200),
         log_every_n_steps=tc.get("log_every_n_steps", 20),
         val_check_interval=tc.get("val_check_interval", 1.0),
+        check_val_every_n_epoch=tc.get("check_val_every_n_epoch", 1),
         gradient_clip_val=tc.get("grad_clip_val", mc.get("grad_clip_norm", 1.0)),
         gradient_clip_algorithm=str(tc.get("gradient_clip_algorithm", "norm")).lower(),
         callbacks=callbacks,
@@ -1105,8 +1119,9 @@ def main():
         cfg["data"].get("scale", 4),
     )
     logger.info(
-        "  验证: %s | scale=x%d | output head=%s",
+        "  验证: %s | 每 %d 个 epoch | scale=x%d | output head=%s",
         "full image" if cfg["data"].get("val_patch_size") is None else f"HR {cfg['data']['val_patch_size']}",
+        tc.get("check_val_every_n_epoch", 1),
         cfg["data"].get("scale", 4),
         lit_model.model_sr.upsampler,
     )

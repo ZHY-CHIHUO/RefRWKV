@@ -109,7 +109,7 @@ conda run -n rwkv7 python scripts/train_sr_prior.py \
   --config configs/runs/aid_x4_l1.yaml
 ```
 
-数据集 YAML 只记录数据集事实和路径；run YAML 记录倍率、LR crop、损失和与默认值不同的训练参数。AID 使用纯 L1 和 50,000 optimizer steps。验证使用固定数量的原生全图；已统一为同一尺寸的数据集可以增大 `val_batch_size`，混合尺寸数据集则保持 1。EMA、`ReduceLROnPlateau`、checkpoint 和 early stopping 全部读取聚合后的全图 `val_loss`。
+数据集 YAML 只记录数据集事实和路径；run YAML 记录倍率、LR crop、损失和与默认值不同的训练参数。AID 使用纯 L1 和 50,000 optimizer steps。验证使用固定数量的原生全图；`val_check_interval: 1.0` 配合 `check_val_every_n_epoch: 10` 表示每 10 个 epoch 在 epoch 末验证一次（不能把 `val_check_interval` 写成整数 10，那表示每 10 个训练 batch）。已统一为同一尺寸的数据集可以增大 `val_batch_size`，混合尺寸数据集则保持 1。EMA、`ReduceLROnPlateau`、checkpoint 和 early stopping 全部读取聚合后的全图 `val_loss`。
 
 `configs/sr_prior_base.yaml` 的窗口为 `8/[0,4]`（level1/2）、`4/[0,2]`（level3）和 `3/[0,1]`（latent）。卷积与参考分支采用逐像素通道 RMSNorm，`GatedFusion` 采用逐像素 1x1 gate；`model.color_match: global|none` 控制唯一可选的全图 Ref 颜色统计。详见 [RefSRWKV.md](RefSRWKV.md)。
 
