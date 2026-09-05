@@ -1,0 +1,4 @@
+source=ALL_2.zip + ALL_2.z01..ALL_2.z25
+temporary_combined=.extract_runs/ALL_2_combined.zip
+target=ALL_2
+finished=2026-06-07T10:41:09+08:00
