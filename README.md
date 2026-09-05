@@ -82,6 +82,8 @@ Stage 4 还需要 `vision_aided_loss`，其上游安装命令写在 `requirement
 
 真实参考图专属字段只放在 `configs/common/refsr_paired.yaml` 和 `configs/common/refsrwkv_paired.yaml`：`augment_ref`、`ref_aug_strengths`、`ref_aug_probs`、`ref_gray_prob`、`loss.ref_drop_prob`。`lr_up` 运行配置不能设置它们，配置校验会直接报错，避免参数看似启用但实际无效。`RefDiffRWKV` 当前只支持 `paired`，因为它的训练和采样都需要真实 `Ref`。
 
+RefSRWKV 的消融开关集中在 `configs/models/refsr/refsrwkv.yaml`：`model.fusion_match.enabled/window/conf/quality`、`model.decoder_refusion`、`model.global_latent_blocks` 和 `model.ref_encoder`。例如 `--overrides model.fusion_match.enabled=false model.global_latent_blocks=0 model.ref_encoder=shallow` 可复现实验变体；默认值对应完整模型。结构型开关通常会改变参数集合或形状，每个变体应从头训练，或只加载同一变体产生的 checkpoint。
+
 ## 训练
 
 SR（SwinIR-M，AID x4）：

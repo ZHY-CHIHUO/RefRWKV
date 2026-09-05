@@ -3,6 +3,8 @@
 RefSRWKV: Reference-based Super-Resolution with RWKV Backbone.
 """
 
+from collections.abc import Mapping
+
 import torch
 
 try:
@@ -38,6 +40,25 @@ _DEFAULT_WINDOW_SPECS = {
     "dec2": {"size": 8, "offsets": (0, 4)},
     "dec1": {"size": 8, "offsets": (0, 4)},
     "refine": {"size": 8, "offsets": (0, 4)},
+}
+
+_FUSION_STAGE_NAMES = (
+    "enc1",
+    "enc2",
+    "enc3",
+    "latent",
+    "dec3",
+    "dec2",
+    "dec1",
+)
+_DEFAULT_FUSION_WINDOWS = {
+    "enc1": 7,
+    "enc2": 5,
+    "enc3": 5,
+    "latent": 3,
+    "dec3": 5,
+    "dec2": 5,
+    "dec1": 7,
 }
 
 
@@ -139,6 +160,73 @@ def normalize_window_config(windows=None):
             for stage_name in _WINDOW_STAGE_NAMES
         },
     }
+
+
+def _fusion_window_size(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value % 2 == 0:
+        raise ValueError(f"{name} 必须是正奇数，得到 {value!r}")
+    return int(value)
+
+
+def normalize_fusion_match_config(fusion_match=None):
+    """Normalize the ablation controls for reference feature fusion.
+
+    ``window`` accepts one odd integer for all fusion sites, a seven-item list
+    in U-Net order, or a partial stage mapping.  The mapping form preserves the
+    production defaults while still making a single-window ablation concise.
+    """
+    defaults = {
+        "enabled": True,
+        "window": dict(_DEFAULT_FUSION_WINDOWS),
+        "conf": True,
+        "quality": True,
+    }
+    if fusion_match is None:
+        fusion_match = {}
+    elif isinstance(fusion_match, bool):
+        fusion_match = {"enabled": fusion_match}
+    if not isinstance(fusion_match, Mapping):
+        raise ValueError("fusion_match 必须是 mapping 或 bool")
+    unknown = set(fusion_match).difference(defaults)
+    if unknown:
+        raise ValueError(f"fusion_match 包含未知字段: {', '.join(sorted(unknown))}")
+
+    for key in ("enabled", "conf", "quality"):
+        if key in fusion_match and not isinstance(fusion_match[key], bool):
+            raise ValueError(f"fusion_match.{key} 必须是 bool")
+        defaults[key] = fusion_match.get(key, defaults[key])
+
+    raw_window = fusion_match.get("window", defaults["window"])
+    if isinstance(raw_window, bool):
+        raise ValueError("fusion_match.window 必须是正奇数、七项列表或阶段 mapping")
+    if isinstance(raw_window, int):
+        size = _fusion_window_size(raw_window, "fusion_match.window")
+        windows = {stage: size for stage in _FUSION_STAGE_NAMES}
+    elif isinstance(raw_window, (list, tuple)):
+        if len(raw_window) != len(_FUSION_STAGE_NAMES):
+            raise ValueError(
+                "fusion_match.window 列表必须按 enc1, enc2, enc3, latent, "
+                "dec3, dec2, dec1 提供七项"
+            )
+        windows = {
+            stage: _fusion_window_size(value, f"fusion_match.window[{index}]")
+            for index, (stage, value) in enumerate(zip(_FUSION_STAGE_NAMES, raw_window))
+        }
+    elif isinstance(raw_window, Mapping):
+        unknown = set(raw_window).difference(_FUSION_STAGE_NAMES)
+        if unknown:
+            raise ValueError(
+                "fusion_match.window 包含未知阶段: " + ", ".join(sorted(unknown))
+            )
+        windows = dict(_DEFAULT_FUSION_WINDOWS)
+        for stage, value in raw_window.items():
+            windows[stage] = _fusion_window_size(value, f"fusion_match.window.{stage}")
+    else:
+        raise ValueError("fusion_match.window 必须是正奇数、七项列表或阶段 mapping")
+    defaults["window"] = windows
+    return defaults
+
+
 # ═══════════════════════════════════════════════════════════
 # 基础组件
 # ═══════════════════════════════════════════════════════════
@@ -407,52 +495,98 @@ class RMSNorm2d(nn.Module):
 
 
 class GatedFusion(nn.Module):
-    """Match reference features in a local neighborhood before fusion."""
+    """Fuse reference features with optional local matching and gates."""
 
-    def __init__(self, dim, reduction=4, window_size=7):
+    def __init__(
+        self,
+        dim,
+        reduction=4,
+        window_size=7,
+        *,
+        match_enabled=True,
+        conf_enabled=True,
+        quality_enabled=True,
+    ):
         super().__init__()
         if not isinstance(window_size, int) or window_size < 1 or window_size % 2 == 0:
             raise ValueError("GatedFusion window_size must be a positive odd integer")
+        for name, value in (
+            ("match_enabled", match_enabled),
+            ("conf_enabled", conf_enabled),
+            ("quality_enabled", quality_enabled),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"GatedFusion {name} must be bool")
         self.dim = dim
         self.window_size = window_size
         self.radius = window_size // 2
         self.kernel = window_size * window_size
-        self.query = nn.Conv2d(dim, dim, 1, bias=False)
-        self.key = nn.Conv2d(dim, dim, 1, bias=False)
-        self.value = nn.Conv2d(dim, dim, 1, bias=False)
-        self.message = nn.Conv2d(dim, dim, 1, bias=False)
+        self.match_enabled = match_enabled
+        self.conf_enabled = conf_enabled
+        self.quality_enabled = quality_enabled
+
         self.fuse_conv = nn.Conv2d(dim * 2, dim, 1, bias=False)
         self.norm = RMSNorm2d(dim)
-        self.message_norm = RMSNorm2d(dim)
         gate_hidden = max(dim // reduction, 8)
-        self.gate = nn.Sequential(
-            nn.Conv2d(dim * 3 + 1, gate_hidden, 1),
-            nn.GELU(),
-            nn.Conv2d(gate_hidden, dim, 1),
-            nn.Sigmoid(),
-        )
-        self.quality = nn.Sequential(
-            nn.Conv2d(dim * 3 + 1, gate_hidden, 1),
-            nn.GELU(),
-            nn.Conv2d(gate_hidden, 1, 1),
-            nn.Sigmoid(),
-        )
-        self.relative_bias = nn.Parameter(torch.zeros(self.kernel))
-        # A learnable temperature makes cosine matching selective enough for
-        # repeated textures while remaining adaptable to ambiguous references.
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        if match_enabled:
+            self.query = nn.Conv2d(dim, dim, 1, bias=False)
+            self.key = nn.Conv2d(dim, dim, 1, bias=False)
+            self.value = nn.Conv2d(dim, dim, 1, bias=False)
+            self.message = nn.Conv2d(dim, dim, 1, bias=False)
+            self.message_norm = RMSNorm2d(dim)
+            self.relative_bias = nn.Parameter(torch.zeros(self.kernel))
+            # A learnable temperature makes cosine matching selective enough
+            # for repeated textures while remaining adaptable to ambiguity.
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+            self.gate = nn.Sequential(
+                nn.Conv2d(dim * 3 + 1, gate_hidden, 1),
+                nn.GELU(),
+                nn.Conv2d(gate_hidden, dim, 1),
+                nn.Sigmoid(),
+            )
+            self.quality = (
+                nn.Sequential(
+                    nn.Conv2d(dim * 3 + 1, gate_hidden, 1),
+                    nn.GELU(),
+                    nn.Conv2d(gate_hidden, 1, 1),
+                    nn.Sigmoid(),
+                )
+                if quality_enabled
+                else nn.Identity()
+            )
+            nn.init.constant_(self.gate[2].bias, -1.0)
+            if quality_enabled:
+                nn.init.constant_(self.quality[2].bias, -1.0)
+        else:
+            # This is the v1 positional-cosine path.  Keeping its parameter
+            # shape separate makes the disabled ablation both faithful and
+            # cheap, instead of allocating unused local-attention weights.
+            self.quality = nn.Identity()
+            self.gate = nn.Sequential(
+                nn.Conv2d(dim, gate_hidden, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(gate_hidden, dim, 1),
+                nn.Sigmoid(),
+            )
+            nn.init.constant_(self.gate[2].bias, 0.0)
         nn.init.trunc_normal_(self.fuse_conv.weight, std=0.02)
-        nn.init.constant_(self.gate[2].bias, -1.0)
-        nn.init.constant_(self.quality[2].bias, -1.0)
 
     def forward(self, lr_feat, ref_feat):
-        b, _, h, w = lr_feat.shape
         if ref_feat.shape != lr_feat.shape:
             raise ValueError(
                 f"GatedFusion expects equal feature shapes, got "
                 f"{tuple(lr_feat.shape)} and {tuple(ref_feat.shape)}"
             )
+        direct = self.norm(self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1)))
+        if not self.match_enabled:
+            conf = (
+                (F.cosine_similarity(lr_feat, ref_feat, dim=1).unsqueeze(1) + 1.0) / 2.0
+                if self.conf_enabled
+                else torch.ones_like(lr_feat[:, :1])
+            )
+            return lr_feat + self.gate(direct) * conf * direct
 
+        b, _, h, w = lr_feat.shape
         q = F.normalize(self.query(lr_feat), dim=1, eps=1e-6)
         k = F.normalize(self.key(ref_feat), dim=1, eps=1e-6)
         v = self.value(ref_feat)
@@ -474,20 +608,19 @@ class GatedFusion(nn.Module):
         matched = (attention.unsqueeze(-1) * v).sum(dim=-2)
         matched = self.message_norm(self.message(matched.permute(0, 3, 1, 2)))
 
-        if kernel == 1:
-            match_conf = attention.new_ones((b, h, w))
-        else:
-            entropy = -(attention.clamp_min(1e-6) * attention.clamp_min(1e-6).log()).sum(-1)
+        if self.conf_enabled and kernel > 1:
+            entropy = -(
+                attention.clamp_min(1e-6) * attention.clamp_min(1e-6).log()
+            ).sum(-1)
             match_conf = (1.0 - entropy / math.log(kernel)).clamp(0.0, 1.0)
-        match_conf = match_conf.unsqueeze(1)
+            match_conf = match_conf.unsqueeze(1)
+        else:
+            match_conf = torch.ones_like(lr_feat[:, :1])
         context = torch.cat([lr_feat, ref_feat, matched, match_conf], dim=1)
-        direct = self.norm(self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1)))
-        # Direct fusion remains useful for aligned references and for SISR
-        # (where Ref is bicubic LR-up); confidence gates only the retrieved
-        # message, whose quality depends on a reliable local match.
-        return lr_feat + self.gate(context) * (
-            direct + self.quality(context) * match_conf * matched
-        )
+        quality = self.quality(context) if self.quality_enabled else 1.0
+        # Direct fusion remains useful for aligned references and for SISR;
+        # confidence and quality only gate the retrieved local message.
+        return lr_feat + self.gate(context) * (direct + quality * match_conf * matched)
 
 
 class GlobalLatentBlock(nn.Module):
@@ -540,6 +673,10 @@ class RefSRWKV(nn.Module):
         hidden_rate: int = 4,
         ref_channels: int = None,
         windows=None,
+        fusion_match=None,
+        decoder_refusion: bool = True,
+        global_latent_blocks: int = 2,
+        ref_encoder: str = "deep",
     ):
         super().__init__()
         if not isinstance(num_blocks, (tuple, list)) or len(num_blocks) != 4:
@@ -586,13 +723,30 @@ class RefSRWKV(nn.Module):
             raise ValueError("ref_channels 必须为正整数")
         if ref_channels != inp_channels:
             raise ValueError("当前颜色对齐路径要求 ref_channels == inp_channels")
+        if isinstance(decoder_refusion, bool) is False:
+            raise ValueError("decoder_refusion 必须是 bool")
+        if (
+            isinstance(global_latent_blocks, bool)
+            or not isinstance(global_latent_blocks, int)
+            or global_latent_blocks < 0
+            or global_latent_blocks > 2
+        ):
+            raise ValueError("global_latent_blocks 必须是 0、1 或 2")
+        ref_encoder = str(ref_encoder).strip().lower()
+        if ref_encoder not in {"shallow", "deep"}:
+            raise ValueError("ref_encoder 只能是 shallow 或 deep")
 
         # The U-Net lives on the incoming LR grid. ``scale`` controls both Ref
         # folding and residual reconstruction.
         shuffle_factors = _pixel_shuffle_factors(scale)
+        fusion_config = normalize_fusion_match_config(fusion_match)
         self.scale = scale
         self.inp_channels, self.ref_channels = inp_channels, ref_channels
         self.upsampler, self.color_match = upsampler, color_match
+        self.fusion_match_config = fusion_config
+        self.decoder_refusion = decoder_refusion
+        self.global_latent_blocks = global_latent_blocks
+        self.ref_encoder = ref_encoder
         self.window_config = normalize_window_config(windows)
         if inp_channels == out_channels:
             self.skip_proj = nn.Identity()
@@ -611,17 +765,25 @@ class RefSRWKV(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.ref_to_level1 = nn.Sequential(
+        ref_encoder_layers = [
             nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
             nn.GELU(),
-            nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
-            nn.PixelUnshuffle(scale),
-            nn.Conv2d(
-                ref_channels * (scale**2), dim, 1, bias=False
-            ),
-            RMSNorm2d(dim),
-            nn.ReLU(inplace=True),
+        ]
+        if ref_encoder == "deep":
+            # Keep the original deep path: two HR-domain convolutions with
+            # one activation between them, followed by phase-preserving fold.
+            ref_encoder_layers.append(
+                nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False)
+            )
+        ref_encoder_layers.extend(
+            [
+                nn.PixelUnshuffle(scale),
+                nn.Conv2d(ref_channels * (scale**2), dim, 1, bias=False),
+                RMSNorm2d(dim),
+                nn.ReLU(inplace=True),
+            ]
         )
+        self.ref_to_level1 = nn.Sequential(*ref_encoder_layers)
         self.ref_down2 = nn.Sequential(
             nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False),
             RMSNorm2d(dim * 2),
@@ -635,11 +797,36 @@ class RefSRWKV(nn.Module):
             RMSNorm2d(dim * 8),
         )
 
+        fusion_windows = fusion_config["window"]
         self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
-            GatedFusion(dim, window_size=7),
-            GatedFusion(dim * 2, window_size=5),
-            GatedFusion(dim * 4, window_size=5),
-            GatedFusion(dim * 8, window_size=3),
+            GatedFusion(
+                dim,
+                window_size=fusion_windows["enc1"],
+                match_enabled=fusion_config["enabled"],
+                conf_enabled=fusion_config["conf"],
+                quality_enabled=fusion_config["quality"],
+            ),
+            GatedFusion(
+                dim * 2,
+                window_size=fusion_windows["enc2"],
+                match_enabled=fusion_config["enabled"],
+                conf_enabled=fusion_config["conf"],
+                quality_enabled=fusion_config["quality"],
+            ),
+            GatedFusion(
+                dim * 4,
+                window_size=fusion_windows["enc3"],
+                match_enabled=fusion_config["enabled"],
+                conf_enabled=fusion_config["conf"],
+                quality_enabled=fusion_config["quality"],
+            ),
+            GatedFusion(
+                dim * 8,
+                window_size=fusion_windows["latent"],
+                match_enabled=fusion_config["enabled"],
+                conf_enabled=fusion_config["conf"],
+                quality_enabled=fusion_config["quality"],
+            ),
         )
 
         total_blocks = sum(num_blocks) * 2 + num_refinement_blocks
@@ -702,12 +889,34 @@ class RefSRWKV(nn.Module):
         )
         dp_idx += num_blocks[3]
         self.global_latent = nn.Sequential(
-            GlobalLatentBlock(dim * 8, num_heads=8, hidden_rate=2),
-            GlobalLatentBlock(dim * 8, num_heads=8, hidden_rate=2),
+            *(GlobalLatentBlock(dim * 8, num_heads=8, hidden_rate=2) for _ in range(global_latent_blocks))
         )
-        self.decoder_fuse3 = GatedFusion(dim * 4, window_size=5)
-        self.decoder_fuse2 = GatedFusion(dim * 2, window_size=5)
-        self.decoder_fuse1 = GatedFusion(dim, window_size=7)
+        if decoder_refusion:
+            self.decoder_fuse3 = GatedFusion(
+                dim * 4,
+                window_size=fusion_windows["dec3"],
+                match_enabled=fusion_config["enabled"],
+                conf_enabled=fusion_config["conf"],
+                quality_enabled=fusion_config["quality"],
+            )
+            self.decoder_fuse2 = GatedFusion(
+                dim * 2,
+                window_size=fusion_windows["dec2"],
+                match_enabled=fusion_config["enabled"],
+                conf_enabled=fusion_config["conf"],
+                quality_enabled=fusion_config["quality"],
+            )
+            self.decoder_fuse1 = GatedFusion(
+                dim,
+                window_size=fusion_windows["dec1"],
+                match_enabled=fusion_config["enabled"],
+                conf_enabled=fusion_config["conf"],
+                quality_enabled=fusion_config["quality"],
+            )
+        else:
+            self.decoder_fuse3 = nn.Identity()
+            self.decoder_fuse2 = nn.Identity()
+            self.decoder_fuse1 = nn.Identity()
 
         self.up4_3 = Upsample(dim * 8)
         self.reduce_chan_level3 = nn.Sequential(
@@ -873,24 +1082,18 @@ class RefSRWKV(nn.Module):
         latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
         latent = self.global_latent(latent)
 
-        d3 = self.decoder_level3(
-            self.decoder_fuse3(
-                self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1)),
-                ref_3,
-            )
-        )
-        d2 = self.decoder_level2(
-            self.decoder_fuse2(
-                self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)),
-                ref_2,
-            )
-        )
-        d1 = self.decoder_level1(
-            self.decoder_fuse1(
-                self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)),
-                ref_1,
-            )
-        )
+        d3_input = self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
+        if self.decoder_refusion:
+            d3_input = self.decoder_fuse3(d3_input, ref_3)
+        d3 = self.decoder_level3(d3_input)
+        d2_input = self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
+        if self.decoder_refusion:
+            d2_input = self.decoder_fuse2(d2_input, ref_2)
+        d2 = self.decoder_level2(d2_input)
+        d1_input = self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
+        if self.decoder_refusion:
+            d1_input = self.decoder_fuse1(d1_input, ref_1)
+        d1 = self.decoder_level1(d1_input)
         d1 = self.refinement(d1)
 
         out_feat = self.output_shuffle(self.output_conv(self.up_final(d1)))

@@ -79,6 +79,8 @@ RefRWKV/
 
 配置也按该契约分层：`common/refsr.yaml` 和 `common/refsrwkv.yaml` 只放两个模式都可用的默认值；`common/refsr_paired.yaml`、`common/refsrwkv_paired.yaml` 才包含 `augment_ref`、颜色/灰度参考图增强和 `loss.ref_drop_prob`。`lr_up` 不允许出现这些字段，避免真实 Ref 增强配置被静默忽略。`RefDiffRWKV` 当前固定使用 `paired`，训练与采样都必须得到真实 `LR/HR/Ref` 三元组。
 
+`configs/models/refsr/refsrwkv.yaml` 还集中声明了 RefSRWKV 的消融开关：`model.fusion_match.enabled` 关闭时退回 v1 的逐位置 cosine 融合，`model.fusion_match.window` 可设统一奇数窗口或按 `enc1/enc2/enc3/latent/dec3/dec2/dec1` 分阶段设置；`model.fusion_match.conf` 和 `model.fusion_match.quality` 分别关闭匹配熵置信度与质量门控。`model.decoder_refusion` 控制解码器 skip 后的二次参考注入，`model.global_latent_blocks` 取 `0/1/2`，`model.ref_encoder` 取 `shallow/deep`（分别为 HR 域一层/两层 3x3 卷积）。这些字段也可用 `--overrides` 点路径覆盖，默认值保持当前完整模型结构。由于大多数开关会改变参数集合或形状，消融模型应从头训练，或只加载相同配置生成的 checkpoint。
+
 ### scale
 
 磁盘上的 LR 是一种存储表示，通常只保留数据集准备时的倍率（当前 AID、UC Merced、HRMS-SCD 为 x4，Real-RefRSSRD 为 x10）。加载器读取 HR 后，按照 `run.scale` 在内存中重采样 LR，再检查 `HR = LR * scale`。因此同一份数据可以尝试 x2、x4 或其他正整数倍率；不会生成默认的 `cache/`，也不会把派生 LR 写回数据目录。若以后确实需要磁盘缓存，应放在被忽略的 `cache/lr/<dataset>/x<scale>/`，而不是提交到 `data/` 或源码目录。

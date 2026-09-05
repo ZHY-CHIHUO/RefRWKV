@@ -23,6 +23,10 @@ _MODEL_FIELDS = {
     "hidden_rate",
     "ref_channels",
     "windows",
+    "fusion_match",
+    "decoder_refusion",
+    "global_latent_blocks",
+    "ref_encoder",
 }
 
 

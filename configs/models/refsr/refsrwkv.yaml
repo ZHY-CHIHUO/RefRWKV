@@ -20,3 +20,20 @@ model:
     refine: {size: 8, offsets: [0, 4]}
   drop_path_rate: 0.15
   hidden_rate: 4
+  # Ablation controls. ``window`` may be one odd integer, a seven-item list,
+  # or a stage mapping; this mapping keeps the production per-stage defaults.
+  fusion_match:
+    enabled: true
+    window:
+      enc1: 7
+      enc2: 5
+      enc3: 5
+      latent: 3
+      dec3: 5
+      dec2: 5
+      dec1: 7
+    conf: true
+    quality: true
+  decoder_refusion: true
+  global_latent_blocks: 2
+  ref_encoder: deep
