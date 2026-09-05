@@ -407,31 +407,124 @@ class RMSNorm2d(nn.Module):
 
 
 class GatedFusion(nn.Module):
-    def __init__(self, dim, reduction=4):
+    """Match reference features in a local neighborhood before fusion."""
+
+    def __init__(self, dim, reduction=4, window_size=7):
         super().__init__()
+        if not isinstance(window_size, int) or window_size < 1 or window_size % 2 == 0:
+            raise ValueError("GatedFusion window_size must be a positive odd integer")
+        self.dim = dim
+        self.window_size = window_size
+        self.radius = window_size // 2
+        self.kernel = window_size * window_size
+        self.query = nn.Conv2d(dim, dim, 1, bias=False)
+        self.key = nn.Conv2d(dim, dim, 1, bias=False)
+        self.value = nn.Conv2d(dim, dim, 1, bias=False)
+        self.message = nn.Conv2d(dim, dim, 1, bias=False)
         self.fuse_conv = nn.Conv2d(dim * 2, dim, 1, bias=False)
         self.norm = RMSNorm2d(dim)
+        self.message_norm = RMSNorm2d(dim)
         gate_hidden = max(dim // reduction, 8)
         self.gate = nn.Sequential(
-            nn.Conv2d(dim, gate_hidden, 1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(dim * 3 + 1, gate_hidden, 1),
+            nn.GELU(),
             nn.Conv2d(gate_hidden, dim, 1),
             nn.Sigmoid(),
         )
+        self.quality = nn.Sequential(
+            nn.Conv2d(dim * 3 + 1, gate_hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(gate_hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+        self.relative_bias = nn.Parameter(torch.zeros(self.kernel))
+        # A learnable temperature makes cosine matching selective enough for
+        # repeated textures while remaining adaptable to ambiguous references.
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
         nn.init.trunc_normal_(self.fuse_conv.weight, std=0.02)
-        nn.init.constant_(self.gate[2].bias, 0.0)
+        nn.init.constant_(self.gate[2].bias, -1.0)
+        nn.init.constant_(self.quality[2].bias, -1.0)
 
     def forward(self, lr_feat, ref_feat):
-        sim = F.cosine_similarity(lr_feat, ref_feat, dim=1).unsqueeze(1)
-        # ★ 修复：将 [-1, 1] 线性映射到 [0, 1]，避免 sigmoid 导致的过度抑制
-        conf = (sim + 1.0) / 2.0
-        fused = self.norm(self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1)))
-        return lr_feat + self.gate(fused) * conf * fused
+        b, _, h, w = lr_feat.shape
+        if ref_feat.shape != lr_feat.shape:
+            raise ValueError(
+                f"GatedFusion expects equal feature shapes, got "
+                f"{tuple(lr_feat.shape)} and {tuple(ref_feat.shape)}"
+            )
+
+        q = F.normalize(self.query(lr_feat), dim=1, eps=1e-6)
+        k = F.normalize(self.key(ref_feat), dim=1, eps=1e-6)
+        v = self.value(ref_feat)
+        kernel = self.kernel
+        k = F.unfold(k, self.window_size, padding=self.radius)
+        v = F.unfold(v, self.window_size, padding=self.radius)
+        k = k.view(b, self.dim, kernel, h, w).permute(0, 3, 4, 2, 1)
+        v = v.view(b, self.dim, kernel, h, w).permute(0, 3, 4, 2, 1)
+        q = q.permute(0, 2, 3, 1).unsqueeze(-2)
+        scale = self.logit_scale.float().exp().clamp(1.0, 100.0).to(q.dtype)
+        logits = (q * k).sum(dim=-1) * scale
+        logits = logits + self.relative_bias.view(1, 1, 1, kernel)
+        valid = F.unfold(
+            lr_feat.new_ones((b, 1, h, w)), self.window_size, padding=self.radius
+        )
+        valid = valid.view(b, kernel, h, w).permute(0, 2, 3, 1)
+        logits = logits.masked_fill(valid < 0.5, torch.finfo(logits.dtype).min)
+        attention = torch.softmax(logits, dim=-1)
+        matched = (attention.unsqueeze(-1) * v).sum(dim=-2)
+        matched = self.message_norm(self.message(matched.permute(0, 3, 1, 2)))
+
+        if kernel == 1:
+            match_conf = attention.new_ones((b, h, w))
+        else:
+            entropy = -(attention.clamp_min(1e-6) * attention.clamp_min(1e-6).log()).sum(-1)
+            match_conf = (1.0 - entropy / math.log(kernel)).clamp(0.0, 1.0)
+        match_conf = match_conf.unsqueeze(1)
+        context = torch.cat([lr_feat, ref_feat, matched, match_conf], dim=1)
+        direct = self.norm(self.fuse_conv(torch.cat([lr_feat, ref_feat], dim=1)))
+        # Direct fusion remains useful for aligned references and for SISR
+        # (where Ref is bicubic LR-up); confidence gates only the retrieved
+        # message, whose quality depends on a reliable local match.
+        return lr_feat + self.gate(context) * (
+            direct + self.quality(context) * match_conf * matched
+        )
 
 
-# ═══════════════════════════════════════════════════════════
-# 核心超分网络
-# ═══════════════════════════════════════════════════════════
+class GlobalLatentBlock(nn.Module):
+    """Full-image context block used after the U-Net bottleneck."""
+
+    def __init__(self, channels, num_heads=8, hidden_rate=2):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("GlobalLatentBlock channels must be divisible by num_heads")
+        hidden = max(channels * hidden_rate, channels)
+        self.norm1 = nn.LayerNorm(channels)
+        self.positional = nn.Conv2d(
+            channels, channels, 3, padding=1, groups=channels, bias=False
+        )
+        self.pos_scale = nn.Parameter(torch.full((channels,), 0.1))
+        self.attn = nn.MultiheadAttention(
+            channels, num_heads, dropout=0.0, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, channels),
+        )
+        self.gamma1 = nn.Parameter(torch.ones(channels))
+        self.gamma2 = nn.Parameter(torch.ones(channels))
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = x + self.pos_scale.view(1, c, 1, 1) * self.positional(x)
+        tokens = rearrange(x, "b c h w -> b (h w) c")
+        normalized = self.norm1(tokens)
+        attended = self.attn(normalized, normalized, normalized, need_weights=False)[0]
+        tokens = tokens + self.gamma1 * attended
+        tokens = tokens + self.gamma2 * self.ffn(self.norm2(tokens))
+        return rearrange(tokens, "b (h w) c -> b c h w", h=h, w=w)
+
 class RefSRWKV(nn.Module):
     def __init__(
         self,
@@ -519,6 +612,9 @@ class RefSRWKV(nn.Module):
         )
 
         self.ref_to_level1 = nn.Sequential(
+            nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
             nn.PixelUnshuffle(scale),
             nn.Conv2d(
                 ref_channels * (scale**2), dim, 1, bias=False
@@ -540,13 +636,13 @@ class RefSRWKV(nn.Module):
         )
 
         self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
-            GatedFusion(dim),
-            GatedFusion(dim * 2),
-            GatedFusion(dim * 4),
-            GatedFusion(dim * 8),
+            GatedFusion(dim, window_size=7),
+            GatedFusion(dim * 2, window_size=5),
+            GatedFusion(dim * 4, window_size=5),
+            GatedFusion(dim * 8, window_size=3),
         )
 
-        total_blocks = sum(num_blocks)
+        total_blocks = sum(num_blocks) * 2 + num_refinement_blocks
         dp_rates = [
             drop_path_rate * i / max(1, total_blocks - 1) for i in range(total_blocks)
         ]
@@ -605,26 +701,40 @@ class RefSRWKV(nn.Module):
             drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[3]],
         )
         dp_idx += num_blocks[3]
+        self.global_latent = nn.Sequential(
+            GlobalLatentBlock(dim * 8, num_heads=8, hidden_rate=2),
+            GlobalLatentBlock(dim * 8, num_heads=8, hidden_rate=2),
+        )
+        self.decoder_fuse3 = GatedFusion(dim * 4, window_size=5)
+        self.decoder_fuse2 = GatedFusion(dim * 2, window_size=5)
+        self.decoder_fuse1 = GatedFusion(dim, window_size=7)
 
         self.up4_3 = Upsample(dim * 8)
         self.reduce_chan_level3 = nn.Sequential(
             nn.Conv2d(dim * 8, dim * 4, 1, bias=False),
             RMSNorm2d(dim * 4),
         )
-        self.decoder_level3 = make_stage("dec3", dim * 4, num_blocks[2])
+        self.decoder_level3 = make_stage("dec3", dim * 4, num_blocks[2], drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[2]])
+        dp_idx += num_blocks[2]
         self.up3_2 = Upsample(dim * 4)
         self.reduce_chan_level2 = nn.Sequential(
             nn.Conv2d(dim * 4, dim * 2, 1, bias=False),
             RMSNorm2d(dim * 2),
         )
-        self.decoder_level2 = make_stage("dec2", dim * 2, num_blocks[1])
+        self.decoder_level2 = make_stage("dec2", dim * 2, num_blocks[1], drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[1]])
+        dp_idx += num_blocks[1]
         self.up2_1 = Upsample(dim * 2)
         self.reduce_chan_level1 = nn.Sequential(
             nn.Conv2d(dim * 2, dim, 1, bias=False), RMSNorm2d(dim)
         )
-        self.decoder_level1 = make_stage("dec1", dim, num_blocks[0])
+        self.decoder_level1 = make_stage("dec1", dim, num_blocks[0], drop_rates=dp_rates[dp_idx : dp_idx + num_blocks[0]])
+        dp_idx += num_blocks[0]
 
-        self.refinement = make_stage("refine", dim, num_refinement_blocks)
+        refine_rates = [
+            drop_path_rate * i / max(1, num_refinement_blocks - 1)
+            for i in range(num_refinement_blocks)
+        ]
+        self.refinement = make_stage("refine", dim, num_refinement_blocks, drop_rates=refine_rates)
 
         # The progressive head preserves the conventional x4 x2+x2 path.  The
         # direct head keeps all expensive activations on the LR grid and only
@@ -643,7 +753,7 @@ class RefSRWKV(nn.Module):
                             bias=False,
                         ),
                         nn.PixelShuffle(shuffle_factor),
-                        nn.ReLU(inplace=True),
+                        nn.GELU(),
                     ]
                 )
             self.up_final = (
@@ -761,15 +871,25 @@ class RefSRWKV(nn.Module):
         e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
         e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
         latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
+        latent = self.global_latent(latent)
 
         d3 = self.decoder_level3(
-            self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
+            self.decoder_fuse3(
+                self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1)),
+                ref_3,
+            )
         )
         d2 = self.decoder_level2(
-            self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
+            self.decoder_fuse2(
+                self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1)),
+                ref_2,
+            )
         )
         d1 = self.decoder_level1(
-            self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
+            self.decoder_fuse1(
+                self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1)),
+                ref_1,
+            )
         )
         d1 = self.refinement(d1)
 

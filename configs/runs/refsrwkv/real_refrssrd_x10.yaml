@@ -11,7 +11,7 @@ run:
   lr_patch: 48
 
 model:
-  upsampler: direct
+  upsampler: progressive
 
 data:
   augment_ref: true
