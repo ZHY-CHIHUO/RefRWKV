@@ -13,20 +13,18 @@ from engines.base_trainer import BaseTrainer
 from models.refsr import build_model as build_refsr_model
 from models.refsr.refsrwkv.model import RefSRWKV
 from runtime.common import gaussian_ssim
+from runtime.config import normalize_reference_mode, validate_refsr_reference_contract
 
 
 class RefSRWKVTrainer(BaseTrainer):
     """Train RefSRWKV with paired references or an LR-derived reference."""
 
     def __init__(self, model: RefSRWKV, config: Mapping[str, Any]) -> None:
+        validate_refsr_reference_contract(config)
         data = config.get("data", {})
         super().__init__(model, config, lr_key=str(data.get("lr_key", "lr")), hr_key=str(data.get("hr_key", "hr")))
         self.ref_key = str(data.get("ref_key", "ref"))
-        self.reference_mode = str(data.get("reference_mode", "paired")).lower()
-        if self.reference_mode in {"sisr", "lr", "lr_up", "bicubic_lr"}:
-            self.reference_mode = "lr_up"
-        if self.reference_mode not in {"paired", "lr_up"}:
-            raise ValueError("data.reference_mode must be paired or lr_up")
+        self.reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
         loss = config.get("loss", {})
         self.loss_name = str(loss.get("name", "l1")).lower()
         if self.loss_name == "l2":

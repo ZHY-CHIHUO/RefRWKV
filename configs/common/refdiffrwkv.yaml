@@ -1,4 +1,4 @@
-base: base.yaml
+base: refsr_paired.yaml
 
 task: refsr
 

@@ -1,5 +1,5 @@
 base:
-  - ../../common/refsrwkv.yaml
+  - ../../common/refsrwkv_paired.yaml
   - ../../models/refsr/refsrwkv.yaml
 
 dataset:

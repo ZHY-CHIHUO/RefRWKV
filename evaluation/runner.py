@@ -22,6 +22,7 @@ from models.refsr import build_model as build_refsr_model
 from models.sr import build_model as build_sr_model
 from runtime.checkpoint import load_checkpoint, load_model_weights
 from runtime.common import gaussian_ssim, per_image_psnr, resolve_path
+from runtime.config import normalize_reference_mode, validate_config
 from runtime.experiments import layout_from_config
 
 LOGGER = logging.getLogger(__name__)
@@ -67,6 +68,29 @@ def _reference_from_lr(lr: torch.Tensor, hr: torch.Tensor, scale: int) -> torch.
             f"LR/HR 尺寸不匹配: LR={tuple(lr.shape[-2:])}, HR={tuple(hr.shape[-2:])}, x{scale}"
         )
     return F.interpolate(lr, size=expected, mode="bicubic", align_corners=False)
+
+
+def _reference_for_refsr_batch(
+    batch: Mapping[str, Any],
+    *,
+    lr: torch.Tensor,
+    hr: torch.Tensor,
+    scale: int,
+    reference_mode: str,
+    ref_key: str,
+) -> torch.Tensor:
+    """Resolve the only valid reference source for one RefSR batch."""
+    if reference_mode == "lr_up":
+        return _reference_from_lr(lr, hr, scale)
+    ref = batch.get(ref_key)
+    if ref is None:
+        raise ValueError(
+            f"data.reference_mode=paired requires batch[{ref_key!r}]; "
+            "use a LR/HR/Ref dataset or select reference_mode=lr_up for RefSRWKV."
+        )
+    if not torch.is_tensor(ref):
+        raise TypeError(f"batch[{ref_key!r}] must be a tensor, got {type(ref).__name__}")
+    return ref
 
 
 def _image_tensor(value: torch.Tensor, *, value_range: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -135,10 +159,16 @@ def run_inference(
     if split not in VALID_SPLITS:
         raise ValueError("split 必须是 test、test_easy 或 test_hard")
     config = dict(config)
+    validate_config(config)
     task = str(config.get("task", "")).lower()
     model_name = str(config.get("model", {}).get("name", "")).lower()
     if task not in {"sr", "refsr"}:
         task = "refsr" if model_name in {"refsrwkv", "refdiffrwkv"} else "sr"
+    reference_mode = (
+        normalize_reference_mode(config["data"].get("reference_mode", "paired"))
+        if task == "refsr"
+        else None
+    )
     selected_device = select_device(config, device)
     checkpoint_obj = load_checkpoint(resolve_path(checkpoint, prefer_cwd=True))
 
@@ -176,15 +206,25 @@ def run_inference(
                 prediction = model(lr)
                 prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
             elif model_name != "refdiffrwkv":
-                ref = batch.get(config["data"].get("ref_key", "ref"))
-                if ref is None:
-                    ref = _reference_from_lr(lr, hr, scale)
+                ref = _reference_for_refsr_batch(
+                    batch,
+                    lr=lr,
+                    hr=hr,
+                    scale=scale,
+                    reference_mode=reference_mode,
+                    ref_key=config["data"].get("ref_key", "ref"),
+                )
                 prediction = model(lr, ref)
                 prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
             else:
-                ref = batch.get(config["data"].get("ref_key", "ref"))
-                if ref is None:
-                    ref = _reference_from_lr(lr, hr, scale)
+                ref = _reference_for_refsr_batch(
+                    batch,
+                    lr=lr,
+                    hr=hr,
+                    scale=scale,
+                    reference_mode=reference_mode,
+                    ref_key=config["data"].get("ref_key", "ref"),
+                )
                 prediction_png = generator.generate_sr(
                     lr,
                     ref,

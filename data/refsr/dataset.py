@@ -8,8 +8,7 @@ from PIL import Image, ImageEnhance
 
 
 class RefPNGDataset(Dataset):
-    """
-    PNG 参考超分配对数据集。
+    """PNG 真实参考图超分配对数据集。
 
     目录结构:
         data_dir/
@@ -37,7 +36,6 @@ class RefPNGDataset(Dataset):
         lr_key: str = "lr",
         hr_key: str = "hr",
         ref_key: str = "ref",
-        reference_mode: str = "paired",
     ):
         if ref_aug_strengths is None:
             ref_aug_strengths = [0.12, 0.12, 0.12, 0.03]
@@ -58,13 +56,7 @@ class RefPNGDataset(Dataset):
         self.data_dir = Path(data_dir)
         if mode not in {"train", "val", "test", "test_easy", "test_hard"}:
             raise ValueError(f"Unknown mode: {mode}")
-        reference_mode = str(reference_mode).lower()
-        if reference_mode in {"sisr", "lr", "lr_up", "bicubic_lr"}:
-            reference_mode = "lr_up"
-        if reference_mode not in {"paired", "lr_up"}:
-            raise ValueError("reference_mode must be paired or lr_up")
         self.mode = mode
-        self.reference_mode = reference_mode
         self.patch_size = patch_size
         self.scale = scale
         self.sample_seed = sample_seed
@@ -86,6 +78,10 @@ class RefPNGDataset(Dataset):
 
         if not self.lr_dir.exists():
             raise FileNotFoundError(f"LR directory not found: {self.lr_dir}")
+        if not self.hr_dir.exists():
+            raise FileNotFoundError(f"HR directory not found: {self.hr_dir}")
+        if not self.ref_dir.exists():
+            raise FileNotFoundError(f"Ref directory not found: {self.ref_dir}")
 
         all_names = sorted(
             [
@@ -113,10 +109,10 @@ class RefPNGDataset(Dataset):
         for name in self.filenames:
             if not (self.hr_dir / f"{name}.png").exists():
                 raise FileNotFoundError(f"Missing HR: {self.hr_dir / f'{name}.png'}")
-            if self.reference_mode == "paired" and not (self.ref_dir / f"{name}.png").exists():
+            if not (self.ref_dir / f"{name}.png").exists():
                 raise FileNotFoundError(f"Missing Ref: {self.ref_dir / f'{name}.png'}")
 
-        print(f"RefPNGDataset [{mode}]: {len(self.filenames)} paired samples")
+        print(f"RefPNGDataset [{mode}]: {len(self.filenames)} LR/HR/Ref triples")
         if patch_size is not None:
             print(
                 f"  Random crop: HR {patch_size}x{patch_size} "
@@ -257,15 +253,8 @@ class RefPNGDataset(Dataset):
         # The on-disk LR is a storage representation. Reuse it only at its
         # native geometry; derive all other scale grids from HR in memory.
         lr = self._lr_for_scale(lr, hr)
-        if self.reference_mode == "lr_up":
-            # Keep the SISR fallback in the dataset contract so RefSR models
-            # can train on datasets that contain only HR/LR pairs.
-            ref_pil = Image.fromarray(
-                np.clip((lr + 1.0) * 127.5, 0, 255).astype(np.uint8)
-            ).resize((hr.shape[1], hr.shape[0]), Image.Resampling.BICUBIC)
-        else:
-            ref_path = self.ref_dir / f"{name}.png"
-            ref_pil = Image.open(ref_path).convert("RGB")
+        ref_path = self.ref_dir / f"{name}.png"
+        ref_pil = Image.open(ref_path).convert("RGB")
         if self.augment_ref:
             ref_pil = self._augment_ref(ref_pil)
         ref = (np.array(ref_pil, dtype=np.float32) / 127.5) - 1.0

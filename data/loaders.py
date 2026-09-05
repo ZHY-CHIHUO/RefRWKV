@@ -11,6 +11,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from data.refsr import RefPNGDataset
 from data.sr import SRPNGDataset
 from runtime.common import resolve_path
+from runtime.config import normalize_reference_mode, validate_refsr_reference_contract
 
 
 def _max_samples(data: Mapping[str, Any]) -> tuple[Any, Any, Any]:
@@ -154,9 +155,10 @@ def build_sr_loaders(config: Mapping[str, Any]):
 
 def build_refsr_loaders(config: Mapping[str, Any]):
     """Build loaders for one or more paired or LR-derived RefSR datasets."""
+    validate_refsr_reference_contract(config)
     data = config["data"]
-    reference_mode = str(data.get("reference_mode", "paired")).lower()
-    dataset_cls = SRPNGDataset if reference_mode in {"lr", "lr_up", "sisr", "bicubic_lr"} else RefPNGDataset
+    reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
+    dataset_cls = SRPNGDataset if reference_mode == "lr_up" else RefPNGDataset
     common = {
         "scale": int(data["scale"]),
         "max_samples": _max_samples(data),
@@ -167,7 +169,6 @@ def build_refsr_loaders(config: Mapping[str, Any]):
     extra: dict[str, Any] = {}
     if dataset_cls is RefPNGDataset:
         extra = {
-            "reference_mode": "paired",
             "ref_key": data.get("ref_key", "ref"),
             "ref_aug_strengths": data.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
             "ref_aug_probs": data.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
@@ -257,14 +258,15 @@ def build_sr_test_loader(
 def build_refsr_test_loader(
     config: Mapping[str, Any], *, split: str = "test", batch_size: int | None = None
 ) -> DataLoader:
-    """Build a native-resolution paired-RefSR test loader.
+    """Build a native-resolution RefSR test loader.
 
     ``reference_mode=lr_up`` remains supported for SISR datasets used to
     train/evaluate RefSRWKV without a real reference image.
     """
+    validate_refsr_reference_contract(config)
     data = config["data"]
-    reference_mode = str(data.get("reference_mode", "paired")).lower()
-    dataset_cls = SRPNGDataset if reference_mode in {"lr", "lr_up", "sisr", "bicubic_lr"} else RefPNGDataset
+    reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
+    dataset_cls = SRPNGDataset if reference_mode == "lr_up" else RefPNGDataset
     roots = _dataset_roots(
         data,
         required_splits=(split,),
@@ -275,7 +277,6 @@ def build_refsr_test_loader(
         kwargs = dict(data_dir=root, **_test_dataset_kwargs(config, split))
         if dataset_cls is RefPNGDataset:
             kwargs.update(
-                reference_mode="paired",
                 ref_key=data.get("ref_key", "ref"),
                 ref_aug_strengths=data.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
                 ref_aug_probs=data.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),

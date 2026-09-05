@@ -3,13 +3,7 @@
 base: refsr.yaml
 
 data:
-  # ``paired`` reads Ref/; ``lr_up`` derives a bicubic reference at runtime.
-  reference_mode: paired
   augment: true
-  augment_ref: false
-  ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
-  ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
-  ref_gray_prob: 0.2
   batch_size: 4
   val_batch_size: 1
   num_workers: 8
@@ -46,4 +40,3 @@ loss:
   name: l1
   ssim_weight: 0.3
   fft_weight: 0.2
-  ref_drop_prob: 0.2

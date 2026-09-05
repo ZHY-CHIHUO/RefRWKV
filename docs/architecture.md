@@ -75,7 +75,9 @@ RefRWKV/
 
 ### RefSR
 
-`data/refsr/<dataset>/<split>/{HR,LR,Ref}` 是严格的三元组。`data.refsr.dataset.RefPNGDataset` 在 `reference_mode: paired` 下强制检查 `Ref`。在 AID 或 UC Merced 这类没有真实参考图的数据集上，可将 `reference_mode: lr_up`，运行时从当前 LR 生成 bicubic 参考，不会修改原始数据。
+`data/refsr/<dataset>/<split>/{HR,LR,Ref}` 是严格的三元组。`data.refsr.dataset.RefPNGDataset` 只负责这类真实三元组，并强制检查 `Ref`。在 AID 或 UC Merced 这类没有真实参考图的数据集上，RefSRWKV 应使用 `reference_mode: lr_up`；`data.loaders.build_refsr_loaders` 会改用 `SRPNGDataset`，运行时从当前 LR 生成 bicubic 参考，不会修改原始数据。
+
+配置也按该契约分层：`common/refsr.yaml` 和 `common/refsrwkv.yaml` 只放两个模式都可用的默认值；`common/refsr_paired.yaml`、`common/refsrwkv_paired.yaml` 才包含 `augment_ref`、颜色/灰度参考图增强和 `loss.ref_drop_prob`。`lr_up` 不允许出现这些字段，避免真实 Ref 增强配置被静默忽略。`RefDiffRWKV` 当前固定使用 `paired`，训练与采样都必须得到真实 `LR/HR/Ref` 三元组。
 
 ### scale
 
@@ -177,15 +179,15 @@ python scripts/evaluate.py \
 
 ## 添加数据集
 
-1. 按 SR 或 RefSR 契约准备 `train/val/test`（RefSR 还可以有 `test_easy/test_hard`）。
-2. 将实际数据放到 `data/sr/<id>` 或 `data/refsr/<id>`，原始压缩包放到 `data/raw` 或 `data/archives`。
+1. 按物理数据契约准备 `train/val/test`（真实 RefSR 还可以有 `test_easy/test_hard`）。`reference_mode: lr_up` 的 RefSRWKV 复用 SR 的 `HR/LR` 契约；`paired` 和 RefDiffRWKV 使用 `HR/LR/Ref` 三元组。
+2. 将 SR 数据和 `lr_up` RefSRWKV 要复用的数据放到 `data/sr/<id>`；只将真实参考图三元组放到 `data/refsr/<id>`。原始压缩包放到 `data/raw` 或 `data/archives`。
 3. 新增 `configs/datasets/{sr,refsr}/<id>.yaml`，填写 `root`、原始尺寸、scale 和 split 统计。
 4. 从一个现有 run YAML 复制出新实验，只修改 `dataset.config`、`run.name`、`run.scale` 和 patch/batch 差异。
 5. 先用 `--overrides data.max_samples_train=8 data.max_samples_val=2` 做 loader smoke test，再正式训练。
 
 ### 聚合多个数据集
 
-训练 loader 既可接收一个数据集根目录，也可接收任务根目录。若 `data.root` 指向 `data/sr`，会自动发现其下一层中满足 `train/{HR,LR}` 和 `val/{HR,LR}` 契约的所有数据集；`data.root: data/refsr` 对 RefSR 同理，并额外要求 `Ref/`。新增完整数据集后不需要改 loader 代码。
+训练 loader 既可接收一个数据集根目录，也可接收任务根目录。`data.root: data/sr` 会自动发现下一层中满足 `train/{HR,LR}` 和 `val/{HR,LR}` 契约的所有数据集，可供 SR 或 `lr_up` RefSRWKV 使用；`data.root: data/refsr` 仅用于 `paired` RefSR，额外要求 `Ref/`。新增完整数据集后不需要改 loader 代码。
 
 若只想组合部分数据集，配置中使用 `data.roots`：
 

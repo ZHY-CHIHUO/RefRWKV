@@ -14,6 +14,3 @@ data:
   reference_mode: lr_up
   val_batch_size: 1
   max_samples_val: 300
-
-loss:
-  ref_drop_prob: 0.0

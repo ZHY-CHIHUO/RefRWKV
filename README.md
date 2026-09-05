@@ -78,7 +78,9 @@ Stage 4 还需要 `vision_aided_loss`，其上游安装命令写在 `requirement
 
 命令行可以用 `--overrides model.dim=64 train.learning_rate=5e-5` 覆盖点路径字段。倍率在运行时从磁盘 LR 表示重采样，不默认生成 `cache/`，也不会修改 `data/`。
 
-`data.root` 可以是单个数据集（如 `data/sr/AID`），也可以是任务目录（如 `data/sr`）。后者会自动聚合下一层所有完整数据集；也可用 `data.roots=[...]` 明确指定组合。SR 只识别 `HR/LR`，RefSR 才识别 `HR/LR/Ref`。
+`data.root` 可以是单个数据集（如 `data/sr/AID`），也可以是任务目录（如 `data/sr`）。后者会自动聚合下一层所有完整数据集；也可用 `data.roots=[...]` 明确指定组合。普通 SR 始终只识别 `HR/LR`。RefSRWKV 使用 `data.reference_mode: lr_up` 时也走同一个 `HR/LR` loader，并从当前 LR 动态生成 bicubic 自参考；只有 `data.reference_mode: paired` 才读取 `HR/LR/Ref`。
+
+真实参考图专属字段只放在 `configs/common/refsr_paired.yaml` 和 `configs/common/refsrwkv_paired.yaml`：`augment_ref`、`ref_aug_strengths`、`ref_aug_probs`、`ref_gray_prob`、`loss.ref_drop_prob`。`lr_up` 运行配置不能设置它们，配置校验会直接报错，避免参数看似启用但实际无效。`RefDiffRWKV` 当前只支持 `paired`，因为它的训练和采样都需要真实 `Ref`。
 
 ## 训练
 

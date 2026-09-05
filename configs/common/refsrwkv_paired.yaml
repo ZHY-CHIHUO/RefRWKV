@@ -1,0 +1,9 @@
+# RefSRWKV defaults plus settings that require a physical paired reference.
+# Keep ``refsr_paired`` first: the latter supplies only the data contract,
+# while RefSRWKV's specialized optimizer/runtime defaults remain authoritative.
+base:
+  - refsr_paired.yaml
+  - refsrwkv.yaml
+
+loss:
+  ref_drop_prob: 0.2
