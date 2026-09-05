@@ -1,0 +1,18 @@
+base:
+  - ../../common/refsrwkv.yaml
+  - ../../models/refsr/refsrwkv.yaml
+
+dataset:
+  config: ../../datasets/refsr/hrms_scd.yaml
+
+run:
+  name: hrms_scd_x4
+  scale: 4
+  lr_patch: 48
+
+data:
+  reference_mode: paired
+  max_samples_val: 300
+
+train:
+  learning_rate: 0.000025

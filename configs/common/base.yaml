@@ -1,0 +1,49 @@
+# Repository-wide defaults.  Dataset facts, model architecture and run
+# budgets live in their own files under configs/datasets, configs/models and
+# configs/runs.
+
+data:
+  batch_size: 1
+  val_batch_size: 1
+  num_workers: 4
+  val_num_workers: 2
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  drop_last: true
+  max_samples_train: null
+  max_samples_val: null
+  max_samples_test: null
+  sample_seed: 42
+
+train:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  max_epochs: 1
+  max_steps: -1
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
+  accumulate_grad_batches: 1
+  log_every_n_steps: 20
+  num_sanity_val_steps: 0
+  grad_clip_norm: 1.0
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  adam_betas: [0.9, 0.999]
+  lr_scheduler: plateau
+  lr_patience: 3
+  lr_factor: 0.5
+  lr_threshold: 0.00001
+  lr_min: 0.0000001
+  use_ema: true
+  ema_decay: 0.999
+  save_top_k: 3
+  early_stopping_patience: null
+  auto_resume: true
+  seed: 42
+
+output:
+  root: experiments
+  train_root: experiments/train
+  test_root: experiments/test

@@ -1,0 +1,14 @@
+# Install a PyTorch build that matches the local CUDA driver first.  See
+# https://pytorch.org/get-started/locally/ for the correct index URL, then run:
+#   python -m pip install -r requirements.txt
+
+# Core SR / RefSRWKV training and native PSNR/SSIM evaluation.
+torch>=2.1
+torchvision>=0.16
+pytorch-lightning>=2.1
+numpy>=1.24
+Pillow>=10.0
+PyYAML>=6.0
+einops>=0.7
+tensorboard>=2.14
+tqdm>=4.66

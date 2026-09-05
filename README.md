@@ -1,286 +1,201 @@
-# RefRWKV — Reference-Guided Remote Sensing Super-Resolution
+# RefRWKV
 
-基于 RWKV + Stable Diffusion 2.1 的参考引导遥感图像超分辨率重建框架。SR Prior 在原生 LR 网格上运行，由物理超分倍率控制参考折叠和输出重建。
+RefRWKV 是一个参考图超分辨率（RefSR）和单图超分辨率（SR）实验仓库。代码、数据、权重、训练运行和测试结果按生命周期分开；新增模型只需要加入自己的模型目录、配置和入口注册，不需要复制数据加载或评估逻辑。
 
-## 核心链路
+完整的目录约定、数据契约、迁移说明和扩展规则见 [docs/architecture.md](docs/architecture.md)。
 
+## 目录
+
+```text
+RefRWKV/
+├── configs/                       # 分层 YAML 配置
+│   ├── common/                   # 全局、SR、RefSR、RefSRWKV、RefDiffRWKV 默认值
+│   ├── datasets/sr/              # 只有 HR/LR 的 SR 数据集配置
+│   ├── datasets/refsr/           # HR/LR/Ref 数据集配置
+│   ├── models/sr/                # SR 网络默认参数
+│   ├── models/refsr/              # RefSR 网络默认参数
+│   └── runs/                     # 可直接运行的实验配置
+├── data/
+│   ├── sr/                       # SR 数据：<dataset>/<split>/{HR,LR}
+│   ├── refsr/                    # RefSR 数据：<dataset>/<split>/{HR,LR,Ref}
+│   ├── raw/                      # 原始压缩包和解压内容
+│   └── archives/                 # RefSR 多卷压缩包等归档
+├── models/
+│   ├── sr/                       # SR registry 和模型实现（当前 SwinIR）
+│   └── refsr/
+│       ├── refsrwkv/             # 参考图超分 RWKV 模型
+│       └── RefDiffRWKV/          # 参考图扩散模型、适配器、G/D、采样器
+├── engines/                      # 训练生命周期
+│   ├── base_trainer.py           # optimizer、EMA、验证、checkpoint 等公共逻辑
+│   ├── sr/trainer.py             # SR 差异化 train/eval step
+│   └── refsr/                    # RefSRWKV 与 RefDiffRWKV engine
+├── runtime/                      # 配置、权重加载、实验路径和通用运行时工具
+├── evaluation/                   # 推理和指标写盘
+├── losses/                       # 可组合损失
+├── metrics/                      # PSNR、SSIM 等指标
+├── kernels/wkv/                  # WKV CUDA 源码
+├── scripts/
+│   ├── train/                    # sr.py、refsrwkv.py、refdiffrwkv.py
+│   ├── test/                     # sr.py、refsr.py
+│   ├── prepare/                  # 数据准备脚本
+│   └── evaluate.py               # 统一评估入口
+├── experiments/
+│   ├── train/                    # 每个 run 的 checkpoint、配置快照和日志
+│   └── test/                     # 每个 split 的图片和 metrics.json
+├── weights/
+│   ├── pretrained/               # 外部或迁移来的权重
+│   └── exports/                  # 明确导出的部署权重
+├── tests/                        # smoke/regression tests
+└── docs/                         # 架构和数据说明
 ```
-LR (H/scale × W/scale) ──→ RefSRWKV SR Prior ──→ SR image / SR latent ──┐
-Ref (H×W) ────────────────→ RWKV Adapter ──→ 多尺度残差 ────────────────┤
-               ──→ DINOv2 + RWKV Pyramid ──→ 语义 token ─────┤
-                                                              ├──→ SD2 UNet (8ch) ──→ VAE ──→ HR (H×W)
-              SR latent ──→ concat(noisy_latent) ─────────────┘
-```
 
-## 架构组件
-
-| 组件 | 作用 | 训练状态 |
-| --- | --- | --- |
-| SD2 UNet + LoRA | 扩散去噪骨干；conv_in 扩展为 8 通道（4 noisy + 4 SR latent） | 🔥 可训练 |
-| RWKV Adapter | 从 LR/Ref 提取多尺度特征注入 UNet | 🔥 可训练 |
-| DINOv2 + RWKV Semantic Pyramid | 全局语义提取，注入 cross-attention | DINOv2 ❄️ / Pyramid 🔥 |
-| **RefSRWKV SR Prior** | **直接超分，提供 SR latent 与结构先验** | **❄️ 冻结（四阶段）** / **🔥 独立训练** |
-| D_sem (ConvNeXt/OpenCLIP) | 语义判别器 | 🔥 可训练 (Stage 4) |
-| D_tex | 参考纹理一致性判别器（置信加权） | 🔥 可训练 (Stage 4) |
+`RefSRWKV` 和 `RefDiffRWKV` 都属于 `models/refsr/`。扩散模型可以通过 `model.sr.ckpt_path` 使用 RefSRWKV 或其他兼容 SR 网络作为先验；仓库不再设置 `prior/` 或 `diffusion/` 顶层目录。
 
 ## 环境
 
-- Python >= 3.10，PyTorch >= 2.1，CUDA >= 12.1
-- 依赖：diffusers transformers peft pytorch-lightning lpips pyiqa open_clip_torch vision_aided_loss pillow pyyaml tensorboard
-- RWKV WKV CUDA 算子通过 torch.utils.cpp_extension.load首次运行时 JIT 编译，无需手动 setup.py install（见 [WKV 后端](#wkv-后端)）。
+先按本机 CUDA 版本从 PyTorch 官网安装匹配的 `torch`/`torchvision`，再安装 SR 和 RefSRWKV 的核心依赖：
 
-## 数据准备
-
-PNG 数据按任务分成两个明确的加载契约：
-
-```
-# 单图超分：SR_data/SRDataset.py
-<sisr_data_dir>/
-├── train/{HR,LR}/*.png
-├── val/{HR,LR}/*.png
-└── test/{HR,LR}/*.png
-
-# 参考超分：RefSR_data/RefDataset.py
-<refsr_data_dir>/
-├── train/{HR,LR,Ref}/*.png
-├── val/{HR,LR,Ref}/*.png
-└── test/{HR,LR,Ref}/*.png
+```bash
+python -m pip install -r requirements.txt
 ```
 
-- 图像尺寸和倍率由配置决定：HRMS-SCD / UC Merced / AID 为 4×，Real-RefRSSRD 为 10×；文件名一一对应。
-- 当前本地数据尺寸：HRMS-SCD `512/128`、UC Merced `256/64`、AID `512/128`、Real-RefRSSRD `480/48`（HR/LR）。
-- 值域在数据集内部统一为 [-1, 1]。
-- 裁剪先采 LR 整数坐标再乘 scale 映射 HR（以及配对 Ref），保证严格对齐。
+RefDiffRWKV、离线 LPIPS/DISTS/SAM 指标额外安装：
 
-数据集说明：[`RefSR_data/HRMS_SCD/RefSR-HRMS.md`](RefSR_data/HRMS_SCD/RefSR-HRMS.md)、[`RefSR_data/ALL_2/Real-RefRSSRD.md`](RefSR_data/ALL_2/Real-RefRSSRD.md)、[`SR_data/remote_sensing/prepared/UC_Merced/介绍.md`](SR_data/remote_sensing/prepared/UC_Merced/介绍.md)、[`SR_data/remote_sensing/prepared/AID/介绍.md`](SR_data/remote_sensing/prepared/AID/介绍.md)。图像、压缩包和生成元数据均由 `.gitignore` 排除，GitHub 只保留这些说明和代码。
+```bash
+python -m pip install -r requirements-refdiff.txt
+```
 
-UC Merced 和 AID 是 SISR 数据，磁盘上仅保留 `HR/LR`；RefSRWKV 的 `reference_mode: lr_up` 在前向中从当前 LR 生成 bicubic 参考。HRMS-SCD 和 Real-RefRSSRD 保留真实配对 `Ref`，只能由严格的 `RefPNGDataset` 读取。
+Stage 4 还需要 `vision_aided_loss`，其上游安装命令写在 `requirements-refdiff.txt`。WKV CUDA 后端需要本机 CUDA toolkit/NVCC；模型导入和 `--help` 不会主动编译扩展。
+
+## 配置
+
+运行配置从四层合并：
+
+1. `configs/common/base.yaml`：设备、batch、优化器和输出根目录默认值。
+2. `configs/common/*.yaml`：SR、RefSRWKV、RefDiffRWKV 家族默认值。
+3. `configs/datasets/{sr,refsr}/*.yaml`：数据集路径、尺寸和 split。
+4. `configs/models/` 与 `configs/runs/`：网络参数和一次实验的倍率、patch、损失开关。
+
+命令行可以用 `--overrides model.dim=64 train.learning_rate=5e-5` 覆盖点路径字段。倍率在运行时从磁盘 LR 表示重采样，不默认生成 `cache/`，也不会修改 `data/`。
+
+`data.root` 可以是单个数据集（如 `data/sr/AID`），也可以是任务目录（如 `data/sr`）。后者会自动聚合下一层所有完整数据集；也可用 `data.roots=[...]` 明确指定组合。SR 只识别 `HR/LR`，RefSR 才识别 `HR/LR/Ref`。
 
 ## 训练
 
-### 配置结构（base + 覆盖）
-
-扩散阶段配置共用 `configs/base.yaml`。SR Prior 单独使用 `configs/sr_prior_base.yaml`，数据集元信息与训练实验分开维护：
-
-```
-configs/
-├── base.yaml                 # 扩散阶段公共默认
-├── sr_prior_base.yaml        # SR Prior 公共默认
-├── datasets/                 # 数据集基本信息和原始/准备后尺寸
-│   ├── aid.yaml
-│   ├── hrms_scd.yaml
-│   ├── real_refrssrd.yaml
-│   └── ucmerced.yaml
-├── runs/                     # SR Prior 原生 LR crop 和实验差异
-│   ├── aid_x4_l1.yaml
-│   ├── hrms_scd_x4.yaml
-│   ├── real_refrssrd_x10.yaml
-│   └── ucmerced_x4.yaml
-├── baselines/                # 统一 SISR baseline 协议
-│   ├── base.yaml
-│   ├── models/swinir_m.yaml
-│   └── runs/aid_x4_swinir_m_l1.yaml
-├── stage1_baseline.yaml      # Stage 1 覆盖
-├── stage2_semantic.yaml      # Stage 2 覆盖
-├── stage3_texture.yaml       # Stage 3 覆盖
-├── stage4_gan.yaml           # Stage 4 覆盖
-└── ablation/
-    └── b_sd2_noref.yaml      # 消融 B：无参考（示例预置）
-```
-
-启动时打印「模块激活摘要」日志，开关与 loss 系数一目了然（消融对账用）。
-
-### 四阶段课程
-
-| Stage | 配置 | 新开启模块 | loss 系数 | lr / 精度 |
-| --- | --- | --- | --- | --- |
-| 1 | stage1_baseline.yaml | —（扩散基线） | sr_noise=0.5 | 1e-5 / fp32 |
-| 2 | stage2_semantic.yaml | 语义金字塔 + SR 条件 | sr_noise=1.0 | 1e-5 / bf16 |
-| 3 | stage3_texture.yaml | SelfSim + 置信/时序门控 | diff_sr=0.3, lpips=0.5, sr_noise=0(warmdown) | 5e-6 / bf16 |
-| 4 | stage4_gan.yaml | D_sem/D_tex + Swap + D_tex 加权 | +gan=0.02, gan_tex=0.05 | 1e-6 / fp32 |
-
-### SR Prior 独立训练
-
-RefSRWKV 在原生 LR 网格上训练：每个 run 定义 `run.scale` 和
-`run.lr_patch`，HR crop 自动为 `lr_patch * scale`。U-Net 不会把全图缩回训练
-尺寸；Ref 使用 `PixelUnshuffle(scale)` 折叠，残差在 `LR * scale` 网格重建，
-验证与测试保留原生全图尺寸。
-
-| 数据集 | 配置 | 存储 HR/LR | 训练 HR/LR | 倍率 | 输出头 |
-| --- | --- | ---: | ---: | ---: | --- |
-| HRMS-SCD | `configs/runs/hrms_scd_x4.yaml` | 512/128 | 192/48 | 4× | progressive |
-| Real-RefRSSRD | `configs/runs/real_refrssrd_x10.yaml` | 480/48 | 480/48 | 10× | direct |
-| UC Merced | `configs/runs/ucmerced_x4.yaml` | 256/64 | 192/48 | 4× | progressive |
-| AID | `configs/runs/aid_x4_l1.yaml` | 512/128 | 192/48 | 4× | progressive |
-
-启动 AID x4 从头训练：
+SR（SwinIR-M，AID x4）：
 
 ```bash
-conda run -n rwkv7 python scripts/train_sr_prior.py \
-  --config configs/runs/aid_x4_l1.yaml
+python scripts/train/sr.py \
+  --config configs/runs/sr/swinir/aid_x4.yaml
 ```
 
-数据集 YAML 只记录数据集事实和路径；run YAML 记录倍率、LR crop、损失和与默认值不同的训练参数。AID 使用纯 L1 和 50,000 optimizer steps。验证使用固定数量的原生全图；`val_check_interval: 1.0` 配合 `check_val_every_n_epoch: 10` 表示每 10 个 epoch 在 epoch 末验证一次（不能把 `val_check_interval` 写成整数 10，那表示每 10 个训练 batch）。已统一为同一尺寸的数据集可以增大 `val_batch_size`，混合尺寸数据集则保持 1。EMA、`ReduceLROnPlateau`、checkpoint 和 early stopping 全部读取聚合后的全图 `val_loss`。
-
-`configs/sr_prior_base.yaml` 的窗口为 `8/[0,4]`（level1/2）、`4/[0,2]`（level3）和 `3/[0,1]`（latent）。卷积与参考分支采用逐像素通道 RMSNorm，`GatedFusion` 采用逐像素 1x1 gate；`model.color_match: global|none` 控制唯一可选的全图 Ref 颜色统计。详见 [RefSRWKV.md](RefSRWKV.md)。
-
-### SISR Baseline 对比
-
-`baselines/` 只承载 HR/LR 单图超分模型，当前已接入 SwinIR-M。所有 baseline 共用 `SRPNGDataset`、`[-1,1]` 值域、L1/EMA、按实际验证次数更新的 Plateau scheduler、checkpoint 命名和 JSON 评测结果；后续 RCAN、EDSR 等模型只需新增一个 adapter 并添加模型 YAML，不应另写数据加载或指标脚本。
-
-从头训练 AID x4 SwinIR-M：
+RefSRWKV：
 
 ```bash
-conda run -n rwkv7 python scripts/train_baseline.py \
-  --config configs/baselines/runs/aid_x4_swinir_m_l1.yaml
+python scripts/train/refsrwkv.py \
+  --config configs/runs/refsrwkv/hrms_scd_x4.yaml
 ```
 
-使用最佳或 `last.ckpt` 在 AID test 全图评测（默认 EMA），同时输出 bicubic、PSNR、SSIM、模型前向耗时和峰值显存：
+RefDiffRWKV：
 
 ```bash
-conda run -n rwkv7 python scripts/eval_baseline.py \
-  --checkpoint checkpoints/baselines/aid_x4_swinir_m_l1/last.ckpt \
-  --split test --batch-size 1
+python scripts/train/refdiffrwkv.py \
+  --config configs/runs/refdiffrwkv/stage1.yaml
 ```
 
-评测 JSON 默认写入 `results/baselines/`。该目录、日志和 checkpoint 均被忽略；run YAML 与数据集 Markdown 是可复现实验并提交 GitHub 的来源。
+训练目录统一为：
 
-### 关键开关速查
+```text
+experiments/train/<task>/<model>/<dataset>/x<scale>/<run>/
+├── checkpoints/                  # last.ckpt、top-k checkpoint
+├── logs/                         # TensorBoard event 和训练日志
+├── config.json                   # 本次 materialized 配置
+└── config.yaml                   # 可读配置快照
+```
 
-| 开关 | 默认 | 作用 |
-| --- | --- | --- |
-| model.use_reference | true | false = 无参考消融（LR 上采样作中性自参考） |
-| model.use_semantic | false | DINOv2 + RWKV 语义金字塔 |
-| model.use_sr_condition | false | 语义金字塔的 SR latent 条件分支 |
-| model.rwkv_cfg.use_self_sim_transfer | false | SR 自相似纹理迁移 |
-| model.use_confidence_gate / use_temporal_gate | false | 置信 / 时序门控 |
-| model.use_discriminator / gan_enabled | false | 双判别器 / GAN loss |
-| model.use_swap_test / dtex_conf_weight | false | Swap Test / D_tex 置信加权 |
-| model.wkv_backend | torch | 语义 WKV 后端（torch 默认，见下文） |
-
-| 系数 | 默认 | 说明 |
-| --- | --- | --- |
-| lambda_diff_sr | 0 | 像素/Latent 重建（Stage 3: 0.3） |
-| lambda_lpips | 0 | 感知损失（Stage 3: 0.5） |
-| lambda_gan / lambda_gan_texture | 0 | GAN 语义/纹理（Stage 4: 0.02 / 0.05） |
-| lambda_sr_noise | 1.0 | SR 路径 ε 噪声权重 |
-
-### 消融实验
-
-论文消融矩阵与命令对照（相邻行差值 = 该模块贡献）：
-
-| 实验 | 构成 | 命令 |
-| --- | --- | --- |
-| A | 仅 RWKV SR | `python scripts/train_sr_prior.py --config configs/runs/hrms_scd_x4.yaml` |
-| B | +SD2 先验（无参考） | `python scripts/train_sd2_gan.py --config configs/ablation/b_sd2_noref.yaml` |
-| C | +参考图 | `python scripts/train_sd2_gan.py --config configs/stage1_baseline.yaml` |
-| D | +语义金字塔 | `python scripts/train_sd2_gan.py --config configs/stage2_semantic.yaml` |
-| E | +GAN（完整） | `python scripts/train_sd2_gan.py --config configs/stage4_gan.yaml` |
-
-子模块消融无需新配置，用 `--overrides` 即可（键支持点分路径）：
+查看所有训练日志：
 
 ```bash
-# 纹理消融：关 SelfSim
-python scripts/train_sd2_gan.py --config configs/stage3_texture.yaml \
-    --overrides model.rwkv_cfg.use_self_sim_transfer=false output.experiment_name=ab_no_selfsim
-
-# 语义消融：关语义 + 关 LPIPS
-python scripts/train_sd2_gan.py --config configs/stage4_gan.yaml \
-    --overrides model.use_semantic=false model.lambda_lpips=0 output.experiment_name=ab_no_sem
+tensorboard --logdir experiments/train
 ```
 
-恢复优先级：`--resume` > 配置 `resume_ckpt` > 实验目录 `last.ckpt` 自动检测 > 从头训练。跨阶段结构变化（如新增 semantic / discriminator）会自动回退为仅加载模型权重、optimizer 重新初始化。
+## 测试与评估
 
-## 评估
+SR：
 
 ```bash
-python evaluation/eval_pyiqa.py \
-    --pred results/output/ --gt <data_dir>/test/HR/ \
-    --fr_metrics psnr ssim lpips dists
+python scripts/test/sr.py \
+  --config configs/runs/sr/swinir/aid_x4.yaml \
+  --checkpoint experiments/train/sr/swinir/aid/x4/aid_x4/checkpoints/last.ckpt \
+  --split test
 ```
 
-**SR Prior 独立评估（val 集）：**
+RefSRWKV 或 RefDiffRWKV：
 
 ```bash
-python evaluation/eval_pyiqa.py \
-    --pred results/refrwkv_val/ \
-    --gt RefSR_data/ALL_2/val/HR/ \
-    --fr_metrics psnr ssim lpips
+python scripts/test/refsr.py \
+  --config configs/runs/refsrwkv/hrms_scd_x4.yaml \
+  --checkpoint experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_x4/checkpoints/last.ckpt \
+  --split test
 ```
 
-指标方向：PSNR / SSIM ↑ 越高越好；LPIPS / DISTS ↓ 越低越好。
+也可以使用统一入口 `python scripts/evaluate.py ...`。测试输出为：
 
-## WKV 后端
-
-项目存在两类 WKV 语义，需区分：
-
-1. **空间 RWKV**（SR Prior / Adapter）：`models/RefSRWKV.py` 与 `models/RefDiffRWKV/RefDiffRWKV.py` 的 `VRWKV_SpatialMix` 直接调用 CUDA `bi_wkv` 算子，按 H→W 与 W→H 两种二维顺序各做一次（recurrence=2）。
-2. **语义 RWKV**（Semantic Pyramid）：`globalsemanticmodule.py` 默认使用纯 PyTorch 分块实现（`wkv_backend="torch"`），通过「正向扫描 + 反向扫描取平均」实现双向。
-
-**语义模块是否切回 CUDA？** 默认保持 torch，原因：
-
-- 语义的 torch 实现是标准 RWKV-4 因果扫描（fp32、分块、数值护栏），语义明确、可复现、CPU 可运行；
-- CUDA `bi_wkv` 算子是另一种单遍双向公式（同时累计过去 + 未来 + 当前 token），与 torch 的「两次单向取平均」数值不等价；
-- 二者若混用会改变语义金字塔输出，进而改变 Stage 2+ 的训练轨迹。
-
-如需使用 CUDA 后端，可在配置中显式 `wkv_backend: cuda`，但必须先做数值对齐验证（对比 torch 与 CUDA 的 forward/backward），确认通过后方可用于正式训练。
-
-## 项目结构
-
-```
-RefRWKV/
-├── configs/            # base + 四阶段 + sr_prior + ablation/
-├── models/
-│   ├── RefSRWKV.py     # SR Prior（含 WKV CUDA 延迟加载）
-│   ├── cuda/           # bi_wkv.cpp / bi_wkv_kernel.cu
-│   └── RefDiffRWKV/    # generator / adapter / semantic / discriminator / gan system / sampler
-├── scripts/            # train_sd2_gan.py / train_sr_prior.py / test.py
-├── baselines/          # SISR registry、SwinIR adapter、共享训练工具
-├── evaluation/         # eval_pyiqa.py / eval_sewar.py
-├── RefSR_data/         # RefDataset.py（严格 HR/LR/Ref loader）
-├── SR_data/            # SRDataset.py（HR/LR loader；仅提交代码和说明）
-└── checkpoints/        # 模型权重
+```text
+experiments/test/<task>/<model>/<dataset>/x<scale>/<run>/<split>/
+├── images/                        # 预测 PNG
+└── metrics.json                   # PSNR/SSIM 和样本信息
 ```
 
-## 训练监控指标
+`test` 是推荐的测试目录名；RefSR-HRMS 的 `test_easy`、`test_hard` 是数据集 split，仍然写在同一个实验目录下面。
 
-TensorBoard 指标一览（logs/sd2_ref_gan/）：
+## 权重和日志放置规则
 
-| 指标 | 含义 |
-| --- | --- |
-| train/G_total | G 总 loss |
-| train/G_diff_hr | 扩散 ε-prediction（HR 路径） |
-| train/G_diff_sr | 像素/Latent 重建 loss（lambda_diff_sr > 0 时） |
-| train/G_lpips | 感知 loss（lambda_lpips > 0 时，降频计算） |
-| train/G_gan | GAN loss（gan_enabled 时） |
-| train/D_sem / train/D_tex | 判别器 loss（Stage 4） |
-| train/D_tex_conf | D_tex 置信均值（健康区间 0.4~0.6） |
-| val/psnr / val/ssim / val/lpips | 验证指标（LPIPS 越低越好） |
+- 外部预训练模型或迁移的旧 checkpoint 放 `weights/pretrained/`。
+- 训练过程产生的 `last.ckpt`、最佳 checkpoint 和 TensorBoard 日志放 `experiments/train/.../`，不会放在 `weights/` 根目录。
+- 明确导出的部署权重放 `weights/exports/`。
+- 推理图片和指标只放 `experiments/test/.../`，不再使用 `results/`。
 
-早停与最佳模型监控：lambda_lpips > 0 且 fr_metrics 含 lpips 时监控 val/lpips（min），否则监控 val/psnr（max）。
+`runtime.checkpoint.load_model_weights` 兼容裸 `state_dict`、Lightning checkpoint、EMA state 和旧 checkpoint 外层前缀，因此可以用迁移后的权重热加载；新实验建议显式指定 `--load-weights` 或 `model.sr.ckpt_path`。
 
-## 数据增强
+## 数据准备
 
-- 空间增强（同步作用于 LR/HR/Ref）：随机水平/垂直翻转 + 90° 旋转（仅训练）。
-- 参考图风格增强（仅 Ref）：随机灰度化（ref_gray_prob）、亮度/对比度/饱和度/色相扰动（ref_aug_strengths / ref_aug_probs），提升对参考图光照差异的鲁棒性。
+SR 数据必须满足：
 
-## 故障排查
+```text
+data/sr/<dataset>/<split>/{HR,LR}/<same-name>.png
+```
 
-| 症状 | 可能原因 | 处理 |
-| --- | --- | --- |
-| 启动报 SR 权重无处加载 | sr.ckpt_path 不存在且无 resume_ckpt | 检查对应数据集配置的 `output.checkpoint_dir`，或用 `--overrides model.sr.ckpt_path=...` 指定权重 |
-| 首次运行 JIT 编译失败 | CUDA/NVCC 版本与 GPU 不匹配 | Blackwell(sm_120) 需 CUDA >= 12.8 |
-| semantic_pyramid 权重跳过 | WKV 公式与 checkpoint 不一致 | 属预期（公式变更），日志会提示 |
-| 训练中断恢复 | — | 重交同一命令，last.ckpt 自动断点续训 |
-| Stage 4 D_tex_conf 长期 < 0.2 | 数据对齐或参考增强过强 | ref_aug_probs 全 0 跑 100 步对比 |
-| Stage 3 LPIPS 上升 | 纹理传播过强 | self_sim_init_alpha 降到 0.15 |
+RefSR 数据必须满足：
 
-## 已知限制
+```text
+data/refsr/<dataset>/<split>/{HR,LR,Ref}/<same-name>.png
+```
 
-- 当前 SR Prior 配置提供 4×（HRMS-SCD、UC Merced、AID）和 10×（Real-RefRSSRD）示例；新倍率需要对应倍率生成的 LR/HR PNG 配对，并由 `run.scale` 与 `run.lr_patch` 定义训练契约。
-- CUDA WKV 算子需要 CUDA/NVCC，不支持纯 CPU 推理（空间 RWKV 路径）。
-- SelfSimTransfer 全局 affinity 为 O(N²)，高分辨率下需注意显存（Stage 3/4 开启）。
-- 数据加载器暂不支持断点续训的 epoch 内恢复（中断后重新遍历）。
-- 评估暂未集成遥感专用指标（SAM / ERGAS）。
+AID、UC Merced 的合成 SR 数据可由以下脚本生成：
 
-训练、评估和数据集的现行入口以本 README、`RefSRWKV.md`、配置文件及数据集目录内的说明为准。
+```bash
+python scripts/prepare/remote_sensing.py \
+  --dataset aid \
+  --source-dir data/raw/sr/aid_extracted/AID \
+  --output-dir data/sr/AID
+```
+
+将 `--dataset aid` 换成 `ucmerced` 并指定对应原始目录即可。数据说明分别位于 `data/sr/AID/介绍.md`、`data/sr/UC_Merced/介绍.md`、`data/refsr/HRMS_SCD/RefSR-HRMS.md` 和 `data/refsr/Real-RefRSSRD/Real-RefRSSRD.md`。
+
+## 添加模型
+
+新增 SR 模型时，在 `models/sr/<model>/` 放网络和 adapter，并在 adapter 中调用 `register_adapter(...)`；新增一个 `configs/models/sr/<model>.yaml` 和 `configs/runs/sr/<model>/...yaml` 即可复用现有数据、训练和评估流程。
+
+新增 RefSR 模型时，在 `models/refsr/<ModelName>/` 放模型代码，在 `engines/refsr/` 增加只包含模型特有 step 的 engine，并添加对应 run 配置。公共 checkpoint、EMA、TensorBoard、scheduler 和 early stopping 逻辑应继续放在 `engines/base_trainer.py`。
+
+模型目录不能直接依赖另一个具体模型目录的私有实现；跨模型复用的训练和运行时能力放在 `engines/`、`runtime/`、`losses/`、`metrics/`，WKV CUDA 代码放 `kernels/wkv/`。
+
+## 验证
+
+```bash
+python3 -m compileall -q data engines models runtime scripts evaluation metrics losses tests
+python tests/smoke_native_geometry.py --only x4
+```
+
+第一个命令不需要导入完整训练依赖即可检查语法；第二个命令需要 CUDA、编译器和 WKV 扩展。

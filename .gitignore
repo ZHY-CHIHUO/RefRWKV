@@ -1,67 +1,61 @@
-# ===== Python =====
+# Python and build products
 __pycache__/
 *.py[cod]
 *.so
 *.egg-info/
-dist/
 build/
+dist/
+.pytest_cache/
+.ruff_cache/
 
-# ===== 数据集 =====
-# Keep dataset documentation and loader code in Git.  Image data, archives,
-# manifests, and generated metadata remain local only.
-/SR_data/**
-!/SR_data/**/
-!/SR_data/__init__.py
-!/SR_data/SRDataset.py
-!/SR_data/**/*.md
+# Local datasets: keep loaders and Markdown notes, ignore downloaded/generated data.
+/data/raw/
+/data/archives/
+/data/**/[Hh][Rr]/*.png
+/data/**/[Hh][Rr]/*.jpg
+/data/**/[Hh][Rr]/*.jpeg
+/data/**/[Hh][Rr]/*.tif
+/data/**/[Hh][Rr]/*.tiff
+/data/**/[Ll][Rr]/*.png
+/data/**/[Ll][Rr]/*.jpg
+/data/**/[Ll][Rr]/*.jpeg
+/data/**/[Ll][Rr]/*.tif
+/data/**/[Ll][Rr]/*.tiff
+/data/**/[Rr][Ee][Ff]/*.png
+/data/**/[Rr][Ee][Ff]/*.jpg
+/data/**/[Rr][Ee][Ff]/*.jpeg
+/data/**/[Rr][Ee][Ff]/*.tif
+/data/**/[Rr][Ee][Ff]/*.tiff
+/data/**/*.png
+/data/**/*.jpg
+/data/**/*.jpeg
+/data/**/*.tif
+/data/**/*.tiff
+/data/**/*.npy
+/data/**/manifest.jsonl
+/data/**/metadata.json
 
-/RefSR_data/ALL_2/**
-!/RefSR_data/ALL_2/**/
-!/RefSR_data/ALL_2/**/*.md
-RefSR_data/ALL_2_zip/
-RefSR_data/CUFED/
-RefSR_data/CUFED5/
-/RefSR_data/HRMS_SCD/**
-!/RefSR_data/HRMS_SCD/**/
-!/RefSR_data/HRMS_SCD/**/*.md
+# Model weights and run outputs are local artifacts.
+/weights/*
+!/weights/.gitkeep
+!/weights/README.md
+/experiments/*
+!/experiments/.gitkeep
 
-# ===== 模型权重 (太大,不上传) =====
-checkpoints/
-*.ckpt
-*.pth
-*.pt
-*.safetensors
+# Optional derived LR cache. Native loaders derive non-storage scales in RAM,
+# so this remains empty unless an experiment explicitly enables a cache.
+/cache/
 
-# ===== 训练日志 =====
-logs/
-
-# ===== 配置 & 脚本 (按需隐藏) =====
-# configs/
-scripts/*
-!scripts/train_sd2_gan.py
-!scripts/train_sr_prior.py
-!scripts/prepare_remote_sensing.py
-!scripts/train_baseline.py
-!scripts/eval_baseline.py
-
-# ===== 结果文件 (按需保留，如果不需要可取消注释) =====
-results/
-
-# ===== CUDA 编译产物 =====
+# CUDA and native compilation products
 *.o
 *.out
 *.ptx
 *.cu.o
 
-# ===== 环境变量 =====
+# Local environment and IDE files
 .env
 .env.local
-
-# ===== IDE =====
 .vscode/
 .idea/
-
-# ===== 系统 =====
 .DS_Store
 Thumbs.db
-!scripts/eval_four_settings.py

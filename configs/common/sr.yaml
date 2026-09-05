@@ -1,0 +1,28 @@
+base: base.yaml
+
+task: sr
+
+loss:
+  name: l1
+  eps: 0.001
+
+data:
+  augment: true
+  reference_mode: none
+  batch_size: 16
+  val_batch_size: 1
+  num_workers: 8
+  val_num_workers: 2
+  prefetch_factor: 4
+
+train:
+  precision: bf16-mixed
+  max_epochs: -1
+  max_steps: 50000
+  accumulate_grad_batches: 2
+  check_val_every_n_epoch: 10
+  log_every_n_steps: 50
+  num_sanity_val_steps: 0
+
+model:
+  name: swinir

@@ -1,0 +1,34 @@
+base:
+  - ../../common/refdiffrwkv.yaml
+  - ../../models/refsr/refdiffrwkv.yaml
+
+dataset:
+  config: ../../datasets/refsr/real_refrssrd.yaml
+
+run:
+  name: stage4
+  scale: 10
+
+model:
+  use_semantic: true
+  use_sr_condition: true
+  use_confidence_gate: true
+  use_temporal_gate: true
+  use_discriminator: true
+  gan_enabled: true
+  use_swap_test: true
+  dtex_conf_weight: true
+  rwkv_cfg:
+    use_self_sim_transfer: true
+    self_sim_topk: 8
+    self_sim_init_alpha: 0.3
+
+loss:
+  lambda_diff_sr: 0.3
+  lambda_lpips: 0.5
+  lambda_gan: 0.02
+  lambda_gan_texture: 0.05
+  lambda_sr_noise: 0.0
+
+train:
+  resume_ckpt: null

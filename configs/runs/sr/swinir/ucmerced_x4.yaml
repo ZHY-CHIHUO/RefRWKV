@@ -1,0 +1,14 @@
+base:
+  - ../../../common/sr.yaml
+  - ../../../models/sr/swinir_m.yaml
+
+dataset:
+  config: ../../../datasets/sr/ucmerced.yaml
+
+run:
+  name: ucmerced_x4
+  scale: 4
+  lr_patch: 48
+
+data:
+  max_samples_val: 300

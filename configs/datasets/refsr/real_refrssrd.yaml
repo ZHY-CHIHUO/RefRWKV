@@ -1,0 +1,9 @@
+dataset:
+  id: real_refrssrd
+  name: Real-RefRSSRD
+  kind: paired_reference
+  root: data/refsr/Real-RefRSSRD
+  default_scale: 10
+  source: {hr_size: [480, 480], lr_size: [48, 48], ref_size: [480, 480], channels: 3}
+  prepared: {hr_size: [480, 480], lr_size: [48, 48], ref_size: [480, 480], scale: 10, splits: {train: 74093, val: 172, test: 1456}}
+  reference_policy: historical NAIP reference image

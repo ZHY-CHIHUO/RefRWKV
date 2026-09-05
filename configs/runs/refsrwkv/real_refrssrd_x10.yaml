@@ -1,0 +1,22 @@
+base:
+  - ../../common/refsrwkv.yaml
+  - ../../models/refsr/refsrwkv.yaml
+
+dataset:
+  config: ../../datasets/refsr/real_refrssrd.yaml
+
+run:
+  name: real_refrssrd_x10
+  scale: 10
+  lr_patch: 48
+
+model:
+  upsampler: direct
+
+data:
+  augment_ref: true
+
+train:
+  max_epochs: 200
+  learning_rate: 0.00005
+  early_stopping_patience: 30

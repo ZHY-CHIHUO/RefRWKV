@@ -1,0 +1,25 @@
+base:
+  - ../../common/refdiffrwkv.yaml
+  - ../../models/refsr/refdiffrwkv.yaml
+
+dataset:
+  config: ../../datasets/refsr/real_refrssrd.yaml
+
+run:
+  name: stage1
+  scale: 10
+
+model:
+  use_semantic: false
+  use_sr_condition: false
+  use_discriminator: false
+  gan_enabled: false
+  sr:
+    ckpt_path: null
+
+loss:
+  lambda_sr_noise: 0.5
+  lambda_diff_sr: 0.5
+
+train:
+  resume_ckpt: null

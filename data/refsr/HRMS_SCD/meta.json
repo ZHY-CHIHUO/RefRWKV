@@ -1,0 +1,40 @@
+{
+  "source": "HRMS-SCD",
+  "scale": 4,
+  "hr_size": [
+    512,
+    512
+  ],
+  "lr_size": [
+    128,
+    128
+  ],
+  "ref_size": [
+    512,
+    512
+  ],
+  "degradation": "bicubic",
+  "bidirectional": true,
+  "splits": {
+    "train": {
+      "scenes": 9529,
+      "samples": 19058,
+      "avg_change_ratio": 0.1210033317867763
+    },
+    "val": {
+      "scenes": 1058,
+      "samples": 1058,
+      "avg_change_ratio": 0.003998228192104059
+    },
+    "test_easy": {
+      "scenes": 500,
+      "samples": 500,
+      "avg_change_ratio": 0.008945281982421876
+    },
+    "test_hard": {
+      "scenes": 500,
+      "samples": 500,
+      "avg_change_ratio": 0.2916398391723633
+    }
+  }
+}

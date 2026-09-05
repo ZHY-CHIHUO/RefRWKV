@@ -1,0 +1,22 @@
+base:
+  - ../../common/refsrwkv.yaml
+  - ../../models/refsr/refsrwkv.yaml
+
+dataset:
+  config: ../../datasets/sr/aid.yaml
+
+run:
+  name: aid_x4
+  scale: 4
+  lr_patch: 48
+
+data:
+  reference_mode: lr_up
+  batch_size: 16
+  val_batch_size: 1
+  max_samples_val: 300
+
+loss:
+  ssim_weight: 0.0
+  fft_weight: 0.0
+  ref_drop_prob: 0.0

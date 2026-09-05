@@ -1,0 +1,27 @@
+base: base.yaml
+
+task: refsr
+
+data:
+  reference_mode: paired
+  augment: true
+  augment_ref: false
+  ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
+  ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
+  ref_gray_prob: 0.2
+  batch_size: 4
+  val_batch_size: 1
+  num_workers: 8
+  val_num_workers: 2
+  prefetch_factor: 4
+
+train:
+  precision: bf16-mixed
+  max_epochs: -1
+  max_steps: 50000
+  accumulate_grad_batches: 2
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 20
+
+loss:
+  name: l1

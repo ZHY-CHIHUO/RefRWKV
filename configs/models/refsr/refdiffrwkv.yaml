@@ -1,0 +1,7 @@
+# The diffusion implementation is a RefSR model family.  It may consume the
+# RefSRWKV checkpoint through model.sr.ckpt_path, but has no separate prior/
+# diffusion top-level namespace.
+base: ../../common/refdiffrwkv.yaml
+
+model:
+  family: refsr

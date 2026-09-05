@@ -1,0 +1,16 @@
+# Optional dependencies for RefDiffRWKV and offline perceptual/remote-sensing
+# metrics.  Install the core environment first.
+-r requirements.txt
+
+diffusers>=0.27
+transformers>=4.38
+accelerate>=0.27
+peft>=0.9
+safetensors>=0.4
+lpips>=0.1.4
+open-clip-torch>=2.24
+pyiqa>=0.1.13
+sewar>=0.4.6
+
+# Stage 4 also imports ``vision_aided_loss``. Install its upstream package:
+# python -m pip install git+https://github.com/nupurkmr9/vision-aided-gan.git

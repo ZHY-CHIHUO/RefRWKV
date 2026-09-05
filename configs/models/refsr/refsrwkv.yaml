@@ -1,0 +1,22 @@
+model:
+  name: RefSRWKV
+  family: refsr
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  upsampler: progressive
+  color_match: global
+  windows:
+    phase_mode: local
+    enc1: {size: 8, offsets: [0, 4]}
+    enc2: {size: 8, offsets: [0, 4]}
+    enc3: {size: 4, offsets: [0, 2]}
+    latent: {size: 3, offsets: [0, 1]}
+    dec3: {size: 4, offsets: [0, 2]}
+    dec2: {size: 8, offsets: [0, 4]}
+    dec1: {size: 8, offsets: [0, 4]}
+    refine: {size: 8, offsets: [0, 4]}
+  drop_path_rate: 0.1
+  hidden_rate: 4

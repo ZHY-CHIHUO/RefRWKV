@@ -1,0 +1,49 @@
+# Shared defaults for standalone RefSRWKV runs. Dataset facts stay in
+# configs/datasets and architecture values stay in configs/models.
+base: refsr.yaml
+
+data:
+  # ``paired`` reads Ref/; ``lr_up`` derives a bicubic reference at runtime.
+  reference_mode: paired
+  augment: true
+  augment_ref: false
+  ref_aug_strengths: [0.12, 0.12, 0.12, 0.03]
+  ref_aug_probs: [0.5, 0.5, 0.5, 0.5]
+  ref_gray_prob: 0.2
+  batch_size: 4
+  val_batch_size: 1
+  num_workers: 8
+  val_num_workers: 2
+  prefetch_factor: 4
+  pin_memory: true
+
+train:
+  devices: 1
+  accelerator: auto
+  precision: "32"
+  max_epochs: 50
+  max_steps: -1
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
+  accumulate_grad_batches: 2
+  log_every_n_steps: 20
+  save_top_k: 3
+  early_stopping_patience: 10
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  adam_betas: [0.9, 0.999]
+  lr_scheduler: plateau
+  lr_patience: 3
+  lr_factor: 0.5
+  lr_min: 1.0e-7
+  lr_threshold: 1.0e-5
+  grad_clip_norm: 1.0
+  ema_decay: 0.999
+  use_ema: true
+  seed: 42
+
+loss:
+  name: l1
+  ssim_weight: 0.3
+  fft_weight: 0.2
+  ref_drop_prob: 0.2

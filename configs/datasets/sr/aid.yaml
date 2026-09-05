@@ -1,0 +1,9 @@
+dataset:
+  id: aid
+  name: AID (Aerial Image Dataset)
+  kind: synthetic_sisr
+  root: data/sr/AID
+  default_scale: 4
+  source: {image_size: [600, 600], channels: 3, classes: 30, images: 10000}
+  prepared: {hr_size: [512, 512], lr_size: [128, 128], scale: 4, splits: {train: 7000, val: 1507, test: 1493}}
+  reference_policy: none; RefSRWKV lr_up derives bicubic LR at runtime

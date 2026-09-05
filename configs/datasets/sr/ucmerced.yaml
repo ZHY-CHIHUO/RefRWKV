@@ -1,0 +1,9 @@
+dataset:
+  id: ucmerced
+  name: UC Merced Land Use
+  kind: synthetic_sisr
+  root: data/sr/UC_Merced
+  default_scale: 4
+  source: {image_size: [256, 256], channels: 3, classes: 21, images: 2100}
+  prepared: {hr_size: [256, 256], lr_size: [64, 64], scale: 4, splits: {train: 1470, val: 315, test: 315}}
+  reference_policy: none; RefSRWKV lr_up derives bicubic LR at runtime
