@@ -340,6 +340,7 @@ def run(config: dict[str, Any], *, resume: str | None = None) -> Path:
         ModelCheckpoint(
             dirpath=str(layout.checkpoints),
             filename="epoch={epoch:04d}-step={step:06d}",
+            auto_insert_metric_name=False,
             monitor=monitor,
             mode=mode,
             save_top_k=int(train.get("save_top_k", 3)),

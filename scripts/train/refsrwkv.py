@@ -69,6 +69,7 @@ def run(config: dict[str, Any], *, resume: str | None = None, load_weights: str 
             ModelCheckpoint(
                 dirpath=str(layout.checkpoints),
                 filename="epoch={epoch:04d}-step={step:06d}",
+                auto_insert_metric_name=False,
                 monitor="val/loss",
                 mode="min",
                 save_top_k=int(train_cfg.get("save_top_k", 3)),

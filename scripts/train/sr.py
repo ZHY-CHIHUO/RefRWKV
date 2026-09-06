@@ -44,6 +44,7 @@ def _callbacks(config: dict[str, Any], checkpoint_dir: Path) -> list[Any]:
         ModelCheckpoint(
             dirpath=str(checkpoint_dir),
             filename="epoch={epoch:04d}-step={step:06d}",
+            auto_insert_metric_name=False,
             monitor="val/loss",
             mode="min",
             save_top_k=int(train.get("save_top_k", 3)),
