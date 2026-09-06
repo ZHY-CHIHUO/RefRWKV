@@ -4,10 +4,10 @@ task: refsr
 
 data:
   augment: true
-  batch_size: 4
-  val_batch_size: 1
+  batch_size: 16
+  val_batch_size: 8
   num_workers: 8
-  val_num_workers: 2
+  val_num_workers: 4
   prefetch_factor: 4
 
 train:
@@ -16,7 +16,7 @@ train:
   max_steps: 50000
   accumulate_grad_batches: 2
   check_val_every_n_epoch: 1
-  log_every_n_steps: 20
+  log_every_n_steps: 50
 
 loss:
   name: l1

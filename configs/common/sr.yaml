@@ -10,9 +10,9 @@ data:
   augment: true
   reference_mode: none
   batch_size: 16
-  val_batch_size: 1
+  val_batch_size: 8
   num_workers: 8
-  val_num_workers: 2
+  val_num_workers: 4
   prefetch_factor: 4
 
 train:
