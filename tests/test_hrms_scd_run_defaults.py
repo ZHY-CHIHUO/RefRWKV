@@ -25,9 +25,22 @@ class HRMSSCDRunDefaultsTests(unittest.TestCase):
     def test_comparable_training_defaults(self) -> None:
         expected_train = {
             "learning_rate": 1.0e-4,
+            "weight_decay": 0.0,
+            "adam_betas": [0.9, 0.999],
+            "max_epochs": -1,
+            "max_steps": 50000,
+            "early_stopping_patience": None,
             "lr_scheduler": "plateau",
+            "lr_patience": 3,
+            "lr_factor": 0.5,
+            "lr_threshold": 1.0e-5,
+            "lr_min": 1.0e-7,
             "val_check_interval": 1.0,
             "check_val_every_n_epoch": 1,
+            "accumulate_grad_batches": 2,
+            "grad_clip_norm": 1.0,
+            "use_ema": True,
+            "ema_decay": 0.999,
         }
         for path in RUN_CONFIGS:
             with self.subTest(path=path):
