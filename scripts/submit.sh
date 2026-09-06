@@ -29,3 +29,4 @@ tensorboard --logdir logs
 
 # 查看GPU使用情况
 squeue -p gpu
+watch -n 0.5 nvidia-smi
