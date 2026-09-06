@@ -12,8 +12,9 @@ shortcut_usage() {
   ${script_name}                 运行训练
   ${script_name} --run            运行训练
   ${script_name} --print          只打印命令，不启动训练
-  ${script_name} --help           显示帮助
+ ${script_name} --help           显示帮助
 
+如果对应实验目录已有 config.yaml，将优先使用该完整配置；否则使用默认 run 配置。
 训练入口之后的参数会原样传递，例如 --resume、--load-weights 或 --overrides。
 EOF
 }
@@ -44,8 +45,18 @@ shortcut_run() {
 
   # Activate the known remote environment when the caller has not activated one.
   if [[ -z "${CONDA_PREFIX:-}" ]]; then
-    local conda_script="${REFRWKV_CONDA_SH:-/mnt/sda/conda/miniforge3/etc/profile.d/conda.sh}"
-    if [[ -f "$conda_script" ]]; then
+    local conda_script="${REFRWKV_CONDA_SH:-}"
+    if [[ -z "$conda_script" ]]; then
+      for candidate in \
+        "/mnt/sda/conda/miniforge3/etc/profile.d/conda.sh" \
+        "/home/zhy/miniconda3/etc/profile.d/conda.sh"; do
+        if [[ -f "$candidate" ]]; then
+          conda_script="$candidate"
+          break
+        fi
+      done
+    fi
+    if [[ -n "$conda_script" && -f "$conda_script" ]]; then
       # shellcheck disable=SC1090
       source "$conda_script"
       conda activate "${REFRWKV_CONDA_ENV:-rwkv7}"

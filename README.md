@@ -88,6 +88,21 @@ RefSRWKV 的消融开关集中在 `configs/models/refsr/refsrwkv.yaml`：`model.
 
 ## 训练
 
+### 完整配置
+
+每次训练都会把合并后的完整配置保存到该实验目录的 `config.yaml`。快捷脚本再次执行同一个 `configs/runs/...` 时，会优先读取这个完整配置，因此手工修改会继续生效。也可以在正式训练前先展开一份配置，手工修改后直接运行：
+
+```bash
+python scripts/render_config.py \
+  --config configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml
+
+# 编辑 experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/config.yaml
+python scripts/train/refsrwkv.py \
+  --config experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/config.yaml
+```
+
+如果目标完整配置已经存在，工具默认拒绝覆盖，以免丢失手工修改；确认需要重新展开时使用 `--force`。完整 YAML 已经包含数据、模型、训练和输出字段，不再依赖 `base`，可以直接作为所有训练或测试入口的 `--config` 参数。直接传入完整 YAML 时会尊重该文件本身，不会再跳转到其他快照。
+
 SR（SwinIR-M，AID x4）：
 
 ```bash

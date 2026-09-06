@@ -42,7 +42,7 @@ gpu-submit --name hrms_scd_ref_x4 -- \
 bash scripts/submit_train.sh --list
 ```
 
-脚本检测到未激活环境时，会尝试激活 `/mnt/sda/conda/miniforge3` 下的 `rwkv7`。如果远程环境路径不同，可以覆盖：
+脚本检测到未激活环境时，会依次尝试激活 `/mnt/sda/conda/miniforge3` 或 `/home/zhy/miniconda3` 下的 `rwkv7`。如果环境路径不同，可以覆盖：
 
 ```bash
 REFRWKV_CONDA_SH=/path/to/conda.sh \
@@ -62,6 +62,22 @@ bash scripts/shortcuts/refsrwkv_hrms_scd_ref_x4.sh --print
 
 ```bash
 bash scripts/shortcuts/show_commands.sh
+```
+
+快捷脚本会先检查对应实验目录中的 `config.yaml`。如果文件存在，就使用这份完整配置；否则才使用脚本内的 `configs/runs/...` 默认配置。因此可以先展开并编辑配置：
+
+```bash
+python scripts/render_config.py \
+  --config configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml
+# 编辑 experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/config.yaml
+bash scripts/shortcuts/refsrwkv_hrms_scd_ref_x4.sh
+```
+
+也可以绕过快捷脚本，直接运行完整 YAML：
+
+```bash
+python scripts/train/refsrwkv.py \
+  --config experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/config.yaml
 ```
 
 查看带消融覆盖的命令：

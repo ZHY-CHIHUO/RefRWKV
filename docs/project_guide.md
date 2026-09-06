@@ -19,10 +19,13 @@ YAML 配置 → data/loaders.py → 模型 registry → engine → experiments/
 | `.vscode/settings.json` | VS Code 的项目编辑器设置。 |
 | `scripts/submit.sh` | 远程作业提交的通用 shell 入口。 |
 | `scripts/submit_train.sh` | 远程训练兼容入口，可选择 `scripts/shortcuts/` 中的快捷脚本。 |
+| `scripts/render_config.py` | 将分层 run 配置展开为可编辑的完整 YAML。 |
 
 ## `configs/`
 
 YAML 配置按职责拆分。`common` 提供默认值，`datasets` 描述数据，`models` 描述网络，`runs` 描述一次可执行实验。
+
+需要手工调整全部字段时，可用 `python scripts/render_config.py --config <run.yaml>` 生成对应实验目录的完整 `config.yaml`；编辑后直接把该文件传给 `scripts/train/*.py` 或测试入口的 `--config` 参数。再次使用同一个 run 配置时，加载器会优先读取这个快照。
 
 ### `configs/common/`
 

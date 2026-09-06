@@ -2,8 +2,10 @@
 
 Run YAML files are intentionally small.  They may inherit one or more base
 files, refer to a dataset description, and override any value from the
-command line with ``section.key=value``.  The loader returns one materialized
-mapping consumed by both training and evaluation entry points.
+command line with ``section.key=value``.  Once a run has an editable
+``experiments/.../config.yaml`` snapshot, layered run paths prefer that file.
+The loader returns one materialized mapping consumed by training and
+evaluation entry points.
 """
 
 from __future__ import annotations
@@ -317,9 +319,53 @@ def materialize_config(config: dict[str, Any], config_path: Path) -> dict[str, A
     return result
 
 
-def load_config(path: str | os.PathLike[str], overrides: list[str] | None = None) -> dict[str, Any]:
+def _is_run_config(path: Path) -> bool:
+    """Return whether ``path`` is one of the repository's layered run files."""
+    try:
+        path.relative_to(PROJECT_ROOT / "configs" / "runs")
+    except ValueError:
+        return False
+    return True
+
+
+def _existing_experiment_config(config: dict[str, Any], config_path: Path) -> Path | None:
+    """Find the materialized config for a layered run when it already exists."""
+    if not _is_run_config(config_path):
+        return None
+
+    # Import lazily to keep the configuration module independent from the
+    # experiment path implementation during module import.
+    from .experiments import layout_from_config
+
+    candidate = layout_from_config(config).train_dir / "config.yaml"
+    if candidate.resolve() == config_path.resolve() or not candidate.is_file():
+        return None
+    return candidate
+
+
+def load_config(
+    path: str | os.PathLike[str],
+    overrides: list[str] | None = None,
+    *,
+    prefer_existing: bool = True,
+) -> dict[str, Any]:
+    """Load a config, preferring an existing run snapshot for layered runs.
+
+    A path under ``configs/runs`` first determines its materialized experiment
+    directory.  If that directory already contains ``config.yaml``, the
+    snapshot is loaded instead, so shortcut commands reuse manual edits.  A
+    direct path to a complete YAML is always honored; pass
+    ``prefer_existing=False`` when rendering a fresh snapshot from defaults.
+    """
     config_path = resolve_path(path, prefer_cwd=True)
-    return materialize_config(apply_overrides(load_yaml_file(config_path), overrides), config_path)
+    source = apply_overrides(load_yaml_file(config_path), overrides)
+    materialized = materialize_config(source, config_path)
+    if prefer_existing:
+        existing = _existing_experiment_config(materialized, config_path)
+        if existing is not None:
+            config_path = existing
+            source = apply_overrides(load_yaml_file(config_path), overrides)
+    return materialize_config(source, config_path)
 
 
 def validate_config(config: dict[str, Any], *, require_data: bool = True) -> None:

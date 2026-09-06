@@ -14,7 +14,7 @@ data:
 train:
   devices: 1
   accelerator: auto
-  precision: "32"
+  precision: bf16-mixed
   max_epochs: 50
   max_steps: -1
   val_check_interval: 1.0

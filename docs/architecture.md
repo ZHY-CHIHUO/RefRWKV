@@ -153,6 +153,15 @@ experiments/test/<task>/<model>/<dataset>/x<scale>/<run>/<split>/
 
 ## 训练、测试和评估
 
+分层 run 配置可以先展开成单个可编辑 YAML：
+
+```bash
+python scripts/render_config.py \
+  --config configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml
+```
+
+省略 `--output` 时，完整文件写入对应的 `experiments/train/.../config.yaml`。编辑后直接将该文件传给训练或评估入口即可；已有文件默认不会被覆盖，确认重新生成时加 `--force`。如果再次传入对应的 `configs/runs/...`，加载器会优先使用这个快照；直接传入完整 YAML 则始终使用该文件。
+
 单图 SR（SwinIR-M x4）：
 
 ```bash

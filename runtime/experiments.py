@@ -78,7 +78,7 @@ def layout_from_config(config: dict[str, Any]) -> ExperimentLayout:
 
 
 def save_config_snapshot(config: dict[str, Any], path: str | Path) -> Path:
-    """Write a JSON snapshot; YAML remains the human-edited source of truth."""
+    """Write a JSON snapshot for inspection alongside the editable YAML."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as handle:
