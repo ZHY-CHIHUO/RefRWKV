@@ -26,3 +26,6 @@ rsync -avzP --partial --delete project/ 4090:/target/project/
 
 # 查看log
 tensorboard --logdir logs
+
+# 查看GPU使用情况
+squeue -p gpu
