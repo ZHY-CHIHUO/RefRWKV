@@ -81,16 +81,11 @@ def _matching_state(
             continue
         original_key = str(source_key)
         key = _strip_outer_prefixes(original_key)
-        # Keep the exact key first.  A full RefDiffRWKV system legitimately
-        # owns names such as ``generator.xxx`` and ``sr_model.xxx``; stripping
-        # those prefixes before trying an exact match would make a complete
-        # system checkpoint impossible to restore.  The stripped variants are
-        # still needed for Lightning wrappers and standalone model checkpoints.
+        # 先匹配原始键名，以保留系统 checkpoint 的 generator/sr_model 命名空间。
         candidates = [original_key]
         if key != original_key:
             candidates.append(key)
-        # A raw official SwinIR state dict has ``conv_first.*`` while this
-        # repository wrapper stores it under ``net.conv_first.*``.
+        # 通过 net. 前缀兼容 SwinIR 的封装参数名。
         if not key.startswith("net."):
             candidates.append(f"net.{key}")
         target_key = next(
@@ -137,7 +132,7 @@ def load_model_weights(
         checkpoint.get("ema_state")
         or checkpoint.get("ema_state_dict")
         or checkpoint.get("model_ema_state")
-        # Legacy checkpoints written before the generic trainer abstraction.
+        # Check the additional EMA field.
         or checkpoint.get("baseline_ema_state")
         or checkpoint.get("ema")
     )
@@ -160,7 +155,7 @@ def checkpoint_config(checkpoint: Any) -> dict[str, Any] | None:
     config = (
         checkpoint.get("trainer_config")
         or checkpoint.get("config")
-        # Legacy checkpoint compatibility.
+        # Check the additional configuration field.
         or checkpoint.get("baseline_config")
     )
     return dict(config) if isinstance(config, Mapping) else None
@@ -172,7 +167,7 @@ def checkpoint_signature(checkpoint: Any) -> dict[str, Any] | None:
     signature = (
         checkpoint.get("experiment_signature")
         or checkpoint.get("trainer_signature")
-        # Legacy checkpoint compatibility.
+        # Check the additional experiment signature field.
         or checkpoint.get("baseline_experiment_signature")
     )
     return dict(signature) if isinstance(signature, Mapping) else None

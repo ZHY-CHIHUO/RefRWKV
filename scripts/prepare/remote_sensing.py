@@ -325,7 +325,10 @@ def prepare(
         "validated_counts": validated,
         "class_counts": dict(sorted(class_counts.items())),
         "degradation": "PIL bicubic downsampling from HR to LR",
-        "loader": "data.sr.dataset.SRPNGDataset",
+        "loader": "data.dataset.SuperResolutionDataset",
+        "lr_native_scale": scale,
+        "lr_provenance": "bicubic",
+        "lr_source": "auto",
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"

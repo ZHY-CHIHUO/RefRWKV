@@ -80,9 +80,10 @@ class DiffAdapterBase(nn.Module):
         self.body = nn.ModuleList()
         for i in range(len(channels) - 1):
             for j in range(nums_rb):
+                # The first block consumes stage input; later blocks consume stage output.
                 self.body.append(
                     ResnetBlock_SD2(
-                        channels[i] if j == 0 else channels[i + 1],  # 修复点 1
+                        channels[i] if j == 0 else channels[i + 1],
                         channels[i + 1],
                         down=(j == 0),
                         ksize=ksize,

@@ -312,8 +312,7 @@ class GlobalSemanticModule(nn.Module):
     参数说明：
         use_sr_condition / sr_latent_ch / sr_hidden 为可选参数；
         use_sr_condition=False 时不启用 SR 条件分支，构造签名、参数名
-        与其他模块保持一致，checkpoint 可 strict 加载（新增的 sr_* 参数
-        出现在 missing keys 中时需 strict=False 或先冻结加载）。
+        与其他模块保持一致；未启用 SR 条件时，加载器可忽略缺失的 sr_* 参数。
     """
 
     IMAGENET_MEAN = (0.485, 0.456, 0.406)

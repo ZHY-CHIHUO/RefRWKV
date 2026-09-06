@@ -1,4 +1,4 @@
-"""DataLoader factories for the two physically separate data contracts."""
+"""DataLoader factories backed by the unified SR/RefSR Dataset."""
 
 from __future__ import annotations
 
@@ -8,10 +8,14 @@ from typing import Any
 
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from data.refsr import RefPNGDataset
-from data.sr import SRPNGDataset
+from data.dataset import SuperResolutionDataset
 from runtime.common import resolve_path
-from runtime.config import normalize_reference_mode, validate_refsr_reference_contract
+from runtime.config import (
+    normalize_lr_provenance,
+    normalize_lr_source,
+    normalize_reference_mode,
+    validate_refsr_reference_contract,
+)
 
 
 def _max_samples(data: Mapping[str, Any]) -> tuple[Any, Any, Any]:
@@ -58,7 +62,8 @@ def _dataset_roots(
     data: Mapping[str, Any],
     *,
     required_splits: tuple[str, ...],
-    require_reference: bool,
+    require_reference: bool = False,
+    required_directories: tuple[str, ...] | None = None,
 ) -> list[Path]:
     """Resolve dataset roots for one task contract.
 
@@ -70,7 +75,7 @@ def _dataset_roots(
     to reproduce.
     """
     roots: list[Path] = []
-    expected_dirs = ("HR", "LR", "Ref") if require_reference else ("HR", "LR")
+    expected_dirs = required_directories or (("HR", "LR", "Ref") if require_reference else ("HR", "LR"))
     for configured in _configured_roots(data):
         candidates = [configured] if _has_any_split(configured) else sorted(
             child for child in configured.iterdir() if child.is_dir() and _has_any_split(child)
@@ -92,6 +97,38 @@ def _dataset_roots(
             if candidate not in roots:
                 roots.append(candidate)
     return roots
+
+
+def _lr_contract(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize LR settings once for every train and test loader."""
+    nested = data.get("lr", {})
+    if not isinstance(nested, Mapping):
+        nested = {}
+    return {
+        "lr_source": normalize_lr_source(data.get("lr_source", nested.get("source", "auto"))),
+        "lr_native_scale": data.get("lr_native_scale", nested.get("native_scale", data.get("scale"))),
+        "lr_provenance": normalize_lr_provenance(
+            data.get("lr_provenance", nested.get("provenance", "bicubic"))
+        ),
+    }
+
+
+def _required_directories(
+    data: Mapping[str, Any], *, include_reference: bool
+) -> tuple[str, ...]:
+    """Return directories that must physically exist for this data policy.
+
+    Bicubic LR can be generated from HR when a stored representation is
+    absent. Sensor LR can never be reconstructed, so its directory is always
+    required. ``Ref`` is required only for the paired reference mode.
+    """
+    contract = _lr_contract(data)
+    directories = ["HR"]
+    if contract["lr_source"] == "stored" or contract["lr_provenance"] == "sensor":
+        directories.append("LR")
+    if include_reference:
+        directories.append("Ref")
+    return tuple(directories)
 
 
 def _combine(datasets: list[Dataset]) -> Dataset:
@@ -118,7 +155,7 @@ def _loader(dataset, data: Mapping[str, Any], *, train: bool) -> DataLoader:
 
 
 def build_sr_loaders(config: Mapping[str, Any]):
-    """Build HR/LR-only loaders for one or more single-image SR datasets."""
+    """Build HR/LR-only loaders for one or more SISR datasets."""
     data = config["data"]
     common = {
         "scale": int(data["scale"]),
@@ -126,24 +163,33 @@ def build_sr_loaders(config: Mapping[str, Any]):
         "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
         "lr_key": data.get("lr_key", "lr"),
         "hr_key": data.get("hr_key", "hr"),
+        **_lr_contract(data),
     }
-    roots = _dataset_roots(data, required_splits=("train", "val"), require_reference=False)
+    roots = _dataset_roots(
+        data,
+        required_splits=("train", "val"),
+        required_directories=_required_directories(data, include_reference=False),
+    )
     train = _combine([
-        SRPNGDataset(
+        SuperResolutionDataset(
             data_dir=root,
             mode="train",
             patch_size=data.get("patch_size"),
             augment=bool(data.get("augment", True)),
+            return_items=("lr", "hr"),
+            reference_source="none",
             **common,
         )
         for root in roots
     ])
     val = _combine([
-        SRPNGDataset(
+        SuperResolutionDataset(
             data_dir=root,
             mode="val",
             patch_size=data.get("val_patch_size"),
             augment=False,
+            return_items=("lr", "hr"),
+            reference_source="none",
             **common,
         )
         for root in roots
@@ -154,30 +200,34 @@ def build_sr_loaders(config: Mapping[str, Any]):
 
 
 def build_refsr_loaders(config: Mapping[str, Any]):
-    """Build loaders for one or more paired or LR-derived RefSR datasets."""
+    """Build paired or LR-derived RefSR loaders through one Dataset class."""
     validate_refsr_reference_contract(config)
     data = config["data"]
     reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
-    dataset_cls = SRPNGDataset if reference_mode == "lr_up" else RefPNGDataset
+    paired = reference_mode == "paired"
     common = {
         "scale": int(data["scale"]),
         "max_samples": _max_samples(data),
         "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
         "lr_key": data.get("lr_key", "lr"),
         "hr_key": data.get("hr_key", "hr"),
+        **_lr_contract(data),
     }
-    extra: dict[str, Any] = {}
-    if dataset_cls is RefPNGDataset:
-        extra = {
-            "ref_key": data.get("ref_key", "ref"),
-            "ref_aug_strengths": data.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
-            "ref_aug_probs": data.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
-            "ref_gray_prob": float(data.get("ref_gray_prob", 0.2)),
-        }
+    extra: dict[str, Any] = {
+        "return_items": ("lr", "hr", "ref") if paired else ("lr", "hr"),
+        "reference_source": "stored" if paired else "none",
+    }
+    if paired:
+        extra.update(
+            ref_key=data.get("ref_key", "ref"),
+            ref_aug_strengths=data.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
+            ref_aug_probs=data.get("ref_aug_probs", [0.5, 0.5, 0.5, 0.5]),
+            ref_gray_prob=float(data.get("ref_gray_prob", 0.2)),
+        )
     roots = _dataset_roots(
         data,
         required_splits=("train", "val"),
-        require_reference=dataset_cls is RefPNGDataset,
+        required_directories=_required_directories(data, include_reference=paired),
     )
     train_datasets: list[Dataset] = []
     val_datasets: list[Dataset] = []
@@ -198,11 +248,11 @@ def build_refsr_loaders(config: Mapping[str, Any]):
             **common,
             **extra,
         )
-        if dataset_cls is RefPNGDataset:
+        if paired:
             train_kwargs["augment_ref"] = bool(data.get("augment_ref", False))
             val_kwargs["augment_ref"] = False
-        train_datasets.append(dataset_cls(**train_kwargs))
-        val_datasets.append(dataset_cls(**val_kwargs))
+        train_datasets.append(SuperResolutionDataset(**train_kwargs))
+        val_datasets.append(SuperResolutionDataset(**val_kwargs))
     train, val = _combine(train_datasets), _combine(val_datasets)
     if not len(train) or not len(val):
         raise ValueError("training and validation splits must be non-empty")
@@ -231,6 +281,7 @@ def _test_dataset_kwargs(config: Mapping[str, Any], split: str) -> dict[str, Any
         "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
         "lr_key": data.get("lr_key", "lr"),
         "hr_key": data.get("hr_key", "hr"),
+        **_lr_contract(data),
     }
 
 
@@ -246,9 +297,19 @@ def build_sr_test_loader(
 ) -> DataLoader:
     """Build a native-resolution HR/LR test loader for an SR run."""
     data = config["data"]
-    roots = _dataset_roots(data, required_splits=(split,), require_reference=False)
+    roots = _dataset_roots(
+        data,
+        required_splits=(split,),
+        required_directories=_required_directories(data, include_reference=False),
+    )
     dataset = _combine([
-        SRPNGDataset(data_dir=root, **_test_dataset_kwargs(config, split)) for root in roots
+        SuperResolutionDataset(
+            data_dir=root,
+            return_items=("lr", "hr"),
+            reference_source="none",
+            **_test_dataset_kwargs(config, split),
+        )
+        for root in roots
     ])
     if not len(dataset):
         raise ValueError(f"test split {split!r} is empty")
@@ -266,16 +327,18 @@ def build_refsr_test_loader(
     validate_refsr_reference_contract(config)
     data = config["data"]
     reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
-    dataset_cls = SRPNGDataset if reference_mode == "lr_up" else RefPNGDataset
+    paired = reference_mode == "paired"
     roots = _dataset_roots(
         data,
         required_splits=(split,),
-        require_reference=dataset_cls is RefPNGDataset,
+        required_directories=_required_directories(data, include_reference=paired),
     )
     datasets: list[Dataset] = []
     for root in roots:
         kwargs = dict(data_dir=root, **_test_dataset_kwargs(config, split))
-        if dataset_cls is RefPNGDataset:
+        kwargs["return_items"] = ("lr", "hr", "ref") if paired else ("lr", "hr")
+        kwargs["reference_source"] = "stored" if paired else "none"
+        if paired:
             kwargs.update(
                 ref_key=data.get("ref_key", "ref"),
                 ref_aug_strengths=data.get("ref_aug_strengths", [0.12, 0.12, 0.12, 0.03]),
@@ -283,7 +346,7 @@ def build_refsr_test_loader(
                 ref_gray_prob=float(data.get("ref_gray_prob", 0.2)),
                 augment_ref=False,
             )
-        datasets.append(dataset_cls(**kwargs))
+        datasets.append(SuperResolutionDataset(**kwargs))
     dataset = _combine(datasets)
     if not len(dataset):
         raise ValueError(f"test split {split!r} is empty")

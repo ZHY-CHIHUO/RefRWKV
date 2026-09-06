@@ -558,9 +558,7 @@ class GatedFusion(nn.Module):
             if quality_enabled:
                 nn.init.constant_(self.quality[2].bias, -1.0)
         else:
-            # This is the v1 positional-cosine path.  Keeping its parameter
-            # shape separate makes the disabled ablation both faithful and
-            # cheap, instead of allocating unused local-attention weights.
+            # Disabled local matching uses positional cosine confidence and a compact gate.
             self.quality = nn.Identity()
             self.gate = nn.Sequential(
                 nn.Conv2d(dim, gate_hidden, 1),
@@ -770,8 +768,7 @@ class RefSRWKV(nn.Module):
             nn.GELU(),
         ]
         if ref_encoder == "deep":
-            # Keep the original deep path: two HR-domain convolutions with
-            # one activation between them, followed by phase-preserving fold.
+            # The deep encoder adds an HR-domain convolution before phase-preserving fold.
             ref_encoder_layers.append(
                 nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False)
             )
@@ -980,8 +977,7 @@ class RefSRWKV(nn.Module):
             self.output_shuffle = nn.PixelShuffle(scale)
         self.apply(self._init_weights)
         if isinstance(self.skip_proj, nn.Conv2d):
-            # Preserve the available channels at initialization; the learned
-            # residual then starts from a predictable bicubic baseline.
+            # Initialize the skip path from bicubic interpolation.
             nn.init.zeros_(self.skip_proj.weight)
             with torch.no_grad():
                 for channel in range(min(inp_channels, out_channels)):

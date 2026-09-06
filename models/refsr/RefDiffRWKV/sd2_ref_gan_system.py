@@ -113,8 +113,7 @@ class SD2RefGANSystem(LightningModule):
         self.use_swap_test = use_swap_test
         self.swap_ratio = swap_ratio
 
-        # D_tex 置信加权：开启后 D_tex 只在 raw cos_map
-        # 高置信的局部匹配区域执法）
+        # D_tex 使用传播前的局部匹配置信度对纹理损失加权。
         self.dtex_conf_weight = dtex_conf_weight
 
         if lambda_sr_noise < 0:
@@ -200,7 +199,7 @@ class SD2RefGANSystem(LightningModule):
             self.discriminator.requires_grad_(True)
 
     # ═══════════════════════════════════════════════════════
-    #  构建全零 down_intrablock 残差（优化：使用 new_zeros）
+    #  构建全零 down_intrablock 残差
     # ═══════════════════════════════════════════════════════
 
     def _build_zero_intrablock(self, x_input: torch.Tensor) -> List[torch.Tensor]:
@@ -318,7 +317,7 @@ class SD2RefGANSystem(LightningModule):
     # ═══════════════════════════════════════════════════════
 
     def _get_opt(self, key: str):
-        """安全获取优化器（兼容 PL 单优化器返回对象而非列表的行为）。"""
+        """安全获取优化器，处理 PL 单优化器和列表两种返回形式。"""
         opts = self.optimizers()
         if not isinstance(opts, list):
             return opts if key == "g" else None
@@ -469,14 +468,13 @@ class SD2RefGANSystem(LightningModule):
         )
 
     def on_save_checkpoint(self, checkpoint):
-        # ── SR/扩散解耦：先把 SR 权重从主 state_dict 拆出 ──
+        # 将 SR 权重从系统 state_dict 中分离保存。
         sd = checkpoint.get("state_dict", {})
         sr_keys = [k for k in sd if "sr_model." in k]
 
         if sr_keys:
             if getattr(self, "sr_fixed", True):
-                # 冻结模式：SR 训练中不变，主 checkpoint 不存，
-                # 加载时由 build_sr_model 从 sr.ckpt_path 重建
+                # 固定 SR 权重由配置指定的 checkpoint 提供。
                 for k in sr_keys:
                     del sd[k]
                 logger.info(
@@ -484,7 +482,7 @@ class SD2RefGANSystem(LightningModule):
                     len(sr_keys),
                 )
             else:
-                # 微调模式：SR 单独落盘 sr_model.ckpt（每次保存覆盖，即 SR 的 last 版）
+                # 将可训练 SR 权重保存为同目录的独立 checkpoint。
                 sr_sd = {k: sd.pop(k) for k in sr_keys}
                 cb = self.trainer.checkpoint_callback if self.trainer else None
                 dirpath = cb.dirpath if cb else "."
@@ -495,7 +493,7 @@ class SD2RefGANSystem(LightningModule):
                     "解耦保存：SR 权重(%d 键) -> %s", len(sr_sd), sr_path
                 )
 
-        # ── 原有逻辑：GAN 相位计数器 ──
+        # 保存 G/D 交替和梯度累积状态。
         checkpoint.update(
             {
                 "gd_phase": self._gd_phase,
@@ -508,11 +506,7 @@ class SD2RefGANSystem(LightningModule):
         )
 
     def load_state_dict(self, state_dict, strict=True):
-        # ── SR/扩散解耦：SR 权重一律不从主 checkpoint 加载 ──
-        # 冻结模式：SR 已由 build_sr_model 从 sr.ckpt_path 装好，此处缺键不覆盖
-        # 现有值（strict=False 下 missing keys 不会清零已加载权重）；
-        # 微调模式：SR 从同目录 sr_model.ckpt 加载。
-        # 同时兼容仍含 SR 键的旧版 checkpoint（自动过滤 + info 日志）。
+        # SR 参数由独立 checkpoint 提供，因此过滤主 checkpoint 中的 SR 键。
         n_sr_keys = sum(1 for k in state_dict if "sr_model." in k)
         if n_sr_keys:
             logger.info(
@@ -526,17 +520,16 @@ class SD2RefGANSystem(LightningModule):
 
         skip_prefix = "generator.global_semantic.semantic_pyramid."
 
-        # 提取 pyramid 相关 keys
+        # 识别 semantic-pyramid 权重需要的 key 和 receptance 层。
         pyramid_keys = [k for k in state_dict if k.startswith(skip_prefix)]
 
-        # 当前 WKV4 公式：同时存在 key 和 receptance 线性层
         has_key = any("key.weight" in k for k in pyramid_keys)
         has_receptance = any("receptance.weight" in k for k in pyramid_keys)
-        is_new_formula = has_key and has_receptance
+        has_current_formula = has_key and has_receptance
 
-        if pyramid_keys and not is_new_formula:
+        if pyramid_keys and not has_current_formula:
             logger.info(
-                "跳过 %d 个不兼容的 semantic_pyramid 权重（WKV 公式不一致）",
+                "跳过 %d 个不适用于当前 WKV 公式的 semantic_pyramid 权重",
                 len(pyramid_keys),
             )
             state_dict = {
@@ -545,23 +538,23 @@ class SD2RefGANSystem(LightningModule):
             strict = False
         elif pyramid_keys:
             logger.info(
-                "semantic_pyramid 权重为新公式，正常加载（%d 个 keys）",
+                "semantic_pyramid 权重符合当前 WKV 公式，正常加载（%d 个 keys）",
                 len(pyramid_keys),
             )
 
-        # Stage1 → Stage2 过渡
+        # 缺少语义分支权重时保留其初始化参数。
         if self.generator.global_semantic is not None:
             has_semantic_in_ckpt = any(
                 k.startswith("generator.global_semantic.") for k in state_dict
             )
             if not has_semantic_in_ckpt:
                 logger.info(
-                    "Checkpoint 无 global_semantic 权重（Stage1→2 过渡），"
-                    "DINOv2 从预训练加载，pyramid/proj 随机初始化"
+                    "Checkpoint 无 global_semantic 权重，DINOv2 从预训练加载，"
+                    "pyramid/proj 随机初始化"
                 )
                 strict = False
 
-        # 跨阶段恢复（如 Stage3→4）时 checkpoint 无 discriminator 权重
+        # 判别器权重缺失时保留其初始化参数。
         if self.discriminator is not None:
             disc_keys_in_ckpt = [
                 k for k in state_dict if k.startswith("discriminator.")
@@ -574,16 +567,13 @@ class SD2RefGANSystem(LightningModule):
                 )
                 strict = False
 
-        # LPIPS 延迟初始化（优化后）：checkpoint 在验证时会写入 net_lpips 权重，
-        # 而新进程加载时 net_lpips 尚未初始化（None），strict 恢复会把这些键判为
-        # unexpected 而崩溃。此处直接丢弃这些键：_get_lpips() 首次验证时会从 lpips
-        # 包重新加载同一份预训练 VGG 权重（同环境同版本），数值等价。
+        # LPIPS 按需初始化，因此跳过 checkpoint 中尚未实例化的 LPIPS 参数。
         if self.net_lpips is None:
             lpips_keys = [k for k in state_dict if k.startswith("net_lpips.")]
             if lpips_keys:
                 logger.info(
-                    "丢弃 %d 个 net_lpips 键（LPIPS 延迟初始化未触发，"
-                    "首次验证时由 _get_lpips() 重新加载预训练权重）",
+                    "丢弃 %d 个 net_lpips 键（LPIPS 延迟初始化，"
+                    "首次验证时由 _get_lpips() 加载预训练权重）",
                     len(lpips_keys),
                 )
                 state_dict = {
@@ -601,7 +591,7 @@ class SD2RefGANSystem(LightningModule):
                 "sim_transfer",
                 "global_semantic",
                 "sem_proj",
-                "sr_model",          # ← 新增：解耦后 SR 键必然 missing，属预期
+                "sr_model",
             )
             non_disc = [
                 k
@@ -621,7 +611,7 @@ class SD2RefGANSystem(LightningModule):
             ]
             if expected_missing:
                 logger.info(
-                    "load_state_dict: %d 个预期内新增参数随机初始化 "
+                    "load_state_dict: %d 个可选模块参数随机初始化 "
                     "(global_semantic / sem_proj / pyramid / sr_conditioner / sr_model)",
                     len(expected_missing),
                 )
@@ -634,7 +624,7 @@ class SD2RefGANSystem(LightningModule):
         return result
 
     def on_load_checkpoint(self, checkpoint):
-        # 强制归零：checkpoint 不保存 .grad，非边界恢复会导致提前 step
+        # checkpoint 不保存梯度，恢复时重置梯度累积状态。
         saved_g = checkpoint.get("g_accum_count", 0)
         if saved_g != 0:
             logger.warning(
@@ -647,10 +637,8 @@ class SD2RefGANSystem(LightningModule):
         self._g_steps_since_d = 0
         self._g_optimizer_steps = checkpoint.get("g_optimizer_steps", 0)
 
-        # 参数分组导致 optimizer 组数不匹配时丢弃 optimizer 状态
-        # 注意：on_load_checkpoint 执行时 optimizer 尚未配置，self.optimizers()
-        # 拿不到参数组；改为按 generator 结构推导 G 优化器应有的组数
-        # （与 scripts/train_sd2_gan.py 预检测逻辑一致）。
+        # 参数组数量不匹配时丢弃对应的优化器状态。
+        # 此钩子尚未创建优化器，因此根据 generator 推导参数组数量。
         opt_states = checkpoint.get("optimizer_states")
         if opt_states:
             saved_groups = len(opt_states[0].get("param_groups", []))
@@ -685,8 +673,7 @@ class SD2RefGANSystem(LightningModule):
             return
         optimizers = opts if isinstance(opts, list) else [opts]
 
-        # G 优化器：semantic 组（带 semantic_group 标记）保留 5× lr，
-        # 其余组恢复为 g_lr（修复此前把所有组一律压成 g_lr 导致 5× 失效的 bug）
+        # Restore the G optimizer learning rate, keeping the 5x multiplier for semantic parameters.
         for i, pg in enumerate(optimizers[self._opt_idx["g"]].param_groups):
             old_g = pg["lr"]
             new_lr = self.hparams.g_lr * (5.0 if pg.get("semantic_group") else 1.0)
@@ -895,7 +882,7 @@ class SD2RefGANSystem(LightningModule):
                 # 1. 编码 hr_latent
                 hr_latent = self.generator.encode_latent(hr)
 
-                # ★ 2. 根据 sr_fixed 选择是否保留梯度
+                # Select whether the SR prior keeps gradient tracking.
                 if not self.sr_fixed:
                     sr_latent = self._get_sr_latent_with_grad(lr, ref)  # 保留梯度
                 else:
@@ -995,7 +982,7 @@ class SD2RefGANSystem(LightningModule):
                 with torch.amp.autocast(
                     self.device.type, enabled=self.use_amp, dtype=torch.bfloat16
                 ):
-                    # ★ 获取 sr_latent (如果 Phase 1 没算，这里算)
+                    # Compute sr_latent when it was not produced in Phase 1.
                     if sr_latent is None:
                         if not self.sr_fixed:
                             sr_latent = self._get_sr_latent_with_grad(lr, ref)
@@ -1441,10 +1428,8 @@ class SD2RefGANSystem(LightningModule):
             and self.discriminator.use_texture_d
             and d_tex_opt is not None
         ):
-            # ── 方案C：Swap Test ──
-            # 注意：conf_dtex_crop 不随 ref_for_d 交换。conf 标记的是"fake 的
-            # 哪些区域含有 ref 借来的纹理"，这些区域正是与错误 ref 比对时
-            # 能暴露不匹配的位置，保持原样即可。
+            # 交换部分参考图以构造纹理判别器的错配样本。
+            # 置信度图始终对应 fake 图中的纹理迁移区域。
             if self.use_swap_test and bsz > 1:
                 n_swap = int(bsz * self.swap_ratio)
                 ref_for_d = ref.clone()
@@ -1571,9 +1556,7 @@ class SD2RefGANSystem(LightningModule):
                         self.log(f"val/{k}", v / n, on_epoch=True, prog_bar=True)
                         self.log(f"val_{k}", v / n, on_epoch=True)
 
-                    # ★ 用训练同款 VGG-LPIPS 覆盖 val/lpips
-                    # IQA 内置的是 AlexNet LPIPS，与训练 loss（VGG）不一致；
-                    # 这里直接用 self.net_lpips 计算，确保验证指标与优化目标对齐。
+                    # 使用 VGG-LPIPS 计算与感知训练损失一致的验证指标。
                     sr_t = torch.stack([s for s in sr_batch]).to(self.device)
                     hq_t = torch.stack([h for h in hq_batch]).to(self.device)
                     # val_results 值域 [0, 1] → LPIPS 期望 [-1, 1]

@@ -50,7 +50,7 @@ def make_beta_schedule(
 
     两种调度方案 / Two schedule types:
         - "linear":      β 线性增长 / β grows linearly
-        - "scaled_linear": β 在 log 空间线性增长（原版 IDDPM 方案）
+        - "scaled_linear": β 在 log 空间线性增长（IDDPM 的 scaled-linear 调度）
                            β grows linearly in log-space (original IDDPM)
 
     Args:
@@ -73,8 +73,8 @@ def make_beta_schedule(
         )
         return betas.numpy()
     elif schedule == "scaled_linear":
-        # 缩放线性: 同上但直接用 numpy（原版 guided-diffusion 风格）
-        # Scaled linear: same as above but using numpy (original style)
+        # 缩放线性: 使用 numpy 计算平方根区间的线性插值
+        # Scaled linear: use numpy for linear interpolation in square-root space.
         betas = np.linspace(
             linear_start ** 0.5, linear_end ** 0.5,
             n_timestep, dtype=np.float64
@@ -187,7 +187,7 @@ def _extract_into_tensor(
         # 默认 float64 → 转 float32 / Default float64 → convert to float32
         res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
     except:
-        # MPS 设备不兼容 float64 时的回退 / Fallback for MPS float64 incompatibility
+        # MPS 设备不支持 float64 时的回退 / Fallback when MPS lacks float64 support
         res = (
             torch.from_numpy(arr.astype(np.float32))
             .to(device=timesteps.device)[timesteps]

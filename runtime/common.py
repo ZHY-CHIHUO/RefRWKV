@@ -76,7 +76,7 @@ def per_image_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 class EMA:
-    """Small, model-agnostic EMA used by all compatible training runners."""
+    """Small, model-agnostic EMA used by the training runners."""
 
     def __init__(self, decay: float = 0.999):
         self.decay = float(decay)

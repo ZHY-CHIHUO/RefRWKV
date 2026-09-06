@@ -109,7 +109,7 @@ class WKV(torch.autograd.Function):
 
 @_compiler_disable()
 def RUN_CUDA(w, u, k, v):
-    """Run the Bi-WKV operator with the legacy float32 call contract."""
+    """Run the Bi-WKV operator with its float32 call contract."""
     return WKV.apply(w.float(), u.float(), k.float(), v.float())
 
 

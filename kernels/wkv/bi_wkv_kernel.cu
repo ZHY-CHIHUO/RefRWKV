@@ -16,12 +16,9 @@
  */
 #include <torch/extension.h>
 #include <cuda.h>
-// #include <cuda_fp16.h>
-// #include <cuda_bf16.h>
 #include <THC/THCAtomics.cuh>
 #include <cuda_runtime.h>
 #include <vector>
-// #include "utils.h"
 
 #define MIN_VALUE (-1e38)
 #define CHANNEL_LEN 16
@@ -41,7 +38,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
     scalar_t* __restrict__ const _y
     ) {
     const int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    const int channel_id = threadIdx.y;   // ★ 修复：取消注释（下方 shared memory 索引要用）
+    const int channel_id = threadIdx.y;   // Channel index used for shared-memory rows.
     const int token_id = threadIdx.x;
     const int _b = idx / C;
     const int _c = idx % C;
@@ -96,7 +93,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
     So2[token_id][channel_id] = o2;
     __syncthreads();
 
-    // ── 第二阶段：段间聚合（★ 修复：从 shared memory 读取，替代发散的 __shfl_sync）──
+    // ── 第二阶段：从 shared memory 聚合各段状态 ──
     scalar_t a2 = 0, b2 = 0, c2 = 0, d2 = 0;
     scalar_t o3 = MIN_VALUE, o4 = MIN_VALUE;
 
@@ -155,7 +152,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════
-// Backward kernel：已经正确使用 shared memory，无需改动
+// Backward kernel：使用 shared memory 保存段状态并计算梯度
 // ═══════════════════════════════════════════════════════════════
 
 template <typename scalar_t>

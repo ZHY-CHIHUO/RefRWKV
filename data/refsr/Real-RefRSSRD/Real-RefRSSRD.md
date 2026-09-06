@@ -35,7 +35,7 @@ Real-RefRSSRD（Real-World Reference-based Super-Resolution Dataset）由 CRefDi
 
 ## 3. 本目录的实际文件
 
-本仓库的 `ALL_2` 是按当前项目 loader 整理好的 PNG 副本，不是原始数据发布页的目录镜像：
+本仓库的 `ALL_2` 是按项目 loader 整理好的 PNG 副本，不是原始数据发布页的目录镜像：
 
 ```text
 data/refsr/Real-RefRSSRD/
@@ -52,16 +52,16 @@ data/refsr/Real-RefRSSRD/
 
 本地核对结果：三个 split 的 `HR/LR/Ref` 文件名一一对应，文件均为 8-bit RGB PNG，尺寸为 `480/48/480`（HR/LR/Ref）。`Ref` 是真实历史影像，不是 `LR` 的上采样结果。
 
-上游 CRefDiff 代码为了适配其扩散模型，会另行生成 `LR_Ux10`（把 48 × 48 LR 最近邻放大到 480 × 480）。本项目的 `RefPNGDataset` 读取原始 `LR`，在模型内部按 `scale=10` 处理，不需要也不应把 `LR_Ux10` 改名覆盖 `LR`。
+上游 CRefDiff 代码为了适配其扩散模型，会另行生成 `LR_Ux10`（把 48 × 48 LR 最近邻放大到 480 × 480）。本项目的 `SuperResolutionDataset` 读取原始 `LR`，在模型内部按 `scale=10` 处理，不需要也不应把 `LR_Ux10` 改名覆盖 `LR`。
 
 ## 4. 加载方式
 
 ### 4.1 PNG 文件夹模式
 
 ```python
-from data.refsr.dataset import RefPNGDataset
+from data.dataset import SuperResolutionDataset
 
-train_ds = RefPNGDataset(
+train_ds = SuperResolutionDataset(
     data_dir="data/refsr/Real-RefRSSRD",
     mode="train",
     patch_size=480,
@@ -69,6 +69,11 @@ train_ds = RefPNGDataset(
     augment=True,
     augment_ref=True,
     ref_gray_prob=0.2,
+    return_items=("lr", "hr", "ref"),
+    reference_source="stored",
+    lr_source="stored",
+    lr_native_scale=10,
+    lr_provenance="sensor",
 )
 
 sample = train_ds[0]
@@ -78,19 +83,24 @@ sample = train_ds[0]
 验证和测试时应关闭随机增强：
 
 ```python
-val_ds = RefPNGDataset(
+val_ds = SuperResolutionDataset(
     data_dir="data/refsr/Real-RefRSSRD",
     mode="val",
     patch_size=480,
     scale=10,
     augment=False,
     augment_ref=False,
+    return_items=("lr", "hr", "ref"),
+    reference_source="stored",
+    lr_source="stored",
+    lr_native_scale=10,
+    lr_provenance="sensor",
 )
 ```
 
-当前训练和评测统一使用上述 PNG 文件夹模式。PNG、原始压缩包和其他本地数据均由 `.gitignore` 排除，GitHub 只上传本说明和代码。
+训练和评测统一使用上述 PNG 文件夹模式。PNG、原始压缩包和其他本地数据均由 `.gitignore` 排除，GitHub 只上传本说明和代码。
 
-## 5. 当前 RefSRWKV 训练入口
+## 5. RefSRWKV 训练入口
 
 本项目对应配置为 `configs/runs/refsrwkv/real_refrssrd_x10.yaml`：
 

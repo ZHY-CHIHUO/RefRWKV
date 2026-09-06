@@ -36,9 +36,8 @@ class SwinIRWrapper(nn.Module):
         if lr.ndim != 4 or lr.shape[1] != 3:
             raise ValueError(f"SwinIR expects RGB NCHW input, got {tuple(lr.shape)}")
         height, width = lr.shape[-2:]
-        # The copied SwinIR implementation expects [0, 1] RGB because it
-        # subtracts the official RGB mean internally.  All project loaders
-        # remain in [-1, 1], including targets and metric code.
+        # SwinIR expects [0, 1] RGB and subtracts the official RGB mean internally.
+        # Project loaders, targets, and metrics use the [-1, 1] convention.
         output = self.net((lr + 1.0) * 0.5) * 2.0 - 1.0
         expected = (height * self.scale, width * self.scale)
         if output.shape[-2:] != expected:

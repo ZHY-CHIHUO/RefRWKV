@@ -23,8 +23,7 @@ def check_rmsnorm_size_independence():
 
 def check_case(scale, upsampler, lr_height, lr_width, backward):
     model = RefSRWKV(
-        # C=16 is the smallest channel count accepted by the CUDA kernel and
-        # keeps this development smoke test quick. Production runs use C=48.
+        # C=16 满足 CUDA 内核的通道对齐要求。
         dim=16,
         num_blocks=(1, 1, 1, 1),
         num_refinement_blocks=1,
@@ -32,8 +31,7 @@ def check_case(scale, upsampler, lr_height, lr_width, backward):
         upsampler=upsampler,
     ).cuda()
     model.train()
-    # The production residual starts at bicubic. Make this smoke-test head
-    # nonzero so gradients traverse the complete RWKV path.
+    # 初始化输出头，使梯度覆盖完整的 RWKV 路径。
     with torch.no_grad():
         model.output_conv.weight.normal_(mean=0.0, std=1e-3)
     lr = torch.randn(1, 3, lr_height, lr_width, device="cuda") * 0.1

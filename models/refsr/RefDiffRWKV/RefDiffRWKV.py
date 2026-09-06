@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from einops import rearrange
 from kernels.wkv import OmniShift, RUN_CUDA
 
-# 参考 SR_Ref_Encoder_LCA，导入其融合模块
+# 局部参考特征融合模块
 from .modules import LocalCrossAttention, MaskAttention
 
 
@@ -237,23 +237,22 @@ class RWKVBlock(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SR 自相似纹理迁移模块（决策链闭环版）
+# SR 自相似纹理传播模块
 # ═══════════════════════════════════════════════════════════════
 
 
 class SelfSimTransfer(nn.Module):
-    """SR 自相似性纹理迁移模块（决策链闭环版）。
+    """SR 自相似性纹理传播模块。
 
     三重决策的显式实现：
         w = (1-α)·conf_own + α·conf_borrowed
         - 局部匹配好            → w ≈ conf_own   → 注入自身匹配纹理
         - 局部匹配差 & 有同伴   → w ≈ α·conf_prop → 注入借来的同类纹理（非局部借）
-        - 局部匹配差 & 无同伴   → w → 0           → 残差趋零，交还扩散先验（脑补）
+        - 局部匹配差 & 无同伴   → w → 0           → 抑制残差注入
 
-    与上一版的差异：norm 之后乘以 w。
-    顺序很关键——GroupNorm 的统计量按组全局计算，先 norm 再乘 w
-    才能让被压制位置真正趋零；反过来先乘 w 再 norm，
-    近零位置会被归一化拉成组内常数向量，压制失效。
+    先执行 GroupNorm，再乘以 w。GroupNorm 的统计量按组全局计算，
+    这样被压制位置才能真正趋零；若先乘 w 再归一化，近零位置会被
+    拉成组内常数向量，门控效果会减弱。
     """
 
     def __init__(
@@ -303,10 +302,7 @@ class SelfSimTransfer(nn.Module):
             conf_prop = torch.bmm(aff, c).transpose(1, 2).reshape(B, 1, H, W)
 
             if self.conf_gated:
-                # ── 决策链闭环 ──
-                # 自身支路按 own conf 压制（局部拒绝）
-                # 传播支路按同伴 conf 加权（非局部借）
-                # 两者都低 → w→0（先验脑补）
+                # 混合局部和传播后的置信度，门控归一化纹理。
                 w = (1.0 - alpha) * conf + alpha * conf_prop
                 out = out * w
 
@@ -343,14 +339,13 @@ class RefDiffRWKV(nn.Module):
         自相似传播的补偿价值最大。
         scale3 用双模块（LCA/Mask 各一），显存合计约 156MB（B=1）。
 
-    cos_map 兼容性（已实测验证）：
+    cos_map 对齐关系：
         三个尺度的 cos_map 均为 (B, 1, H, W)，空间分辨率与特征尺度
         精确匹配，SelfSimTransfer 无需任何对齐代码。
 
-    checkpoint 兼容：
-        use_self_sim_transfer=False（默认）时不启用自相似迁移，
-        旧 checkpoint 可 strict 加载；开启后新增的 sim_transfer*
-        参数随机初始化，resume 时 strict=False 即可。
+    参数行为：
+        use_self_sim_transfer=False（默认）时不启用自相似传播；
+        开启后创建 sim_transfer* 模块，并在加载缺失参数时使用随机初始化。
     """
 
     def __init__(
@@ -612,7 +607,7 @@ class RefDiffRWKV(nn.Module):
             learned_maps.append(learned_map3)
 
         # 最后一层像 LCA 一样 concat 后投影
-        # 维度不变（4*embed_dim），旧 last_linear 权重兼容
+        # concat 后维度保持为 4*embed_dim
         sr_cond = torch.cat([sr_cond1, sr_cond2], dim=1)
         out = self.last_linear(sr_cond)
 
@@ -692,7 +687,7 @@ class RefDiffRWKV(nn.Module):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 开启自相似迁移测试
+    # 自相似传播测试
     model = RefDiffRWKV(out_channel=192, embed_dim=384, use_self_sim_transfer=True).to(
         device
     )
@@ -708,7 +703,7 @@ if __name__ == "__main__":
     print(f"Output: {out.shape}")
     print(f"cos_maps (prop): {[m.shape for m in cos_maps]}")
     print(f"raw_maps:        {[m.shape for m in raw_maps]}")
-    # 验证 raw 和 prop 不是同一份（传播改变了数值）
+    # 比较传播前后的置信度图。
     if len(cos_maps) > 1 and len(raw_maps) > 1:
         diff = (cos_maps[1] - raw_maps[1]).abs().max().item()
         print(f"scale2 prop vs raw max diff: {diff:.4f} (应 > 0)")

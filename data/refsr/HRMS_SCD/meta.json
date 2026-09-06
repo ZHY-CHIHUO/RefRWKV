@@ -9,11 +9,14 @@
     128,
     128
   ],
+  "lr_native_scale": 4,
+  "lr_provenance": "bicubic",
+  "lr_source": "auto",
   "ref_size": [
     512,
     512
   ],
-  "degradation": "bicubic",
+  "degradation": "PIL bicubic downsampling x4 from HR to LR",
   "bidirectional": true,
   "splits": {
     "train": {

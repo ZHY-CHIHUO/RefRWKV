@@ -126,8 +126,8 @@ def _build_refsr_model(
         LOGGER.info("loaded direct RefSR checkpoint (%s): %s", model_name, report)
         return model.to(device).eval(), "minus_one_one", None
 
-    # The builder is shared with the training entry point so its prior-loading
-    # and Stable-Diffusion compatibility rules cannot drift between commands.
+    # Share the builder with the training entry point so prior loading and
+    # Stable-Diffusion construction use the same rules.
     from scripts.train.refdiffrwkv import build_model
 
     system = build_model(config)

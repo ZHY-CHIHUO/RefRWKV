@@ -81,7 +81,7 @@ class GatedFusionAblationTests(unittest.TestCase):
         self.lr = torch.randn(2, 4, 5, 6)
         self.ref = torch.randn(2, 4, 5, 6)
 
-    def test_disabled_match_is_v1_positional_cosine_path(self) -> None:
+    def test_disabled_match_uses_positional_cosine_path(self) -> None:
         fusion = GatedFusion(4, window_size=7, match_enabled=False)
         actual = fusion(self.lr, self.ref)
         direct = fusion.norm(fusion.fuse_conv(torch.cat([self.lr, self.ref], dim=1)))

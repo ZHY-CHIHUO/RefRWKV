@@ -164,7 +164,7 @@ data/refsr/HRMS_SCD/
 └── meta.json        # 构建参数与 split 统计
 ```
 
-当前目录核对结果：`train/val/test_easy/test_hard` 分别为 `19058/1058/500/500` 对，每个 split 的 `LR`、`HR`、`Ref` 文件名完全一致；所有 PNG 为 8-bit RGB，尺寸分别为 `128×128`、`512×512`、`512×512`。由于训练 split 含双向样本，文件名中的 `_rev` 只在 `train` 中出现。
+目录核对结果：`train/val/test_easy/test_hard` 分别为 `19058/1058/500/500` 对，每个 split 的 `LR`、`HR`、`Ref` 文件名完全一致；所有 PNG 为 8-bit RGB，尺寸分别为 `128×128`、`512×512`、`512×512`。由于训练 split 含双向样本，文件名中的 `_rev` 只在 `train` 中出现。
 
 ### 文件命名约定
 
@@ -177,13 +177,13 @@ data/refsr/HRMS_SCD/
 
 ## 7. 使用方式
 
-### 7.1 通过 RefPNGDataset 加载
+### 7.1 通过统一 SuperResolutionDataset 加载
 
 ```python
-from data.refsr.dataset import RefPNGDataset
+from data.dataset import SuperResolutionDataset
 
 # 训练（全图 512×512，不裁）
-train_ds = RefPNGDataset(
+train_ds = SuperResolutionDataset(
     data_dir="data/refsr/HRMS_SCD",
     mode="train",
     scale=4,
@@ -191,30 +191,38 @@ train_ds = RefPNGDataset(
     augment=True,          # flip + rot90
     augment_ref=False,     # 关闭，天然差异已足够
     ref_gray_prob=0.0,
+    return_items=("lr", "hr", "ref"),
+    reference_source="stored",
 )
 
 # 验证
-val_ds = RefPNGDataset(
+val_ds = SuperResolutionDataset(
     data_dir="data/refsr/HRMS_SCD",
     mode="val",
     scale=4,
     patch_size=None,
     augment=False,
     augment_ref=False,
+    return_items=("lr", "hr", "ref"),
+    reference_source="stored",
 )
 
 # 测试（简单 / 困难）
-test_easy = RefPNGDataset(
-    data_dir="data/refsr/HRMS_SCD",
-    mode="test_easy",
-    scale=4, patch_size=None, augment=False, augment_ref=False,
+test_easy = SuperResolutionDataset(
+    data_dir="data/refsr/HRMS_SCD", mode="test_easy", scale=4,
+    patch_size=None, augment=False, augment_ref=False,
+    return_items=("lr", "hr", "ref"), reference_source="stored",
 )
-test_hard = RefPNGDataset(
-    data_dir="data/refsr/HRMS_SCD",
-    mode="test_hard",
-    scale=4, patch_size=None, augment=False, augment_ref=False,
+test_hard = SuperResolutionDataset(
+    data_dir="data/refsr/HRMS_SCD", mode="test_hard", scale=4,
+    patch_size=None, augment=False, augment_ref=False,
+    return_items=("lr", "hr", "ref"), reference_source="stored",
 )
 ```
+
+`data.refsr.dataset.RefPNGDataset` 是按 RefSR 任务命名的调用入口，内部使用
+`SuperResolutionDataset`。HRMS-SCD 的 LR 是 HR 经 bicubic 下采样 4 倍生成，
+可用 `lr_provenance="bicubic"` 标注。
 
 ### 7.2 训练 Config 示例
 
@@ -279,7 +287,7 @@ conda run -n rwkv7 python scripts/train/refsrwkv.py \
 
 ## 9. 构建与复现边界
 
-当前仓库提交的是已经整理好的 RefSR PNG。原始 HRMS-SCD 下载包、变化掩膜和生成这些文件的临时构建脚本不在仓库内；因此不能用本仓库中的命令从零重建原始配对。`meta.json` 保存了当前版本的倍率、尺寸、双向标记和 split 统计，`RefPNGDataset` 可直接读取现有目录。
+本仓库提供已经整理好的 RefSR PNG。原始 HRMS-SCD 下载包、变化掩膜和生成这些文件的临时构建脚本不在仓库内；因此不能用本仓库中的命令从零重建原始配对。`meta.json` 保存数据集的倍率、尺寸、双向标记和 split 统计，`SuperResolutionDataset` 可直接读取现有目录。
 
 如果重新整理数据，必须保持以下约定：
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a single-image SR model from the new task-oriented config tree."""
+"""Train a single-image SR model from the task-oriented config tree."""
 
 from __future__ import annotations
 

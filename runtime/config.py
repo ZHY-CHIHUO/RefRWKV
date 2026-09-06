@@ -26,6 +26,22 @@ _REFERENCE_MODE_ALIASES = {
     "sisr": "lr_up",
     "bicubic_lr": "lr_up",
 }
+_LR_SOURCE_ALIASES = {
+    "auto": "auto",
+    "stored": "stored",
+    "disk": "stored",
+    "from_hr": "from_hr",
+    "hr": "from_hr",
+    "generated": "from_hr",
+}
+_LR_PROVENANCE_ALIASES = {
+    "bicubic": "bicubic",
+    "synthetic": "bicubic",
+    "downsampled": "bicubic",
+    "sensor": "sensor",
+    "measured": "sensor",
+    "real": "sensor",
+}
 _PAIRED_ONLY_DATA_KEYS = (
     "augment_ref",
     "ref_aug_strengths",
@@ -48,6 +64,26 @@ def normalize_reference_mode(value: Any) -> str:
     except KeyError as exc:
         options = ", ".join(sorted({"paired", "lr_up"}))
         raise ValueError(f"data.reference_mode 必须是 {options}，得到 {value!r}") from exc
+
+
+def normalize_lr_source(value: Any) -> str:
+    """Return the canonical source policy for the LR tensor."""
+    normalized = str(value).strip().lower()
+    try:
+        return _LR_SOURCE_ALIASES[normalized]
+    except KeyError as exc:
+        options = ", ".join(sorted({"auto", "stored", "from_hr"}))
+        raise ValueError(f"data.lr_source 必须是 {options}，得到 {value!r}") from exc
+
+
+def normalize_lr_provenance(value: Any) -> str:
+    """Return ``bicubic`` for synthetic LR or ``sensor`` for measurements."""
+    normalized = str(value).strip().lower()
+    try:
+        return _LR_PROVENANCE_ALIASES[normalized]
+    except KeyError as exc:
+        options = ", ".join(sorted({"bicubic", "sensor"}))
+        raise ValueError(f"data.lr_provenance 必须是 {options}，得到 {value!r}") from exc
 
 
 def validate_refsr_reference_contract(config: Mapping[str, Any]) -> None:
@@ -216,6 +252,35 @@ def materialize_config(config: dict[str, Any], config_path: Path) -> dict[str, A
         data["scale"] = int(scale)
         run["scale"] = int(scale)
 
+    # Dataset descriptions carry the physical LR facts.  Materialize them in
+    # ``data`` so loaders and saved config snapshots remain self-contained.
+    dataset_lr = dataset.get("lr", {})
+    data_lr = data.get("lr", {})
+    if not isinstance(dataset_lr, Mapping):
+        dataset_lr = {}
+    if not isinstance(data_lr, Mapping):
+        data_lr = {}
+    data.setdefault(
+        "lr_native_scale",
+        data_lr.get("native_scale", dataset_lr.get("native_scale", dataset.get("default_scale", data.get("scale")))),
+    )
+    data.setdefault(
+        "lr_provenance",
+        data_lr.get("provenance", dataset_lr.get("provenance", dataset.get("lr_provenance", "bicubic"))),
+    )
+    data.setdefault(
+        "lr_source",
+        data_lr.get("source", dataset_lr.get("source", dataset.get("lr_source", "auto"))),
+    )
+    data["lr_source"] = normalize_lr_source(data.get("lr_source", "auto"))
+    data["lr_provenance"] = normalize_lr_provenance(
+        data.get("lr_provenance", "bicubic")
+    )
+    if data.get("lr_native_scale") is not None:
+        native_scale = data["lr_native_scale"]
+        if isinstance(native_scale, bool) or not isinstance(native_scale, int) or native_scale < 1:
+            raise ValueError("data.lr_native_scale 必须是正整数")
+
     lr_patch = run.get("lr_patch", data.get("train_lr_patch"))
     if lr_patch is not None:
         if isinstance(lr_patch, bool) or not isinstance(lr_patch, int) or lr_patch < 1:
@@ -268,6 +333,28 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
             raise ValueError("data.root 未设置")
         if not isinstance(data.get("scale"), int) or data["scale"] < 1:
             raise ValueError("data.scale 必须是正整数")
+        nested_lr = data.get("lr", {})
+        if not isinstance(nested_lr, Mapping):
+            nested_lr = {}
+        lr_source = normalize_lr_source(
+            data.get("lr_source", nested_lr.get("source", "auto"))
+        )
+        lr_provenance = normalize_lr_provenance(
+            data.get("lr_provenance", nested_lr.get("provenance", "bicubic"))
+        )
+        native_scale = data.get(
+            "lr_native_scale", nested_lr.get("native_scale", data["scale"])
+        )
+        if isinstance(native_scale, bool) or not isinstance(native_scale, int) or native_scale < 1:
+            raise ValueError("data.lr_native_scale 必须是正整数")
+        if lr_provenance == "sensor":
+            if lr_source == "from_hr":
+                raise ValueError("sensor LR 不能设置 data.lr_source=from_hr")
+            if native_scale != data["scale"]:
+                raise ValueError(
+                    "sensor LR 只能使用原生倍率: "
+                    f"native=x{native_scale}, requested=x{data['scale']}"
+                )
     if not str(model.get("name", "")).strip():
         raise ValueError("model.name 必须是非空字符串")
     validate_refsr_reference_contract(config)
@@ -288,6 +375,8 @@ __all__ = [
     "load_yaml_file",
     "materialize_config",
     "normalize_reference_mode",
+    "normalize_lr_source",
+    "normalize_lr_provenance",
     "validate_config",
     "validate_refsr_reference_contract",
 ]

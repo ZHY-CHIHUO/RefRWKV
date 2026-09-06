@@ -10,7 +10,7 @@ D_tex 置信加权：
    低 conf = 纹理来自别处或扩散先验 = D_tex 放手。
 3. 采用加权平均池化（除以权重和）而非先乘权再全局均值，避免 logit 尺度
    随可信面积占比漂移；权重全零时 logit=bias、G 侧梯度为 0。
-4. weight=None 时退化为全局平均池化，向后兼容。
+4. weight=None 时使用全局平均池化，不启用区域门控。
 """
 
 import logging
@@ -224,7 +224,7 @@ class ImageConvNextDiscriminator(nn.Module):
         super().train(mode)
         # backbone 整体保持 eval（冻结 BN/Dropout 统计量）
         self.model.eval()
-        # 可训练阶段重新设为 train
+        # 可训练阶段保持 train 状态
         if self.trainable_stages >= 1:
             self.model.model.trunk.stem.train(mode)
         if self.trainable_stages >= 2:
@@ -272,7 +272,7 @@ class TextureConsistencyDiscriminator(nn.Module):
         weight 是局部匹配置信图（raw cos_map，传播前），取 scale2 的
         (B, 1, 60, 60)。高 conf 区域 = 局部 ref 纹理被注入生成图，
         D_tex 在此执法（强制纹理一致）；低 conf 区域 = 纹理借自别处
-        或由扩散先验脑补，与局部 ref 比较是错靶，D_tex 不执法。
+        或由扩散先验生成，与局部 ref 比较是错靶，D_tex 不执法。
 
         必须用 raw（传播前）而非传播后的 conf_prop：传播后的高 conf
         表示"纹理借自其他位置"，与局部 ref 比较同样是错靶。
@@ -372,7 +372,7 @@ class TextureConsistencyDiscriminator(nn.Module):
             h = conv_part(diff)  # (B, ch//4, h, w)
 
             if weight is None:
-                # 旧行为：全局平均池化
+                # 无区域权重时使用全局平均池化
                 pooled = h.mean(dim=(-2, -1))
             else:
                 w = F.interpolate(
@@ -403,8 +403,8 @@ class SD2RefDiscriminator(LightningModule):
     tex_weight 透传约定：
         compute_g_loss / compute_d_loss / forward 均接受可选 tex_weight
         （raw cos_map scale2，(B,1,60,60)），仅作用于 D_tex；
-        D_sem 不加权——"是否像真实遥感图"是全局判断，脑补区也必须像真图。
-        默认 None = 旧行为，完全向后兼容。
+        D_sem 不加权——"是否像真实遥感图"是全局判断，低置信区域也必须像真图。
+        默认 None：D_tex 使用全局平均池化，不做区域加权。
     """
 
     def __init__(
@@ -626,13 +626,13 @@ if __name__ == "__main__":
     print("\n--- tex_weight 语义验证 ---")
     D_tex = model.D_tex
 
-    # 1. 全 1 权重必须等于旧行为（weight=None）
+    # 1. 全 1 权重应等于无区域权重的结果
     w_ones = torch.ones(B, 1, 60, 60, device=device)
-    l_old, _ = D_tex(fake, ref)
-    l_new, _ = D_tex(fake, ref, weight=w_ones)
-    diff = (l_old - l_new).abs().max().item()
-    print(f"全1权重 vs 旧行为 最大差异: {diff:.2e} (应 < 1e-5)")
-    assert diff < 1e-5, "全1权重不等于旧行为！"
+    l_unweighted, _ = D_tex(fake, ref)
+    l_weighted, _ = D_tex(fake, ref, weight=w_ones)
+    diff = (l_unweighted - l_weighted).abs().max().item()
+    print(f"全1权重与无权重结果的最大差异: {diff:.2e} (应 < 1e-5)")
+    assert diff < 1e-5, "全1权重与无权重结果不一致！"
 
     # 2. 全 0 权重：G 侧梯度必须为 0（无可信区 → 完全不执法）
     w_zero = torch.zeros(B, 1, 60, 60, device=device)

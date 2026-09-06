@@ -3,9 +3,9 @@
 
 The diffusion implementation owns its manual G/D loop. This entry point only
 owns experiment setup: configuration materialization, direct-RefSR prior
-loading, data loaders, checkpoint compatibility, and the Lightning callbacks
+loading, data loaders, checkpoint handling, and the Lightning callbacks
 shared by the project. The model remains under ``models/refsr/RefDiffRWKV`` so
-adding a compatible RefSR condition model does not create another framework.
+adding a RefSR condition model does not create another framework.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def build_sr_model(config: Mapping[str, Any], *, resume_ckpt_path: str | Path | 
     missing prior is allowed with a warning so a user can deliberately start a
     fully fresh experiment, but a production run should set
     ``model.sr.name`` and ``model.sr.ckpt_path`` to a registered direct RefSR
-    architecture and compatible checkpoint.
+    architecture and matching checkpoint.
     """
     mc = _model_cfg(config)
     if not bool(mc.get("sr_enabled", True)):
@@ -122,8 +122,8 @@ def build_model(config: Mapping[str, Any], *, resume_ckpt_path: str | Path | Non
     if not isinstance(loss, Mapping):
         raise ValueError("loss must be a mapping")
     # Optimizer settings belong to ``train`` and objective weights belong to
-    # ``loss``.  The model-level fallbacks keep old in-memory configs usable
-    # while the canonical YAML remains cleanly separated.
+    # ``loss``.  The model-level fallbacks also accept values supplied directly
+    # by callers while the canonical YAML remains cleanly separated.
     train_value = lambda key, default: train.get(key, mc.get(key, default))
     loss_value = lambda key, default: loss.get(key, mc.get(key, default))
     sr_model = build_sr_model(config, resume_ckpt_path=resume_ckpt_path)

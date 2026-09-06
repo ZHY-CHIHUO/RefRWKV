@@ -37,12 +37,9 @@ def cosine_attention_map(tensor1, tensor2, eps=1e-8):
 class SPADE(nn.Module):
     def __init__(self, norm_nc, label_nc=3):
         super().__init__()
-        # self.param_free_norm = SyncBatchNorm.convert_sync_batchnorm(nn.BatchNorm2d(norm_nc, affine=True))
-        # self.param_free_norm = nn.GroupNorm(32, norm_nc)
         self.param_free_norm = nn.BatchNorm2d(norm_nc, affine=True)
-        # self.param_free_norm = nn.InstanceNorm2d(norm_nc, affine=True)
 
-        # The dimension of the intermediate embedding space. Yes, hardcoded.
+        # Intermediate semantic embedding width.
         nhidden = 128
 
         ks = 3
@@ -54,18 +51,15 @@ class SPADE(nn.Module):
         self.mlp_beta = nn.Conv2d(nhidden, norm_nc, kernel_size=ks, padding=pw)
 
     def forward(self, x, segmap):
-        # Part 1. generate parameter-free normalized activations
-        # segmap = segmap[str(x.size(-1))]
+        # Normalize activations independently of the conditioning map.
         normalized = self.param_free_norm(x)
-        # normalized = x
 
-        # Part 2. produce scaling and bias conditioned on semantic map
-        # segmap = F.interpolate(segmap, size=x.size()[2:], mode='nearest')
+        # Generate scale and bias from the semantic conditioning map.
         actv = self.mlp_shared(segmap)
         gamma = self.mlp_gamma(actv)
         beta = self.mlp_beta(actv)
 
-        # apply scale and bias
+        # Apply the semantic scale and bias.
         out = normalized * (1 + gamma) + beta
 
         return out

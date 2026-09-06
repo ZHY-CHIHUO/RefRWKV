@@ -15,7 +15,7 @@ sd2_ref_generator.py — SD2 Ref-guided Generator (latent ε-prediction)
    无需改签名，训练与推理各路径自动覆盖。
 3. 置信门控使用 scale2 的 cos_map：scale1 窗口大、cos 全图 ~0.92 无区分度；
    scale2 窗口 4×4、range 0.40~0.55，有真实匹配信息。门控用传播后置信。
-4. adapter 输出解包兼容三元组 (feats, cos_maps, raw_cos_maps)：
+4. adapter 输出处理三元组 (feats, cos_maps, raw_cos_maps)：
    raw_cos_maps（传播前局部置信）供 gan_system 的 D_tex 加权使用，
    通过 _unpack_adapter_out 静态方法复用。
 """
@@ -114,8 +114,8 @@ class SD2RefGenerator(LightningModule):
         self.lr_key = lr_key
         self.ref_key = ref_key
         self.hr_key = hr_key
-        # 仅用于：① 独立 Generator.forward / p_losses；② 时序门控归一化。
-        # 四阶段课程的训练 t 范围由 System 持有，不要在这里采样。
+        # 独立 Generator.forward/p_losses 和时序门控归一化使用此范围。
+        # System 管理训练时的时间步范围。
         self.t_min = t_min
         self.t_max = t_max
         assert t_min <= t_max, f"t_min({t_min}) 必须 <= t_max({t_max})"
@@ -126,8 +126,7 @@ class SD2RefGenerator(LightningModule):
         self.use_sr_latent_cond = use_sr_latent_cond
         self.use_sr_condition = use_sr_condition
         self.use_confidence_gate = use_confidence_gate
-        # 注：adapter 内部 SelfSimTransfer 已做 conf 加权（决策链闭环），
-        # 此处残差级门控为第二道，alpha 默认 0.4（原 0.2）以减弱二次压制
+        # 残差注入按局部匹配置信度和 confidence_alpha 加权。
         self.confidence_alpha = confidence_alpha
         self.use_temporal_gate = use_temporal_gate
         self.control_scale_min = control_scale_min
@@ -229,7 +228,7 @@ class SD2RefGenerator(LightningModule):
 
         with torch.no_grad():
             new_conv.weight[:, :4] = old_weight
-            # [FIX] xavier_uniform_ 对切片不生效，手动计算 std 后 normal_ 赋值
+            # Initialize the added input channels with a scaled Xavier normal distribution.
             fan_in = (
                 old_weight.shape[1] * old_conv.kernel_size[0] * old_conv.kernel_size[1]
             )
@@ -274,7 +273,7 @@ class SD2RefGenerator(LightningModule):
             if "attn" not in n and "lora" not in n:
                 p.requires_grad = False
 
-        # [FIX] 切片无法设置 requires_grad；整体开启后用 hook 屏蔽前 4 通道梯度
+        # Keep pretrained input channels frozen while allowing gradients on added channels.
         self.unet.conv_in.weight.requires_grad = True
         self.unet.conv_in.bias.requires_grad = True
 
@@ -323,7 +322,7 @@ class SD2RefGenerator(LightningModule):
     def _unpack_adapter_out(out):
         """解包 adapter 输出为 (feats, cos_maps, raw_cos_maps)。
 
-        兼容两种返回约定：
+        处理两种返回约定：
           - (feats, cos_maps)                无 raw 分支
           - (feats, cos_maps, raw_cos_maps)  SelfSimTransfer 版
         非元组（仅 feats）时两个 map 均为 None。
@@ -398,9 +397,9 @@ class SD2RefGenerator(LightningModule):
         target_sizes = [(h0, w0), (h1, w1), (h2, w2), (h3, w3)]
         feats = [f320, f640, f1280, f1280]
 
-        # ── 方案B：时序门控 ──
+        # 按扩散时间步调整残差注入尺度。
         if self.use_temporal_gate and t is not None:
-            # 用 scheduler 总步数归一化，避免课程 t 超出 Generator.t_max 时 scale 变负
+            # 使用调度器总步数归一化时间步。
             t_norm = max(self.num_train_timesteps - 1, 1)
             t_ratio = 1.0 - t.float().mean().item() / t_norm
             scale = (
@@ -410,10 +409,7 @@ class SD2RefGenerator(LightningModule):
         else:
             scale = self.control_scale
 
-        # ── 方案A：置信门控（取 scale2 的 cos_map）──
-        # scale1 (120×120, 窗口 8×8) cos 全图 ~0.92 无区分度（已实测）；
-        # scale2 (60×60, 窗口 4×4) range 0.40~0.55，有真实匹配信息，
-        # 且分辨率与 latent 最大尺度对齐，插值失真最小。
+        # 使用尺度 2 的匹配置信度门控残差注入。
         conf = None
         if self.use_confidence_gate and cos_maps is not None and len(cos_maps) > 0:
             conf = cos_maps[1] if len(cos_maps) > 1 else cos_maps[0]
@@ -697,7 +693,7 @@ class SD2RefGenerator(LightningModule):
     def _compute_sr_prior(self, lr: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         """统一的 SR prior 计算入口：SR 模型前向 + 数值安全处理。"""
         with torch.amp.autocast(self.device.type, enabled=False):
-            # ★ 确保 SR 模型在正确设备上
+            # Run the SR prior on the active device in float32.
             sr_pixel = self.sr_model(lr.float(), ref.float())
         sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0)
         return sr_pixel.clamp(-1.0, 1.0)
@@ -839,8 +835,7 @@ class SD2RefGenerator(LightningModule):
         t_tensor = torch.full((bsz,), t_int, device=x_t.device, dtype=torch.long)
 
         if sr_target is not None and guidance_scale > 0 and t_int > t_stop:
-            # DPS 近似（Chung et al. 2023）：noise_pred 对应梯度修改前的 x_t，
-            # 修改后的 x_t 与原始 noise_pred 配合送入 scheduler.step
+            # DPS approximation: use the predicted noise from before the guidance update.
             with torch.enable_grad():
                 x_t.requires_grad_(True)
                 x_t_input = self.concat_sr_latent(x_t, sr_latent_cond)
@@ -1007,7 +1002,7 @@ class SD2RefGenerator(LightningModule):
 
     @torch.no_grad()
     def validation_inference(self, batch, save_dir, steps=50, sr_model=None):
-        # [FIX] 添加 CUDA 可用性检查，避免 CPU 环境报错
+        # Collect CUDA timing and memory statistics when a GPU is available.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -1082,7 +1077,7 @@ class SD2RefGenerator(LightningModule):
         if self.use_semantic and self.sem_proj is not None:
             params.extend(self.sem_proj.parameters())
 
-        # [FIX] 空参数保护，避免 AdamW 收到空列表报错
+        # Skip optimizer construction when all model parameters are frozen.
         if not params:
             logger.warning("Generator 无可训练参数")
             return None
@@ -1143,7 +1138,7 @@ if __name__ == "__main__":
     )
     assert out["noise_pred"].shape == out["hr_latent"].shape
 
-    # [FIX] 验证梯度流
+    # Verify that gradients reach trainable parameters.
     out["loss"].backward()
     has_grad = all(
         p.grad is not None and p.grad.abs().sum() > 0
