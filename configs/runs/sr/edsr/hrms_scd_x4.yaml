@@ -1,0 +1,15 @@
+base:
+  - ../../../common/sr.yaml
+  - ../../../models/sr/edsr.yaml
+  - ../../../common/benchmark.yaml
+
+dataset:
+  config: ../../../datasets/refsr/hrms_scd.yaml
+
+run:
+  name: hrms_scd_edsr_x4
+  scale: 4
+  lr_patch: 48
+
+data:
+  max_samples_val: 300

@@ -1,0 +1,10 @@
+# RCAN-style residual-channel-attention baseline.
+model:
+  name: rcan
+  family: sr
+  variant: rcan
+  implementation: native_compatibility
+  dim: 64
+  num_groups: 10
+  blocks_per_group: 20
+  reduction: 16

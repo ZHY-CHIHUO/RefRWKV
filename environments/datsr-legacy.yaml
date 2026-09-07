@@ -1,0 +1,19 @@
+# Exact upstream DATSR bridge.  Use only on a host/container that can provide
+# CUDA 10.1 + GCC 5.4; this is intentionally not compatible with rwkv7.
+name: datsr-legacy
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pytorch=1.7.1
+  - torchvision=0.8.2
+  - cudatoolkit=10.1
+  - pip
+  - pip:
+      - mmcv==0.4.4
+      - opencv-python
+      - pyyaml
+      - scipy
+      - tensorboard
+      - tqdm

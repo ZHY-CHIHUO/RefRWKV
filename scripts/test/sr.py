@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a single-image SR checkpoint on one native test split."""
+"""Run a single-image SR checkpoint (or checkpoint-free Bicubic) on one split."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from runtime.config import load_config
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None, help="required except for model.name=bicubic")
     parser.add_argument("--split", default="test", choices=("test", "test_easy", "test_hard"))
     parser.add_argument("--output", default=None, help="test run root; split is written below it")
     parser.add_argument("--device", default=None)

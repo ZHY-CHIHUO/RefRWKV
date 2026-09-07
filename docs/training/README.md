@@ -8,6 +8,11 @@
 bash scripts/shortcuts/show_commands.sh
 ```
 
+完整的 HRMS-SCD x4 基线协议、全部快捷入口和评估规范见
+[模型对比表](../models/baselines.md)。`scripts/submit_train.sh --list` 会列出
+新增的 EDSR、RCAN、HAT、MambaIRv2、TTSR、MASA-SR 和 DATSR 快捷脚本；Bicubic
+是无参数评估基线，使用 `scripts/test/sr.py --split test_easy|test_hard`，不训练。
+
 本地只打印某一条命令：
 
 ```bash

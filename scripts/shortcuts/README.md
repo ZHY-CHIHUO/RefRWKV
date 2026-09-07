@@ -58,11 +58,27 @@ bash scripts/shortcuts/refsrwkv_hrms_scd_sr_x4.sh --print
 bash scripts/shortcuts/refsrwkv_hrms_scd_ref_x4.sh --print
 ```
 
-一次查看三组命令：
+一次查看所有可训练的 HRMS-SCD 对比命令：
 
 ```bash
 bash scripts/shortcuts/show_commands.sh
 ```
+
+新增的单图 SR 快捷脚本为 `edsr_hrms_scd_sr_x4.sh`、
+`rcan_hrms_scd_sr_x4.sh`、`hat_hrms_scd_sr_x4.sh` 和
+`mambairv2_hrms_scd_sr_x4.sh`；真实参考图 RefSR 快捷脚本为
+`ttsr_hrms_scd_ref_x4.sh`、`masa_sr_hrms_scd_ref_x4.sh` 和
+`datsr_hrms_scd_ref_x4.sh`。它们都使用 `configs/common/benchmark.yaml`
+的统一协议。Bicubic 没有训练快捷脚本，需显式运行：
+
+```bash
+python scripts/test/sr.py \
+  --config configs/runs/sr/bicubic/hrms_scd_x4.yaml \
+  --split test_easy
+```
+
+完整方法表、参数量、官方环境与复现边界见
+[`docs/models/baselines.md`](../../docs/models/baselines.md)。
 
 快捷脚本会先检查对应实验目录中的 `config.yaml`。如果文件存在，就使用这份完整配置；否则才使用脚本内的 `configs/runs/...` 默认配置。因此可以先展开并编辑配置：
 

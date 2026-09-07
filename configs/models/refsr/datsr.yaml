@@ -1,0 +1,12 @@
+# DATSR-family alignment profile.  The official DCNv2/MMCV implementation has
+# a separate legacy environment; this profile uses the native grid-sample path.
+model:
+  name: datsr
+  family: refsr
+  variant: datsr_compat
+  implementation: native_compatibility
+  dim: 64
+  num_blocks: 10
+  match_window: 7
+  match_dim: 16
+  max_offset: 2.0

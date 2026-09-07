@@ -1,0 +1,12 @@
+# MASA-SR-family coarse matching and spatial-adaptation profile.
+model:
+  name: masa_sr
+  family: refsr
+  variant: masa_sr_compat
+  implementation: native_compatibility
+  dim: 64
+  num_blocks: 8
+  refine_blocks: 4
+  match_window: 7
+  match_dim: 16
+  max_offset: 2.0

@@ -1,0 +1,19 @@
+# Official TTSR bridge.  The upstream project declares Python 3.7 and
+# torch>=1.1; these conservative pins keep its VGG/torchvision code usable.
+name: ttsr
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pytorch=1.13
+  - torchvision=0.14
+  - pytorch-cuda=11.7
+  - pip
+  - pip:
+      - imageio
+      - opencv-python
+      - pyyaml
+      - tensorboard
+      - tqdm

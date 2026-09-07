@@ -15,9 +15,17 @@ from runtime.config import load_config, validate_config  # noqa: E402
 
 
 RUN_CONFIGS = (
+    "configs/runs/sr/bicubic/hrms_scd_x4.yaml",
+    "configs/runs/sr/edsr/hrms_scd_x4.yaml",
+    "configs/runs/sr/rcan/hrms_scd_x4.yaml",
     "configs/runs/sr/swinir/hrms_scd_x4.yaml",
+    "configs/runs/sr/hat/hrms_scd_x4.yaml",
+    "configs/runs/sr/mambairv2/hrms_scd_x4.yaml",
     "configs/runs/refsrwkv/hrms_scd_sr_x4.yaml",
     "configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml",
+    "configs/runs/refsr/ttsr/hrms_scd_x4.yaml",
+    "configs/runs/refsr/masa_sr/hrms_scd_x4.yaml",
+    "configs/runs/refsr/datsr/hrms_scd_x4.yaml",
 )
 
 
@@ -51,9 +59,8 @@ class HRMSSCDRunDefaultsTests(unittest.TestCase):
                     expected_train,
                 )
                 self.assertEqual(config["loss"]["name"], "l1")
-                if config["task"] == "refsr":
-                    self.assertEqual(config["loss"].get("ssim_weight"), 0.0)
-                    self.assertEqual(config["loss"].get("fft_weight"), 0.0)
+                self.assertEqual(config["loss"].get("ssim_weight"), 0.0)
+                self.assertEqual(config["loss"].get("fft_weight"), 0.0)
 
 
 if __name__ == "__main__":

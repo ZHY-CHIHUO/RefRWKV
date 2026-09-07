@@ -1,0 +1,12 @@
+# TTSR-family texture-transfer profile.  This native profile does not require
+# a downloaded VGG19 feature extractor and is not upstream-checkpoint compatible.
+model:
+  name: ttsr
+  family: refsr
+  variant: ttsr_compat
+  implementation: native_compatibility
+  dim: 64
+  num_blocks: 8
+  texture_blocks: 3
+  match_window: 7
+  match_dim: 16

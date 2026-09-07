@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run RefSRWKV or RefDiffRWKV on one native RefSR test split."""
+"""Run a direct RefSR model or RefDiffRWKV on one native RefSR test split."""
 
 from __future__ import annotations
 

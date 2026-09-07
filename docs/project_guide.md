@@ -15,6 +15,7 @@ YAML 配置 → data/loaders.py → 模型 registry → engine → experiments/
 | `README.md` | 安装、配置、训练、测试和数据准备的快速入口。 |
 | `requirements.txt` | SR、RefSRWKV 训练和评测所需的基础 Python 依赖。 |
 | `requirements-refdiff.txt` | RefDiffRWKV、离线感知指标和判别器所需的额外依赖。 |
+| `environments/` | 官方 MambaIRv2、TTSR、MASA-SR、DATSR bridge 的独立 Conda 环境定义；不会修改主 `rwkv7`。 |
 | `.gitignore` | 忽略本地数据、缓存、checkpoint、日志和编译产物。 |
 | `.vscode/settings.json` | VS Code 的项目编辑器设置。 |
 | `scripts/submit.sh` | 远程作业提交的通用 shell 入口。 |
@@ -38,6 +39,7 @@ YAML 配置按职责拆分。`common` 提供默认值，`datasets` 描述数据�
 | `refsrwkv.yaml` | RefSRWKV 的优化器、训练周期和损失默认值。 |
 | `refsrwkv_paired.yaml` | RefSRWKV 与真实参考图配对训练时的组合配置。 |
 | `refdiffrwkv.yaml` | RefDiffRWKV 的扩散、先验、判别器和采样默认值。 |
+| `benchmark.yaml` | HRMS-SCD x4 基线的固定优化、验证、预算和 L1 协议。 |
 
 ### `configs/datasets/`
 
@@ -55,7 +57,9 @@ YAML 配置按职责拆分。`common` 提供默认值，`datasets` 描述数据�
 | 文件 | 功能 |
 |---|---|
 | `models/sr/swinir_m.yaml` | SwinIR-M 的窗口、深度、通道和上采样参数。 |
+| `models/sr/{bicubic,edsr,rcan,hat,mambairv2}.yaml` | 五个 SISR 对比基线的默认结构参数。 |
 | `models/refsr/refsrwkv.yaml` | RefSRWKV 的编码器、匹配窗口、全局 latent、decoder refusion 和置信度门控开关。 |
+| `models/refsr/{ttsr,masa_sr,datsr}.yaml` | 三个真实参考图 RefSR 对比基线的默认结构参数（另加项目原有 RefSRWKV）。 |
 | `models/refsr/refdiffrwkv.yaml` | RefDiffRWKV 的模型族标识，并引入扩散公共配置。 |
 
 ### `configs/runs/`
@@ -77,6 +81,8 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 | `runs/refdiffrwkv/stage2.yaml` | 加入语义和 SR 条件的训练阶段。 |
 | `runs/refdiffrwkv/stage3.yaml` | 加入置信度、时序门控和自相似传播的训练阶段。 |
 | `runs/refdiffrwkv/stage4.yaml` | 启用判别器和 GAN 损失的完整训练阶段。 |
+| `runs/sr/{bicubic,edsr,rcan,hat,mambairv2}/hrms_scd_x4.yaml` | HRMS-SCD x4 SISR 比较配置。 |
+| `runs/refsr/{ttsr,masa_sr,datsr}/hrms_scd_x4.yaml` | HRMS-SCD x4 paired RefSR 比较配置。 |
 
 ## `data/`
 
@@ -117,6 +123,17 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 | `models/refsr/registry.py` | 注册和构造 RefSR 模型。 |
 | `models/sr/__init__.py`、`models/refsr/__init__.py` | 暴露模型构造接口。 |
 
+### 对比基线
+
+| 路径 | 功能 |
+|---|---|
+| `models/sr/baselines.py` | Bicubic、EDSR、RCAN、HAT、MambaIRv2 的主环境 compatibility 网络。 |
+| `models/sr/baseline_adapters.py` | 将上述 SISR 网络注册到统一 SR registry。 |
+| `models/refsr/baselines.py` | TTSR、MASA-SR、DATSR 的主环境 direct RefSR compatibility 网络。 |
+| `models/refsr/baseline_adapters.py` | 注册 direct RefSR 对比网络。 |
+
+这些模型与官方项目的 exact checkpoint 不互换；原因、参数量和官方 bridge 环境见 [模型基线说明](models/baselines.md)。
+
 ### `models/sr/swinir/`
 
 | 文件 | 功能 |
@@ -154,6 +171,7 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 |---|---|
 | `engines/base_trainer.py` | 公共训练生命周期、优化器、EMA、验证、checkpoint 和 scheduler。 |
 | `engines/sr/trainer.py` | SR 的 batch 解包、前向、损失和验证步骤。 |
+| `engines/refsr/trainer.py` | 任意 `forward(lr, ref)` direct RefSR 模型的统一训练步骤。 |
 | `engines/refsr/refsrwkv_trainer.py` | RefSRWKV 的 batch、参考图和损失步骤。 |
 | `engines/refsr/refdiff_trainer.py` | RefDiffRWKV 的生成器/判别器交替训练和扩散损失。 |
 | `*/__init__.py` | 导出各任务的 engine。 |
@@ -193,10 +211,11 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 | 文件或目录 | 功能 |
 |---|---|
 | `scripts/train/sr.py` | 启动 SwinIR 等 SR 训练。 |
+| `scripts/train/refsr.py` | 启动 TTSR、MASA-SR、DATSR 等 direct RefSR 基线训练。 |
 | `scripts/train/refsrwkv.py` | 启动 RefSRWKV 训练。 |
 | `scripts/train/refdiffrwkv.py` | 启动 RefDiffRWKV 训练。 |
 | `scripts/test/sr.py` | SR 推理和测试。 |
-| `scripts/test/refsr.py` | RefSRWKV/RefDiffRWKV 推理和测试。 |
+| `scripts/test/refsr.py` | direct RefSR / RefDiffRWKV 推理和测试。 |
 | `scripts/evaluate.py` | 统一评估入口。 |
 | `scripts/prepare/remote_sensing.py` | 将遥感原始图像整理为 HR/LR split，并生成 bicubic LR。 |
 | `scripts/shortcuts/` | 按模型、数据集、任务和倍率命名的训练快捷入口；`show_commands.sh` 可集中查看命令。 |

@@ -1,7 +1,8 @@
 """Reference-based super-resolution model families.
 
-Only the two supported model families are exposed here: ``RefSRWKV`` and
-``RefDiffRWKV``.  Heavy diffusion dependencies remain lazy.
+Direct models use the shared ``forward(lr, ref) -> sr`` contract and are
+registered lazily.  RefDiffRWKV remains lazy because importing its diffusion
+stack is intentionally optional.
 """
 
 from .registry import RefSRModelAdapter, build_model, get_adapter, list_models, register_adapter

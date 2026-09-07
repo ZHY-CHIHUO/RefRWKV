@@ -1,0 +1,8 @@
+# Parameter-free interpolation reference.  Evaluation only; no optimizer or
+# checkpoint is needed.
+model:
+  name: bicubic
+  family: sr
+  variant: bicubic
+  implementation: reference_only
+  trainable: false

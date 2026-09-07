@@ -53,7 +53,7 @@ def _load_builtins() -> None:
         return
     # Importing registers built-ins and keeps this core module independent of
     # any particular architecture's optional dependencies.
-    from . import swinir  # noqa: F401
+    from . import baseline_adapters, swinir  # noqa: F401
 
     _BUILTINS_LOADED = True
 

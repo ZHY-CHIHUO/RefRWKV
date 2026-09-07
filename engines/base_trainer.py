@@ -157,8 +157,13 @@ class BaseTrainer(pl.LightningModule, ABC):
         scheduler.step(metric) if metric is not None else scheduler.step()
 
     def configure_optimizers(self):
+        parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        if not parameters:
+            raise ValueError(
+                "model has no trainable parameters; use the evaluation entry point for a reference-only baseline such as Bicubic"
+            )
         optimizer = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
+            parameters,
             lr=self.learning_rate,
             betas=self.betas,
             weight_decay=self.weight_decay,

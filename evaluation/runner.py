@@ -22,7 +22,7 @@ from models.refsr import build_model as build_refsr_model
 from models.sr import build_model as build_sr_model
 from runtime.checkpoint import load_checkpoint, load_model_weights
 from runtime.common import gaussian_ssim, per_image_psnr, resolve_path
-from runtime.config import normalize_reference_mode, validate_config
+from runtime.config import is_refsr_model, normalize_reference_mode, validate_config
 from runtime.experiments import layout_from_config
 
 LOGGER = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ def _reference_for_refsr_batch(
     if ref is None:
         raise ValueError(
             f"data.reference_mode=paired requires batch[{ref_key!r}]; "
-            "use a LR/HR/Ref dataset or select reference_mode=lr_up for RefSRWKV."
+            "use a LR/HR/Ref dataset or a model/configuration that supports lr_up."
         )
     if not torch.is_tensor(ref):
         raise TypeError(f"batch[{ref_key!r}] must be a tensor, got {type(ref).__name__}")
@@ -142,7 +142,7 @@ def _build_refsr_model(
 def run_inference(
     config: Mapping[str, Any],
     *,
-    checkpoint: str | Path,
+    checkpoint: str | Path | None = None,
     split: str = "test",
     output: str | Path | None = None,
     device: str | None = None,
@@ -163,23 +163,31 @@ def run_inference(
     task = str(config.get("task", "")).lower()
     model_name = str(config.get("model", {}).get("name", "")).lower()
     if task not in {"sr", "refsr"}:
-        task = "refsr" if model_name in {"refsrwkv", "refdiffrwkv"} else "sr"
+        task = "refsr" if is_refsr_model(model_name) else "sr"
     reference_mode = (
         normalize_reference_mode(config["data"].get("reference_mode", "paired"))
         if task == "refsr"
         else None
     )
     selected_device = select_device(config, device)
-    checkpoint_obj = load_checkpoint(resolve_path(checkpoint, prefer_cwd=True))
+    is_bicubic = task == "sr" and model_name == "bicubic"
+    if checkpoint is None and not is_bicubic:
+        raise ValueError("--checkpoint is required for every trainable SR/RefSR model; Bicubic is the only checkpoint-free baseline")
+    checkpoint_path = resolve_path(checkpoint, prefer_cwd=True) if checkpoint is not None else None
+    checkpoint_obj = load_checkpoint(checkpoint_path) if checkpoint_path is not None else None
 
     if task == "sr":
         loader = build_sr_test_loader(config, split=split, batch_size=batch_size)
         model = build_sr_model(config["model"], scale=int(config["data"]["scale"]))
-        report = load_model_weights(model, checkpoint_obj, prefer_ema=not raw_weights)
-        LOGGER.info("loaded SR checkpoint: %s", report)
+        if checkpoint_obj is not None:
+            report = load_model_weights(model, checkpoint_obj, prefer_ema=not raw_weights)
+            LOGGER.info("loaded SR checkpoint: %s", report)
+        else:
+            LOGGER.info("running parameter-free Bicubic baseline without a checkpoint")
         model = model.to(selected_device).eval()
         value_range, generator = "minus_one_one", None
     else:
+        assert checkpoint_obj is not None
         loader = build_refsr_test_loader(config, split=split, batch_size=batch_size)
         model, value_range, generator = _build_refsr_model(
             config, checkpoint_obj, selected_device, raw_weights=raw_weights
@@ -251,13 +259,16 @@ def run_inference(
     metrics = {
         "task": task,
         "model": model_name,
+        "implementation": str(config.get("model", {}).get("implementation", "native")),
+        "variant": str(config.get("model", {}).get("variant", model_name)),
         "dataset": str(config.get("dataset", {}).get("id", "dataset")),
         "scale": scale,
         "split": split,
+        "reference_mode": reference_mode,
         "samples": sample_count,
         "psnr": {"mean": sum(psnr_values) / len(psnr_values), "per_image": psnr_values},
         "ssim": {"mean": sum(ssim_values) / len(ssim_values), "per_image": ssim_values},
-        "checkpoint": str(resolve_path(checkpoint, prefer_cwd=True)),
+        "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
     }
     metrics_path = split_root / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

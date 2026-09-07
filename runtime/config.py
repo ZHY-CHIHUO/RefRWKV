@@ -52,6 +52,14 @@ _PAIRED_ONLY_DATA_KEYS = (
 )
 _PAIRED_ONLY_LOSS_KEYS = ("ref_drop_prob",)
 
+# Direct RefSR models all expose ``forward(lr, ref)``.  Keeping the names in
+# runtime (rather than importing model packages here) lets config rendering,
+# training and evaluation agree on the task without pulling optional model
+# dependencies into the configuration parser.
+DIRECT_REFSR_MODEL_NAMES = frozenset({"refsrwkv", "ttsr", "masa_sr", "datsr"})
+REFSR_MODEL_NAMES = DIRECT_REFSR_MODEL_NAMES | frozenset({"refdiffrwkv"})
+PAIRED_REFERENCE_MODEL_NAMES = frozenset({"ttsr", "masa_sr", "datsr", "refdiffrwkv"})
+
 
 def normalize_reference_mode(value: Any) -> str:
     """Return the canonical RefSR reference source mode.
@@ -88,6 +96,11 @@ def normalize_lr_provenance(value: Any) -> str:
         raise ValueError(f"data.lr_provenance 必须是 {options}，得到 {value!r}") from exc
 
 
+def is_refsr_model(value: Any) -> bool:
+    """Return whether a registered model name belongs to the RefSR task."""
+    return str(value or "").strip().lower() in REFSR_MODEL_NAMES
+
+
 def validate_refsr_reference_contract(config: Mapping[str, Any]) -> None:
     """Reject RefSR configurations whose reference settings cannot take effect.
 
@@ -103,15 +116,19 @@ def validate_refsr_reference_contract(config: Mapping[str, Any]) -> None:
 
     model_name = str(model.get("name") or model.get("id") or "").strip().lower()
     task = str(config.get("task") or "").strip().lower()
-    is_refsr = task == "refsr" or model_name in {"refsrwkv", "refdiffrwkv"}
+    is_refsr = task == "refsr" or is_refsr_model(model_name)
     if not is_refsr:
         return
 
     mode = normalize_reference_mode(data.get("reference_mode", "paired"))
-    if model_name == "refdiffrwkv" and mode != "paired":
+    if model_name in PAIRED_REFERENCE_MODEL_NAMES and mode != "paired":
+        if model_name == "refdiffrwkv":
+            detail = "训练和推理都需要真实的 LR/HR/Ref 三元组。"
+        else:
+            detail = "该比较基线只能使用真实的 LR/HR/Ref 三元组。"
         raise ValueError(
-            "model.name=RefDiffRWKV 当前只支持 data.reference_mode=paired；"
-            "训练和推理都需要真实的 LR/HR/Ref 三元组。"
+            f"model.name={model.get('name', model_name)} 当前只支持 "
+            f"data.reference_mode=paired；{detail}"
         )
     if mode != "lr_up":
         return
@@ -240,7 +257,7 @@ def materialize_config(config: dict[str, Any], config_path: Path) -> dict[str, A
 
     task = str(result.get("task") or model.get("task") or "").lower().strip()
     if task not in {"sr", "refsr"}:
-        task = "refsr" if model_name.lower() in {"refsrwkv", "refdiffrwkv"} else "sr"
+        task = "refsr" if is_refsr_model(model_name) else "sr"
     result["task"] = task
     model["name"] = model_name
 
@@ -417,9 +434,13 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
 
 __all__ = [
     "apply_overrides",
+    "DIRECT_REFSR_MODEL_NAMES",
     "load_config",
     "load_yaml_file",
     "materialize_config",
+    "PAIRED_REFERENCE_MODEL_NAMES",
+    "REFSR_MODEL_NAMES",
+    "is_refsr_model",
     "normalize_reference_mode",
     "normalize_lr_source",
     "normalize_lr_provenance",

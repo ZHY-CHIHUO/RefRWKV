@@ -1,0 +1,11 @@
+# Portable MambaIRv2-family profile.  The optional official MambaSSM backend
+# is isolated in environments/mambairv2-official.yaml.
+model:
+  name: mambairv2
+  family: sr
+  variant: mambairv2_compat
+  implementation: native_compatibility
+  dim: 64
+  num_blocks: 12
+  expansion: 2
+  official_backend: mamba_ssm

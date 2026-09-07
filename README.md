@@ -9,7 +9,7 @@ RefRWKV 是一个参考图超分辨率（RefSR）和单图超分辨率（SR）�
 ```text
 RefRWKV/
 ├── configs/                       # 分层 YAML 配置
-│   ├── common/                   # 全局、SR、RefSR、RefSRWKV、RefDiffRWKV 默认值
+│   ├── common/                   # 全局、任务默认值与 benchmark 比较协议
 │   ├── datasets/sr/              # SR 数据集配置及 LR 来源元数据
 │   ├── datasets/refsr/           # RefSR 数据集配置及 LR 来源元数据
 │   ├── models/sr/                # SR 网络默认参数
@@ -22,9 +22,10 @@ RefRWKV/
 │   ├── raw/                      # 原始压缩包和解压内容
 │   └── archives/                 # RefSR 多卷压缩包等归档
 ├── models/
-│   ├── sr/                       # SR registry 和模型实现
+│   ├── sr/                       # SR registry、SwinIR 和对比模型实现
 │   └── refsr/
 │       ├── refsrwkv/             # 参考图超分 RWKV 模型
+│       ├── baselines.py           # TTSR、MASA-SR、DATSR compatibility 基线
 │       └── RefDiffRWKV/          # 参考图扩散模型、适配器、G/D、采样器
 ├── engines/                      # 训练生命周期
 │   ├── base_trainer.py           # optimizer、EMA、验证、checkpoint 等公共逻辑
@@ -36,7 +37,7 @@ RefRWKV/
 ├── metrics/                      # PSNR、SSIM 等指标
 ├── kernels/wkv/                  # WKV CUDA 源码
 ├── scripts/
-│   ├── train/                    # sr.py、refsrwkv.py、refdiffrwkv.py
+│   ├── train/                    # sr.py、refsr.py、refsrwkv.py、refdiffrwkv.py
 │   ├── test/                     # sr.py、refsr.py
 │   ├── shortcuts/                # 按模型/数据集/任务/倍率命名的快捷训练脚本
 │   ├── prepare/                  # 数据准备脚本
@@ -48,7 +49,8 @@ RefRWKV/
 │   ├── pretrained/               # 外部或下载的权重
 │   └── exports/                  # 明确导出的部署权重
 ├── tests/                        # smoke/regression tests
-└── docs/                         # 架构和数据说明
+├── environments/                 # 可选官方基线的独立 Conda 环境定义
+└── docs/                         # 架构、数据和对比实验说明
 ```
 
 `RefSRWKV` 和 `RefDiffRWKV` 都属于 `models/refsr/`。扩散模型可以通过 `model.sr.ckpt_path` 使用 RefSRWKV 或其他可作为先验的 SR 网络，扩散相关代码和配置均位于 RefSR 的模型与运行目录中。
@@ -68,6 +70,11 @@ python -m pip install -r requirements-refdiff.txt
 ```
 
 Stage 4 还需要 `vision_aided_loss`，其上游安装命令写在 `requirements-refdiff.txt`。WKV CUDA 后端需要本机 CUDA toolkit/NVCC；模型导入和 `--help` 不会主动编译扩展。
+
+EDSR、RCAN、HAT、MambaIRv2、TTSR、MASA-SR、DATSR 的可训练 compatibility
+基线已包含在主环境；官方旧代码或编译依赖不要混装进 `rwkv7`。环境 YAML、风险
+和结果可比性边界见 [环境说明](environments/README.md) 与
+[完整基线表](docs/models/baselines.md)。
 
 ## 配置
 
@@ -133,6 +140,12 @@ python scripts/train/refsrwkv.py \
   --config configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml
 ```
 
+完整对比集合（Bicubic、EDSR、RCAN、SwinIR、HAT、MambaIRv2、RefSRWKV、TTSR、
+MASA-SR、DATSR）的配置、快捷入口、参数量和复现边界见
+[HRMS-SCD x4 对比基线](docs/models/baselines.md)。其中 Bicubic 只评估，其余
+模型统一使用 `1e-4`、plateau、每 epoch 验证、L1、`max_epochs: -1`、
+`max_steps: 50000` 和无 early stopping。
+
 RefDiffRWKV：
 
 ```bash
@@ -167,7 +180,7 @@ python scripts/test/sr.py \
   --split test
 ```
 
-RefSRWKV 或 RefDiffRWKV：
+RefSRWKV、TTSR、MASA-SR、DATSR 或 RefDiffRWKV：
 
 ```bash
 python scripts/test/refsr.py \
@@ -224,7 +237,10 @@ python scripts/prepare/remote_sensing.py \
 
 添加 SR 模型时，在 `models/sr/<model>/` 放网络和 adapter，并在 adapter 中调用 `register_adapter(...)`；增加一个 `configs/models/sr/<model>.yaml` 和 `configs/runs/sr/<model>/...yaml` 即可复用现有数据、训练和评估流程。
 
-添加 RefSR 模型时，在 `models/refsr/<ModelName>/` 放模型代码，在 `engines/refsr/` 增加只包含模型特有 step 的 engine，并添加对应 run 配置。公共 checkpoint、EMA、TensorBoard、scheduler 和 early stopping 逻辑放在 `engines/base_trainer.py`。
+添加直接 RefSR 模型时，实现 `forward(lr, ref) -> sr` 并注册 adapter；它可复用
+`engines/refsr/trainer.py` 和 `scripts/train/refsr.py`。只有特殊训练机制（如扩散）
+才需要专用 engine。公共 checkpoint、EMA、TensorBoard、scheduler 和 early stopping
+逻辑放在 `engines/base_trainer.py`。
 
 模型目录不能直接依赖另一个具体模型目录的私有实现；跨模型复用的训练和运行时能力放在 `engines/`、`runtime/`、`losses/`、`metrics/`，WKV CUDA 代码放 `kernels/wkv/`。
 

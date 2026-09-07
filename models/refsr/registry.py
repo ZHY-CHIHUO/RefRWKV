@@ -24,6 +24,14 @@ class RefSRModelAdapter(ABC):
     def build(self, model_config: Mapping[str, Any], *, scale: int) -> nn.Module:
         """Construct an untrained ``forward(lr, ref)`` model for ``scale``."""
 
+    def describe(self, model_config: Mapping[str, Any], *, scale: int) -> dict[str, Any]:
+        """Return model metadata suitable for experiment reports."""
+        return {
+            "name": self.name,
+            "scale": int(scale),
+            "config": dict(model_config),
+        }
+
 
 _ADAPTERS: dict[str, RefSRModelAdapter] = {}
 _BUILTINS_LOADED = False
@@ -47,7 +55,7 @@ def _load_builtins() -> None:
         return
     # Importing package adapters performs registration while keeping this
     # registry independent of concrete model implementations.
-    from . import refsrwkv  # noqa: F401
+    from . import baseline_adapters, refsrwkv  # noqa: F401
 
     _BUILTINS_LOADED = True
 

@@ -7,7 +7,7 @@
 ```text
 RefRWKV/
 ├── configs/
-│   ├── common/                 # 任务公共默认值
+│   ├── common/                 # 任务公共默认值与 benchmark 比较协议
 │   ├── datasets/{sr,refsr}/    # 数据集元信息与路径
 │   ├── models/{sr,refsr}/      # 网络结构默认值
 │   └── runs/                   # 可直接启动的实验配置
@@ -19,21 +19,23 @@ RefRWKV/
 │   └── archives/refsr/         # RefSR 原始压缩包
 ├── models/
 │   ├── sr/                     # 单图 SR 模型与 registry
-│   │   └── swinir/             # SwinIR 网络和 adapter
+│   │   ├── swinir/             # SwinIR 网络和 adapter
+│   │   └── baselines.py        # Bicubic、EDSR、RCAN、HAT、MambaIRv2 compatibility
 │   └── refsr/
 │       ├── refsrwkv/           # 参考超分 RWKV 模型
+│       ├── baselines.py        # TTSR、MASA-SR、DATSR compatibility
 │       └── RefDiffRWKV/        # 参考超分扩散模型及其 G/D 组件
 ├── engines/
 │   ├── base_trainer.py         # 训练公共生命周期
 │   ├── sr/trainer.py           # SR 的 train/eval step
-│   └── refsr/                  # RefSRWKV 与 RefDiffRWKV engine
+│   └── refsr/                  # direct RefSR、RefSRWKV 与 RefDiffRWKV engine
 ├── kernels/wkv/                # WKV CUDA 源码，模型只通过统一接口调用
 ├── losses/                     # 可组合损失
 ├── metrics/                    # 指标实现
 ├── evaluation/                # 推理、指标汇总和结果写盘
 ├── runtime/                    # 配置、checkpoint、实验路径、EMA 等运行时工具
 ├── scripts/
-│   ├── train/                  # sr.py、refsrwkv.py、refdiffrwkv.py
+│   ├── train/                  # sr.py、refsr.py、refsrwkv.py、refdiffrwkv.py
 │   ├── test/                   # SR/RefSR 推理入口
 │   ├── shortcuts/              # 按模型/数据集/任务/倍率命名的快捷训练脚本
 │   ├── prepare/                # 数据准备脚本
@@ -45,6 +47,7 @@ RefRWKV/
 │   ├── pretrained/              # 外部或下载的预训练权重
 │   └── exports/                 # 明确导出的部署权重
 ├── tests/                      # 轻量 smoke test 与回归测试
+├── environments/               # 可选官方基线的独立 Conda 环境定义
 └── docs/                       # 架构和数据说明
 ```
 
@@ -58,6 +61,11 @@ RefRWKV/
 2. `configs/common/sr.yaml`、`refsr.yaml`、`refsrwkv.yaml`、`refdiffrwkv.yaml`：任务或模型家族的训练默认值。
 3. `configs/datasets/sr/*.yaml`、`configs/datasets/refsr/*.yaml`：数据集 id、物理路径、原始尺寸、split 数量和参考图策略。
 4. `configs/models/*/*.yaml` 与 `configs/runs/**/*.yaml`：网络结构和一次可复现实验的 scale、patch、损失开关。
+
+HRMS-SCD x4 的完整对比 run 在上述 base 列表的最后再引入
+`configs/common/benchmark.yaml`，以覆盖模型家族自己的训练默认值。它固定
+`1e-4`、Plateau、每 epoch 验证、纯 L1、`max_epochs: -1`、`max_steps: 50000`
+和禁用 early stopping；完整范围见[对比基线表](models/baselines.md)。
 
 例如 `configs/runs/refsrwkv/real_refrssrd_x10.yaml` 只声明数据集、x10 和少数差异；它的通用训练参数来自 `common/refsrwkv.yaml`，网络参数来自 `models/refsr/refsrwkv.yaml`。命令行可以用 `--overrides model.dim=64 train.learning_rate=5e-5` 覆盖任意点路径。
 
@@ -81,7 +89,7 @@ LR 来源由三个字段明确描述：
 - `data.lr_native_scale`：磁盘 LR 的原生倍率。
 - `data.lr_provenance=bicubic|sensor`：AID、UC Merced、HRMS-SCD 是 HR bicubic 下采样；Real-RefRSSRD 是 Sentinel-2 实测 LR。
 
-`bicubic` 数据允许在其他倍率从 HR 重新生成 LR；`sensor` 数据禁止重采样，要求请求倍率等于原生倍率并存在磁盘 LR。RefSRWKV 的 `reference_mode: lr_up` 只返回 `lr/hr`，由 trainer 从 LR 生成 bicubic 自参考；`paired` 才读取 `Ref`。因此 SwinIR 在 RefSR 目录上训练时可以复用同一个 Dataset 并忽略 `Ref`。
+`bicubic` 数据允许在其他倍率从 HR 重新生成 LR；`sensor` 数据禁止重采样，要求请求倍率等于原生倍率并存在磁盘 LR。RefSRWKV 的 `reference_mode: lr_up` 只返回 `lr/hr`，由 trainer 从 LR 生成 bicubic 自参考；`paired` 才读取 `Ref`。TTSR、MASA-SR、DATSR 和 RefDiffRWKV 被配置校验强制为 `paired`，不会把 bicubic(LR) 误作跨时相参考图。因此 SwinIR 在 RefSR 目录上训练时可以复用同一个 Dataset 并忽略 `Ref`。
 
 配置也按该契约分层：`common/refsr.yaml` 和 `common/refsrwkv.yaml` 只放两个模式都可用的默认值；`common/refsr_paired.yaml`、`common/refsrwkv_paired.yaml` 才包含 `augment_ref`、颜色/灰度参考图增强和 `loss.ref_drop_prob`。`lr_up` 不允许出现这些字段，避免真实 Ref 增强配置被静默忽略。`RefDiffRWKV` 固定使用 `paired`，训练与采样都必须得到真实 `LR/HR/Ref` 三元组。
 
@@ -97,7 +105,9 @@ LR 来源由三个字段明确描述：
 
 ### SR registry
 
-`models/sr/registry.py` 只定义模型注册和构造接口。每个 SR 模型建立自己的目录，例如：
+`models/sr/registry.py` 只定义模型注册和构造接口。现有的 SwinIR 使用独立目录；
+轻量、无额外依赖的比较模型集中在 `baselines.py` 与 `baseline_adapters.py`。后续
+每个 SR 模型也可以建立自己的目录，例如：
 
 ```text
 models/sr/rcan/
@@ -113,7 +123,13 @@ models/sr/rcan/
 RefSR 模型目录包括：
 
 - `models/refsr/refsrwkv/`：独立的参考图超分网络，既可以直接训练，也可以作为扩散模型的 SR prior。
+- `models/refsr/baselines.py`：TTSR、MASA-SR、DATSR 的 `forward(lr, ref) -> sr` direct RefSR compatibility 实现，统一使用 RGB `[-1, 1]` 张量。
 - `models/refsr/RefDiffRWKV/`：扩散生成器、参考适配器、语义模块、判别器、采样器和系统封装。
+
+direct RefSR 通过 `models/refsr/registry.py` 注册，并由
+`engines/refsr/trainer.py` 与 `scripts/train/refsr.py` 共享训练循环。官方代码或
+官方 checkpoint 需要独立 bridge 环境，不能与 `native_compatibility` checkpoint
+互换；环境和可比性边界见[对比基线表](models/baselines.md)。
 
 扩散模型属于 RefSR，并通过 `model.sr.ckpt_path` 加载 `RefSRWKV` 或其他可作为先验的 SR 网络权重；`model.sr_fixed: true` 时 prior 冻结，设为 false 时可以联合微调。替换 prior 只需要替换构造器和权重配置，不改变数据契约。
 
@@ -121,7 +137,7 @@ RefSR 模型目录包括：
 
 ## 训练 engine
 
-`engines/base_trainer.py` 统一处理 AdamW、EMA、梯度裁剪、验证指标、checkpoint 元数据、Plateau/Cosine scheduler 和 Lightning 生命周期。`engines/sr/trainer.py` 与 `engines/refsr/refsrwkv_trainer.py` 只负责解包 batch、前向和损失的差异。
+`engines/base_trainer.py` 统一处理 AdamW、EMA、梯度裁剪、验证指标、checkpoint 元数据、Plateau/Cosine scheduler 和 Lightning 生命周期。`engines/sr/trainer.py`、`engines/refsr/trainer.py` 与 `engines/refsr/refsrwkv_trainer.py` 只负责解包 batch、前向和损失的差异；其中 direct RefSR trainer 适用于任意 `forward(lr, ref)` 模型。
 
 `engines/refsr/refdiff_trainer.py` 负责 RefDiffRWKV 的 G/D 交替、手动梯度累积和 AMP；这些步骤是扩散系统本身的训练协议。它使用与其他任务相同的实验目录、配置快照和 checkpoint 规则。
 
@@ -133,7 +149,7 @@ RefSR 模型目录包括：
 - `weights/exports/`：从实验中明确导出的部署或分享权重。
 - `experiments/train/.../checkpoints/`：保存一次训练运行的 `last.ckpt`、top-k checkpoint 和恢复所需的配置快照。
 - `experiments/train/.../logs/`：TensorBoard event 文件和训练日志；用 `tensorboard --logdir experiments/train` 查看。
-- `experiments/test/.../`：保存推理图片和 `metrics.json`。
+- `experiments/test/.../`：保存推理图片和 `metrics.json`；后者也记录 `implementation`、`variant` 和 `reference_mode`，供结果汇总时区分 native 与官方 bridge。
 
 标准路径为：
 
@@ -172,6 +188,15 @@ python scripts/test/sr.py \
   --split test
 ```
 
+其他单图比较模型共用同一入口，例如：
+
+```bash
+python scripts/train/sr.py --config configs/runs/sr/rcan/hrms_scd_x4.yaml
+python scripts/test/sr.py \
+  --config configs/runs/sr/bicubic/hrms_scd_x4.yaml \
+  --split test_easy
+```
+
 RefSRWKV：
 
 ```bash
@@ -180,6 +205,12 @@ python scripts/test/refsr.py \
   --config configs/runs/refsrwkv/hrms_scd_x4.yaml \
   --checkpoint experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_x4/checkpoints/last.ckpt \
   --split test_easy
+```
+
+TTSR、MASA-SR、DATSR 共享 direct RefSR 入口，例如：
+
+```bash
+python scripts/train/refsr.py --config configs/runs/refsr/datsr/hrms_scd_x4.yaml
 ```
 
 RefDiffRWKV 的四阶段配置都在 `configs/runs/refdiffrwkv/`。把训练好的 RefSRWKV 权重写入 `model.sr.ckpt_path`，然后运行：
@@ -219,4 +250,7 @@ data:
 
 ## 添加模型
 
-SR 模型按 registry/adaptor 约定接入 `models/sr/`。RefSR 模型在 `models/refsr/<ModelName>/` 中自包含，明确 `forward(lr, ref)` 或扩散系统的输入输出值域，并在 `scripts/test` 的构造分支中注册。训练器只读取数据键名和模型接口，不直接 import 另一个模型的私有实现。
+SR 模型按 registry/adaptor 约定接入 `models/sr/`。direct RefSR 模型实现
+`forward(lr, ref)` 并注册 adapter 后，可直接复用 `scripts/train/refsr.py` 与统一
+评估入口；扩散模型才需要专用 engine。训练器只读取数据键名和模型接口，不直接
+import 另一个模型的私有实现。

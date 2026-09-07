@@ -1,0 +1,22 @@
+# Official MambaIR/MambaIRv2 bridge; separate from rwkv7 because mamba-ssm
+# and causal-conv1d compile CUDA extensions against the selected torch build.
+name: mambairv2
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.1
+  - torchvision=0.16
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+      - basicsr==1.4.2
+      - einops>=0.7
+      - timm>=0.9
+      - mamba-ssm==1.2.0.post1
+      - causal-conv1d>=1.2.0.post1
+      - opencv-python
+      - pyyaml
+      - tensorboard

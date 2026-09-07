@@ -1,0 +1,9 @@
+# EDSR-style residual SR baseline.
+model:
+  name: edsr
+  family: sr
+  variant: edsr_baseline
+  implementation: native_compatibility
+  dim: 64
+  num_blocks: 16
+  res_scale: 0.1

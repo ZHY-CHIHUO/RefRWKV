@@ -1,0 +1,19 @@
+# Official MASA-SR bridge.  MASA-SR itself has light Python dependencies, but
+# a separate environment keeps its legacy scripts and checkpoint format apart.
+name: masa-sr
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pytorch=1.13
+  - torchvision=0.14
+  - pytorch-cuda=11.7
+  - pip
+  - pip:
+      - imageio
+      - opencv-python
+      - pyyaml
+      - tensorboard
+      - tqdm

@@ -1,6 +1,7 @@
 base:
   - ../../common/refsrwkv.yaml
   - ../../models/refsr/refsrwkv.yaml
+  - ../../common/benchmark.yaml
 
 dataset:
   config: ../../datasets/refsr/hrms_scd.yaml
@@ -14,16 +15,6 @@ data:
   reference_mode: lr_up
   max_samples_val: 300
 
-train:
-  learning_rate: 1.0e-4
-  max_epochs: -1
-  max_steps: 50000
-  early_stopping_patience: null
-  lr_scheduler: plateau
-  val_check_interval: 1.0
-  check_val_every_n_epoch: 1
-
 loss:
-  name: l1
   ssim_weight: 0.0
   fft_weight: 0.0

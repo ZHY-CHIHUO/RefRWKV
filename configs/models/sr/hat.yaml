@@ -1,0 +1,11 @@
+# Dependency-free HAT-family profile.  It preserves local hybrid and channel
+# attention but is not a checkpoint-compatible BasicSR/HAT copy.
+model:
+  name: hat
+  family: sr
+  variant: hat_compat_s
+  implementation: native_compatibility
+  dim: 96
+  num_blocks: 12
+  reduction: 16
+  window_size: 16
