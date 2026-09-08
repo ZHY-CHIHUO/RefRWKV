@@ -23,6 +23,7 @@ from data.loaders import build_refsr_loaders
 from engines.refsr import RefSRTrainer
 from runtime.checkpoint import load_checkpoint, load_model_weights
 from runtime.config import load_config, validate_config
+from runtime.callbacks import StopOnLearningRate
 from runtime.experiments import layout_from_config, save_config_snapshot
 
 logger = logging.getLogger("train.refsr")
@@ -51,6 +52,8 @@ def _callbacks(config: dict[str, Any], checkpoint_dir: Path) -> list[Any]:
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
+    if train.get("stop_at_lr_min", False):
+        callbacks.append(StopOnLearningRate(float(train["lr_min"])))
     patience = train.get("early_stopping_patience")
     if patience is not None:
         callbacks.insert(1, EarlyStopping(monitor="val/loss", mode="min", patience=int(patience)))

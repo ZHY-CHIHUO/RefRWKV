@@ -54,6 +54,7 @@ class BaseTrainer(pl.LightningModule, ABC):
         self.ema = EMA(float(train.get("ema_decay", 0.999))) if self.use_ema else None
         self._ema_last_step = -1
         self._plateau_scheduler = None
+        self._checkpoint_train_config: dict[str, Any] | None = None
         data = self.config.get("data", {})
         dataset = self.config.get("dataset", {})
         if not isinstance(data, Mapping):
@@ -182,6 +183,40 @@ class BaseTrainer(pl.LightningModule, ABC):
     def on_train_start(self) -> None:
         if self.ema is not None:
             self.ema._init(self.model)
+        self._sync_resumed_optimization_config()
+
+    def _sync_resumed_optimization_config(self) -> None:
+        """Apply edited optimization settings after checkpoint restoration.
+
+        Lightning restores optimizer and scheduler state after ``on_fit_start``.
+        This hook runs later, so edits made to an experiment snapshot are not
+        overwritten by the serialized state.
+        """
+        scheduler = self._plateau_scheduler
+        train = self.config["train"]
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.factor = float(train.get("lr_factor", scheduler.factor))
+            scheduler.patience = int(train.get("lr_patience", scheduler.patience))
+            scheduler.threshold = float(train.get("lr_threshold", scheduler.threshold))
+            scheduler.threshold_mode = "abs"
+            min_lr = float(train.get("lr_min", min(scheduler.min_lrs)))
+            scheduler.min_lrs = [min_lr for _ in scheduler.optimizer.param_groups]
+            scheduler.default_min_lr = min_lr
+
+        # Preserve a scheduler-decayed LR when only the run budget/plateau
+        # policy changed.  Explicitly changing learning_rate starts the
+        # resumed optimizer from the newly requested value.
+        saved_train = self._checkpoint_train_config
+        if not saved_train or "learning_rate" not in train:
+            return
+        old_lr = saved_train.get("learning_rate")
+        new_lr = float(train["learning_rate"])
+        if old_lr is not None and float(old_lr) == new_lr:
+            return
+        optimizers = getattr(self.trainer, "optimizers", None) or []
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = new_lr
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         if self.ema is None:
@@ -276,6 +311,11 @@ class BaseTrainer(pl.LightningModule, ABC):
             checkpoint["ema_state"] = self.ema.state_dict()
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        trainer_config = checkpoint.get("trainer_config")
+        if isinstance(trainer_config, Mapping):
+            train_config = trainer_config.get("train")
+            if isinstance(train_config, Mapping):
+                self._checkpoint_train_config = dict(train_config)
         state = checkpoint.get("ema_state")
         if self.ema is not None and isinstance(state, Mapping):
             self.ema.load_state_dict(dict(state))

@@ -9,10 +9,11 @@ train:
   lr_scheduler: plateau
   lr_patience: 3
   lr_factor: 0.5
-  lr_threshold: 1.0e-5
-  lr_min: 1.0e-7
+  lr_threshold: 1.0e-4
+  lr_min: 1.0e-6
+  stop_at_lr_min: true
   max_epochs: -1
-  max_steps: 50000
+  max_steps: 100000
   val_check_interval: 1.0
   check_val_every_n_epoch: 1
   accumulate_grad_batches: 2

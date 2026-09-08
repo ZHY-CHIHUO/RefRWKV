@@ -23,6 +23,7 @@ from data.loaders import build_refsr_loaders
 from engines.refsr import RefSRWKVTrainer
 from runtime.checkpoint import load_checkpoint, load_model_weights
 from runtime.config import load_config, validate_config
+from runtime.callbacks import StopOnLearningRate
 from runtime.experiments import layout_from_config, save_config_snapshot
 
 logger = logging.getLogger("train.refsrwkv")
@@ -81,6 +82,7 @@ def run(config: dict[str, Any], *, resume: str | None = None, load_weights: str 
                 save_last=True,
             ),
             LearningRateMonitor(logging_interval="step"),
+            *([StopOnLearningRate(float(train_cfg["lr_min"]))] if train_cfg.get("stop_at_lr_min", False) else []),
             *([EarlyStopping(monitor="val/loss", mode="min", patience=int(train_cfg["early_stopping_patience"]))] if train_cfg.get("early_stopping_patience") is not None else []),
         ],
         logger=TensorBoardLogger(str(layout.train_dir), name="logs", version=""),
