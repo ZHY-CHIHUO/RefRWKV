@@ -291,6 +291,21 @@ def materialize_config(config: dict[str, Any], config_path: Path) -> dict[str, A
         "lr_source",
         data_lr.get("source", dataset_lr.get("source", dataset.get("lr_source", "auto"))),
     )
+    # Physical resolution metadata is distinct from the integer tensor scale.
+    # Wuhan TIFFs are already on a common pixel grid (tensor scale x1) while
+    # ERGAS still needs the real 30 m / 8 m ratio.
+    if "physical_resolution_ratio" in dataset and "physical_resolution_ratio" not in data:
+        data["physical_resolution_ratio"] = dataset["physical_resolution_ratio"]
+    if "format" in dataset and "dataset_format" not in data:
+        data["dataset_format"] = dataset["format"]
+    if "kind" in dataset and "dataset_kind" not in data:
+        data["dataset_kind"] = dataset["kind"]
+    if isinstance(dataset.get("source"), Mapping):
+        source = dataset["source"]
+        if "channels" in source and "channels" not in data:
+            data["channels"] = source["channels"]
+        if "normalization" in source and "normalization" not in data:
+            data["normalization"] = source["normalization"]
     data["lr_source"] = normalize_lr_source(data.get("lr_source", "auto"))
     data["lr_provenance"] = normalize_lr_provenance(
         data.get("lr_provenance", "bicubic")
@@ -310,7 +325,15 @@ def materialize_config(config: dict[str, Any], config_path: Path) -> dict[str, A
             data.setdefault("patch_size", data["train_hr_patch"])
 
     if task == "refsr":
-        default_reference_mode = "paired" if dataset.get("kind") == "paired_reference" else "lr_up"
+        dataset_kind = str(dataset.get("kind", "")).strip().lower()
+        dataset_identifier = str(dataset.get("id", "")).strip().lower()
+        default_reference_mode = (
+            "paired"
+            if dataset_kind == "paired_reference"
+            or "wuhan" in dataset_kind
+            or "wuhan" in dataset_identifier
+            else "lr_up"
+        )
         data["reference_mode"] = normalize_reference_mode(
             data.get("reference_mode", default_reference_mode)
         )
@@ -418,6 +441,42 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
                     "sensor LR 只能使用原生倍率: "
                     f"native=x{native_scale}, requested=x{data['scale']}"
                 )
+        if "physical_resolution_ratio" in data:
+            ratio = data["physical_resolution_ratio"]
+            if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or ratio <= 0:
+                raise ValueError("data.physical_resolution_ratio 必须是正数")
+        dataset_info = config.get("dataset", {})
+        if not isinstance(dataset_info, Mapping):
+            dataset_info = {}
+        wuhan_markers = {
+            str(value).strip().lower()
+            for value in (
+                dataset_info.get("id"),
+                dataset_info.get("kind"),
+                data.get("dataset_format"),
+                data.get("dataset_kind"),
+                data.get("format"),
+                str(data.get("root", "")).split("/")[-1],
+            )
+            if value is not None
+        }
+        if any("wuhan" in marker for marker in wuhan_markers):
+            if data["scale"] != 1:
+                raise ValueError(
+                    "Wuhan TIFF 已在同一像素网格对齐，data.scale 必须为 1；"
+                    "30/8=3.75 只用于 ERGAS"
+                )
+            if data.get("reference_mode", "paired") != "paired":
+                raise ValueError("Wuhan RefSR 必须使用 data.reference_mode=paired")
+            if data.get("channels", 4) != 4:
+                raise ValueError("Wuhan TIFF 数据必须是 4 通道")
+            if "value_scale" in data:
+                value_scale = data["value_scale"]
+                if isinstance(value_scale, bool) or not isinstance(value_scale, (int, float)) or value_scale <= 0:
+                    raise ValueError("data.value_scale 必须是正数")
+            for field in ("inp_channels", "out_channels", "ref_channels"):
+                if field in model and model[field] != 4:
+                    raise ValueError(f"Wuhan 四通道模型要求 model.{field}=4")
     if not str(model.get("name", "")).strip():
         raise ValueError("model.name 必须是非空字符串")
     validate_refsr_reference_contract(config)

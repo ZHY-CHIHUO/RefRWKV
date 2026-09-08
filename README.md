@@ -87,13 +87,33 @@ EDSR、RCAN、HAT、MambaIRv2、TTSR、MASA-SR、DATSR 的可训练 compatibilit
 
 命令行可以用 `--overrides model.dim=64 train.learning_rate=5e-5` 覆盖点路径字段。bicubic 数据会在运行时从 HR 按目标倍率生成 LR；sensor 数据保持原生观测倍率，不默认生成 `cache/`，也不会修改 `data/`。
 
-`data.root` 可以是单个数据集（如 `data/sr/AID`），也可以是任务目录（如 `data/sr`）。后者会自动聚合下一层数据集；也可用 `data.roots=[...]` 明确指定组合。SR 和 RefSR loader 都使用 `data.dataset.SuperResolutionDataset`，由 `return_items` 决定返回 `lr`、`hr`、`ref`。`data.lr_source` 支持 `auto`、`stored`、`from_hr`：AID、UC Merced 和 `data/refsr/HRMS_SCD` 的 LR 都是 HR 经 bicubic 下采样 x4 生成（可在 HR-only 目录上在线生成），Real-RefRSSRD 的 LR 是实测 Sentinel-2，配置为 `stored` 且只能使用原生 x10。RefSRWKV 使用 `data.reference_mode: lr_up` 时返回 `lr/hr`，trainer 从 LR 动态生成 bicubic 自参考；只有 `paired` 才返回并读取 `Ref`。
+`data.root` 可以是单个数据集（如 `data/sr/AID`），也可以是任务目录（如 `data/sr`）。后者会自动聚合下一层数据集；也可用 `data.roots=[...]` 明确指定组合。常规 SR/RefSR loader 使用 `data.dataset.SuperResolutionDataset`，由 `return_items` 决定返回 `lr`、`hr`、`ref`；Wuhan 的 temporal-pair GeoTIFF 使用专用 `WuhanSTFDataset`。`data.lr_source` 支持 `auto`、`stored`、`from_hr`：AID、UC Merced 和 `data/refsr/HRMS_SCD` 的 LR 都是 HR 经 bicubic 下采样 x4 生成（可在 HR-only 目录上在线生成），Real-RefRSSRD 的 LR 是实测 Sentinel-2，配置为 `stored` 且只能使用原生 x10。RefSRWKV 使用 `data.reference_mode: lr_up` 时返回 `lr/hr`，trainer 从 LR 动态生成 bicubic 自参考；只有 `paired` 才返回并读取 `Ref`。
 
 真实参考图专属字段只放在 `configs/common/refsr_paired.yaml` 和 `configs/common/refsrwkv_paired.yaml`：`augment_ref`、`ref_aug_strengths`、`ref_aug_probs`、`ref_gray_prob`、`loss.ref_drop_prob`。`lr_up` 运行配置不能设置它们，配置校验会直接报错，避免参数看似启用但实际无效。`RefDiffRWKV` 使用 `paired`，因为它的训练和采样都需要真实 `Ref`。
 
 RefSRWKV 的消融开关集中在 `configs/models/refsr/refsrwkv.yaml`：`model.fusion_match.enabled/window/conf/quality`、`model.decoder_refusion`、`model.global_latent_blocks` 和 `model.ref_encoder`。例如 `--overrides model.fusion_match.enabled=false model.global_latent_blocks=0 model.ref_encoder=shallow` 可复现实验变体；默认值对应完整模型。结构型开关通常会改变参数集合或形状，每个变体应从头训练，或只加载同一变体产生的 checkpoint。
 
 ## 训练
+
+### Wuhan 四通道时空数据
+
+Wuhan 的 `L`/`G` TIFF 已在文件中对齐为同一 1000×1000 网格，RefSRWKV 使用
+`L_t2 + G_t1 -> G_t2`，所以网络配置是 `scale=1`、`inp/ref/out_channels=4`；
+30/8=3.75 只用于 ERGAS。数据已整理到 `data/refsr/Wuhan-dataset`，训练/验证/测试
+分别为 8/2/5 个完整时相对，训练时四幅影像同步裁剪。运行：
+
+```bash
+python scripts/train/refsrwkv.py --config configs/runs/refsrwkv/wuhan.yaml
+python scripts/evaluate.py --config configs/runs/refsrwkv/wuhan.yaml \
+  --checkpoint experiments/train/refsr/refsrwkv/wuhan/x1/wuhan/checkpoints/last.ckpt \
+  --split test
+```
+
+Wuhan 评估结果会额外写入 RMSE、UIQI、PSNR、SAM（弧度/角度）和 ERGAS。
+验证/测试会以重叠 128×128 tiles 拼接完整网格，避免全图局部匹配的显存峰值。
+若从同构的 3 通道 HRMS-SCD RefSRWKV checkpoint 微调，可在训练命令后加
+`--load-weights <checkpoint>`；配置会安全适配输入/参考边界层的第四通道，其余
+倍率相关层保持 Wuhan 新初始化。
 
 ### 完整配置
 
@@ -194,7 +214,7 @@ python scripts/test/refsr.py \
 ```text
 experiments/test/<task>/<model>/<dataset>/x<scale>/<run>/<split>/
 ├── images/                        # 预测 PNG
-└── metrics.json                   # PSNR/SSIM 和样本信息
+└── metrics.json                   # PSNR/SSIM；Wuhan 另含 RMSE/UIQI/SAM/ERGAS
 ```
 
 `test` 是推荐的测试目录名；RefSR-HRMS 的 `test_easy`、`test_hard` 是数据集 split，统一写在同一个实验目录下面。

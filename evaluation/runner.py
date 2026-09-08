@@ -24,6 +24,8 @@ from runtime.checkpoint import load_checkpoint, load_model_weights
 from runtime.common import gaussian_ssim, per_image_psnr, resolve_path
 from runtime.config import is_refsr_model, normalize_reference_mode, validate_config
 from runtime.experiments import layout_from_config
+from runtime.tiling import tiled_forward
+from metrics.wuhan import wuhan_metric_tensors
 
 LOGGER = logging.getLogger(__name__)
 VALID_SPLITS = {"test", "test_easy", "test_hard"}
@@ -118,11 +120,20 @@ def _build_refsr_model(
     raw_weights: bool = False,
 ):
     model_name = str(config.get("model", {}).get("name", "RefSRWKV")).lower()
+    train_cfg = config.get("train", {})
+    if not isinstance(train_cfg, Mapping):
+        train_cfg = {}
+    channel_adaptation = str(train_cfg.get("channel_adaptation", "none"))
     if model_name != "refdiffrwkv":
         model = build_refsr_model(
             config["model"], scale=int(config["data"]["scale"])
         )
-        report = load_model_weights(model, checkpoint, prefer_ema=not raw_weights)
+        report = load_model_weights(
+            model,
+            checkpoint,
+            prefer_ema=not raw_weights,
+            channel_adaptation=channel_adaptation,
+        )
         LOGGER.info("loaded direct RefSR checkpoint (%s): %s", model_name, report)
         return model.to(device).eval(), "minus_one_one", None
 
@@ -202,6 +213,42 @@ def run_inference(
     sample_count = 0
     psnr_values: list[float] = []
     ssim_values: list[float] = []
+    wuhan_values: dict[str, list[float]] = {
+        key: [] for key in ("rmse", "uiqi", "psnr", "sam_rad", "sam_deg", "ergas")
+    }
+    wuhan_band_rmse: list[list[float]] = []
+    dataset_meta = config.get("dataset", {})
+    if not isinstance(dataset_meta, Mapping):
+        dataset_meta = {}
+    data_meta = config.get("data", {})
+    if not isinstance(data_meta, Mapping):
+        data_meta = {}
+    wuhan_run = any(
+        "wuhan" in str(value).strip().lower()
+        for value in (
+            dataset_meta.get("id"),
+            dataset_meta.get("kind"),
+            data_meta.get("dataset_format"),
+            data_meta.get("dataset_kind"),
+            data_meta.get("format"),
+            str(data_meta.get("root", "")).split("/")[-1],
+        )
+        if value is not None
+    )
+    wuhan_ratio = float(data_meta.get("physical_resolution_ratio", 30.0 / 8.0))
+    eval_tile_size = data_meta.get("eval_tile_size") if wuhan_run else None
+    eval_tile_overlap = data_meta.get("eval_tile_overlap", 0) if wuhan_run else 0
+    if eval_tile_size is not None and (
+        isinstance(eval_tile_size, bool) or not isinstance(eval_tile_size, int) or eval_tile_size < 1
+    ):
+        raise ValueError("data.eval_tile_size must be a positive integer or null")
+    if (
+        isinstance(eval_tile_overlap, bool)
+        or not isinstance(eval_tile_overlap, int)
+        or eval_tile_overlap < 0
+        or (eval_tile_size is not None and eval_tile_overlap >= eval_tile_size)
+    ):
+        raise ValueError("data.eval_tile_overlap must be in [0, data.eval_tile_size)")
     inference_steps = int(steps if steps is not None else config.get("model", {}).get("sample_steps", 20))
     if inference_steps < 1:
         raise ValueError("steps 必须为正整数")
@@ -211,7 +258,13 @@ def run_inference(
             batch = _move_batch(batch, selected_device)
             lr, hr = batch[config["data"].get("lr_key", "lr")], batch[config["data"].get("hr_key", "hr")]
             if task == "sr":
-                prediction = model(lr)
+                prediction = tiled_forward(
+                    model,
+                    lr,
+                    scale=scale,
+                    tile_size=eval_tile_size,
+                    overlap=eval_tile_overlap,
+                )
                 prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
             elif model_name != "refdiffrwkv":
                 ref = _reference_for_refsr_batch(
@@ -222,7 +275,14 @@ def run_inference(
                     reference_mode=reference_mode,
                     ref_key=config["data"].get("ref_key", "ref"),
                 )
-                prediction = model(lr, ref)
+                prediction = tiled_forward(
+                    model,
+                    lr,
+                    ref,
+                    scale=scale,
+                    tile_size=eval_tile_size,
+                    overlap=eval_tile_overlap,
+                )
                 prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
             else:
                 ref = _reference_for_refsr_batch(
@@ -251,6 +311,16 @@ def run_inference(
                 )
             psnr_values.extend(per_image_psnr(prediction_metric, hr_metric).detach().cpu().tolist())
             ssim_values.extend(gaussian_ssim(prediction_metric, hr_metric).detach().cpu().tolist())
+            if wuhan_run:
+                values = wuhan_metric_tensors(
+                    prediction_metric,
+                    hr_metric,
+                    resolution_ratio=wuhan_ratio,
+                    value_range="minus_one_one",
+                )
+                for key in wuhan_values:
+                    wuhan_values[key].extend(values[key].detach().cpu().tolist())
+                wuhan_band_rmse.extend(values["rmse_per_band"].detach().cpu().tolist())
             _save_png(prediction_png, image_root, sample_count)
             sample_count += int(prediction_png.shape[0])
 
@@ -270,6 +340,35 @@ def run_inference(
         "ssim": {"mean": sum(ssim_values) / len(ssim_values), "per_image": ssim_values},
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
     }
+    if wuhan_run:
+        metrics["wuhan"] = {
+            "resolution_ratio": wuhan_ratio,
+            "value_range": "reflectance [0,1]",
+            "rmse": {"mean": sum(wuhan_values["rmse"]) / len(wuhan_values["rmse"]), "per_image": wuhan_values["rmse"]},
+            "uiqi": {"mean": sum(wuhan_values["uiqi"]) / len(wuhan_values["uiqi"]), "per_image": wuhan_values["uiqi"]},
+            "psnr": {"mean": sum(wuhan_values["psnr"]) / len(wuhan_values["psnr"]), "per_image": wuhan_values["psnr"]},
+            "sam_rad": {"mean": sum(wuhan_values["sam_rad"]) / len(wuhan_values["sam_rad"]), "per_image": wuhan_values["sam_rad"]},
+            "sam_deg": {"mean": sum(wuhan_values["sam_deg"]) / len(wuhan_values["sam_deg"]), "per_image": wuhan_values["sam_deg"]},
+            "ergas": {"mean": sum(wuhan_values["ergas"]) / len(wuhan_values["ergas"]), "per_image": wuhan_values["ergas"]},
+            "rmse_per_band": (
+                torch.as_tensor(wuhan_band_rmse, dtype=torch.float64).mean(dim=0).tolist()
+                if wuhan_band_rmse
+                else []
+            ),
+        }
+        # Keep the six paper metrics easy to consume without requiring callers
+        # to know the nested report layout; the nested copy remains canonical.
+        for key in ("rmse", "uiqi", "sam_rad", "sam_deg", "ergas"):
+            metrics[key] = metrics["wuhan"][key]
+        metrics["psnr_wuhan"] = metrics["wuhan"]["psnr"]
+        metrics["SAM"] = {
+            "rad": metrics["wuhan"]["sam_rad"],
+            "deg": metrics["wuhan"]["sam_deg"],
+        }
+        metrics["RMSE"] = metrics["wuhan"]["rmse"]
+        metrics["UIQI"] = metrics["wuhan"]["uiqi"]
+        metrics["PSNR_Wuhan"] = metrics["wuhan"]["psnr"]
+        metrics["ERGAS"] = metrics["wuhan"]["ergas"]
     metrics_path = split_root / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     LOGGER.info("saved %d predictions and metrics to %s", sample_count, split_root)

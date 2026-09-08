@@ -51,7 +51,12 @@ def run(config: dict[str, Any], *, resume: str | None = None, load_weights: str 
     train_loader, val_loader = build_refsr_loaders(config)
     module = RefSRWKVTrainer.from_config(config)
     if load_weights:
-        report = load_model_weights(module.model, load_checkpoint(load_weights), prefer_ema=not raw_weights)
+        report = load_model_weights(
+            module.model,
+            load_checkpoint(load_weights),
+            prefer_ema=not raw_weights,
+            channel_adaptation=str(train_cfg.get("channel_adaptation", "none")),
+        )
         logger.info("已加载模型权重 %s: %s", load_weights, report)
 
     trainer = pl.Trainer(

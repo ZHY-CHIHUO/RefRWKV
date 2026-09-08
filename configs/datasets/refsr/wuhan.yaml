@@ -1,0 +1,29 @@
+dataset:
+  id: wuhan
+  name: Wuhan GF/Landsat spatiotemporal-fusion dataset
+  kind: wuhan_stf_tiff
+  format: tiff_temporal_pairs
+  root: data/refsr/Wuhan-dataset
+  # Files are already co-registered on a common 1000x1000 grid.  ``scale``
+  # below is therefore the tensor geometry scale, not 30/8.
+  default_scale: 1
+  lr:
+    source: stored
+    provenance: sensor
+    native_scale: 1
+    physical_resolution_m: 30
+  hr:
+    physical_resolution_m: 8
+  physical_resolution_ratio: 3.75
+  source:
+    image_size: [1000, 1000]
+    channels: 4
+    lr_sensor: Landsat
+    hr_sensor: Gaofen
+    dtype: uint16
+    normalization: value / 11848 -> [0, 1]
+  prepared:
+    temporal_pairs: {train: 8, val: 2, test: 5}
+    patch_size: 128
+    tensor_scale: 1
+  reference_policy: G_t1 is the aligned physical reference for L_t2 -> G_t2

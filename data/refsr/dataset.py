@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from data.dataset import SuperResolutionDataset
+from .wuhan import WuhanDataset, WuhanSTFDataset, WuhanTemporalDataset
 
 
 class RefPNGDataset(SuperResolutionDataset):
@@ -55,4 +56,4 @@ class RefPNGDataset(SuperResolutionDataset):
         )
 
 
-__all__ = ["RefPNGDataset"]
+__all__ = ["RefPNGDataset", "WuhanDataset", "WuhanSTFDataset", "WuhanTemporalDataset"]

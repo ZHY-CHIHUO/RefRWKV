@@ -223,7 +223,7 @@ python scripts/evaluate.py \
   --split test
 ```
 
-`scripts/evaluate.py` 是 SR 和 RefSR 共用的评估入口；`evaluation/runner.py` 负责选择 loader、构造模型、保存 PNG 和汇总 PSNR/SSIM。更重的 LPIPS、DISTS、SAM 等离线指标实现放在 `evaluation/eval_pyiqa.py` 和 `evaluation/eval_sewar.py`，不参与训练主循环。
+`scripts/evaluate.py` 是 SR 和 RefSR 共用的评估入口；`evaluation/runner.py` 负责选择 loader、构造模型、保存 PNG 和汇总 PSNR/SSIM。Wuhan 配置会额外汇总 RMSE、UIQI、PSNR、SAM（弧度和角度）及 ERGAS（30/8 物理比例）。
 
 ## 添加数据集
 

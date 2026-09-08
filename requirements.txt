@@ -8,7 +8,10 @@ torchvision>=0.16
 pytorch-lightning>=2.1
 numpy>=1.24
 Pillow>=10.0
+# GeoTIFF reader for the four-band Wuhan temporal-pair dataset.
+tifffile>=2023.7
 PyYAML>=6.0
 einops>=0.7
+ninja>=1.11
 tensorboard>=2.14
 tqdm>=4.66

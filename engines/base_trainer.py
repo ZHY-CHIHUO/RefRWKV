@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from runtime.common import EMA, gaussian_ssim, per_image_psnr
+from runtime.tiling import tiled_forward
 
 
 class BaseTrainer(pl.LightningModule, ABC):
@@ -53,6 +54,42 @@ class BaseTrainer(pl.LightningModule, ABC):
         self.ema = EMA(float(train.get("ema_decay", 0.999))) if self.use_ema else None
         self._ema_last_step = -1
         self._plateau_scheduler = None
+        data = self.config.get("data", {})
+        dataset = self.config.get("dataset", {})
+        if not isinstance(data, Mapping):
+            data = {}
+        if not isinstance(dataset, Mapping):
+            dataset = {}
+        dataset_markers = {
+            str(value).strip().lower()
+            for value in (
+                dataset.get("id"),
+                dataset.get("kind"),
+                data.get("dataset_format"),
+                data.get("dataset_kind"),
+                data.get("format"),
+                str(data.get("root", "")).split("/")[-1],
+            )
+            if value is not None
+        }
+        self.is_wuhan = bool(
+            any("wuhan" in marker for marker in dataset_markers)
+            or "wuhan_stf_tiff" in dataset_markers
+        )
+        self.metric_resolution_ratio = float(data.get("physical_resolution_ratio", 30.0 / 8.0))
+        raw_tile_size = data.get("eval_tile_size")
+        raw_tile_overlap = data.get("eval_tile_overlap", 0)
+        if raw_tile_size is None:
+            self.eval_tile_size: int | None = None
+        elif isinstance(raw_tile_size, bool) or not isinstance(raw_tile_size, int) or raw_tile_size < 1:
+            raise ValueError("data.eval_tile_size must be a positive integer or null")
+        else:
+            self.eval_tile_size = int(raw_tile_size)
+        if isinstance(raw_tile_overlap, bool) or not isinstance(raw_tile_overlap, int) or raw_tile_overlap < 0:
+            raise ValueError("data.eval_tile_overlap must be a non-negative integer")
+        self.eval_tile_overlap = int(raw_tile_overlap)
+        if self.eval_tile_size is not None and self.eval_tile_overlap >= self.eval_tile_size:
+            raise ValueError("data.eval_tile_overlap must be smaller than data.eval_tile_size")
         self.save_hyperparameters(
             {
                 "learning_rate": self.learning_rate,
@@ -64,6 +101,19 @@ class BaseTrainer(pl.LightningModule, ABC):
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.model(*args, **kwargs)
+
+    def predict_for_eval(self, *inputs: torch.Tensor) -> torch.Tensor:
+        """Run bounded-memory full-grid inference when an eval tile is configured."""
+        if self.eval_tile_size is None:
+            return self(*inputs)
+        scale = int(self.config.get("data", {}).get("scale", 1))
+        return tiled_forward(
+            self,
+            *inputs,
+            scale=scale,
+            tile_size=self.eval_tile_size,
+            overlap=self.eval_tile_overlap,
+        )
 
     @abstractmethod
     def _train_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
@@ -106,6 +156,28 @@ class BaseTrainer(pl.LightningModule, ABC):
             "psnr": per_image_psnr(prediction, target).mean(),
             "ssim": gaussian_ssim(prediction, target).mean(),
         }
+
+    def benchmark_image_metrics(
+        self, prediction: torch.Tensor, target: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Return standard metrics plus Wuhan's six-band-quality metrics."""
+        metrics = self.image_metrics(prediction, target)
+        if self.is_wuhan:
+            from metrics.wuhan import wuhan_metric_tensors
+
+            values = wuhan_metric_tensors(
+                prediction,
+                target,
+                resolution_ratio=self.metric_resolution_ratio,
+                value_range="minus_one_one",
+            )
+            metrics.update(
+                {
+                    key: values[key].mean()
+                    for key in ("rmse", "uiqi", "psnr", "sam_rad", "sam_deg", "ergas")
+                }
+            )
+        return metrics
 
     def on_train_start(self) -> None:
         if self.ema is not None:

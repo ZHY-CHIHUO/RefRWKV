@@ -9,6 +9,7 @@ from .config import (
     validate_config,
 )
 from .experiments import ExperimentLayout, layout_from_config, save_config_snapshot
+from .tiling import tiled_forward
 
 __all__ = [
     "ExperimentLayout",
@@ -19,5 +20,6 @@ __all__ = [
     "normalize_lr_provenance",
     "normalize_lr_source",
     "save_config_snapshot",
+    "tiled_forward",
     "validate_config",
 ]

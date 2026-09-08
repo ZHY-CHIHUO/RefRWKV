@@ -56,6 +56,5 @@ class SRTrainer(BaseTrainer):
 
     def _eval_step(self, batch: Any, batch_idx: int, *, stage: str) -> dict[str, torch.Tensor]:
         lr, hr = self._unpack(batch)
-        prediction = self(lr)
-        return {"loss": self._loss(prediction, hr), **self.image_metrics(prediction, hr)}
-
+        prediction = self.predict_for_eval(lr)
+        return {"loss": self._loss(prediction, hr), **self.benchmark_image_metrics(prediction, hr)}

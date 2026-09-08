@@ -51,6 +51,7 @@ YAML 配置按职责拆分。`common` 提供默认值，`datasets` 描述数据�
 | `datasets/sr/ucmerced.yaml` | UC Merced 的 bicubic x4 SISR 数据元信息。 |
 | `datasets/refsr/hrms_scd.yaml` | HRMS-SCD 跨时相参考数据元信息，LR 为 HR bicubic x4。 |
 | `datasets/refsr/real_refrssrd.yaml` | Real-RefRSSRD 真实传感器数据元信息，LR 为原生 x10 Sentinel-2 观测。 |
+| `datasets/refsr/wuhan.yaml` | Wuhan 四通道、同网格 temporal-pair GeoTIFF；tensor scale x1，ERGAS 比例 3.75。 |
 
 ### `configs/models/`
 
@@ -77,6 +78,7 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 | `runs/refsrwkv/hrms_scd_x4.yaml` | RefSRWKV 在 HRMS-SCD 三元组上的训练配置。 |
 | `runs/refsrwkv/hrms_scd_trefsr_x4.yaml` | HRMS-SCD 跨时相 TRefSR 的清晰命名入口。 |
 | `runs/refsrwkv/real_refrssrd_x10.yaml` | RefSRWKV 在 Real-RefRSSRD x10 上的训练配置。 |
+| `runs/refsrwkv/wuhan.yaml` | RefSRWKV 在 Wuhan `L_t2 + G_t1 -> G_t2` 上的四通道配置。 |
 | `runs/refdiffrwkv/stage1.yaml` | 扩散系统基础训练阶段。 |
 | `runs/refdiffrwkv/stage2.yaml` | 加入语义和 SR 条件的训练阶段。 |
 | `runs/refdiffrwkv/stage3.yaml` | 加入置信度、时序门控和自相似传播的训练阶段。 |
@@ -94,6 +96,7 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 | `data/loaders.py` | 根据任务配置构造 train/val/test DataLoader，处理目录聚合、split 和采样上限。 |
 | `data/sr/dataset.py` | SR 任务命名入口，调用统一 Dataset。 |
 | `data/refsr/dataset.py` | RefSR 任务命名入口，调用统一 Dataset。 |
+| `data/refsr/wuhan.py` | 四通道 Wuhan temporal-pair TIFF、路径缓存和同步裁剪。 |
 | `data/sr/__init__.py`、`data/refsr/__init__.py` | 导出对应任务的数据集接口。 |
 
 ### 数据目录和说明
@@ -104,6 +107,7 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 | `data/sr/UC_Merced/` | UC Merced 的 HR/LR split 数据（LR 可由 HR bicubic x4 生成）。 |
 | `data/refsr/HRMS_SCD/` | HRMS-SCD 的 HR/LR/Ref split 数据和元信息。 |
 | `data/refsr/Real-RefRSSRD/` | Real-RefRSSRD 的 HR/LR/Ref split 数据和数据说明。 |
+| `data/refsr/Wuhan-dataset/` | Wuhan temporal-pair GeoTIFF（train/val/test 8/2/5）及 split manifest。 |
 | `data/refsr/CUFED/`、`data/refsr/CUFED5/` | 参考数据集的本地数据目录标记。 |
 | `data/raw/` | 原始数据压缩包或解压内容。 |
 | `data/archives/` | 数据归档文件。 |
@@ -204,7 +208,7 @@ run 文件把任务、数据和模型组合成可直接启动的实验。
 | `metrics/__init__.py` | 指标包入口；基础 PSNR/SSIM 由评测流程调用。 |
 | `evaluation/runner.py` | 构造 loader 和模型，运行推理，保存图片和指标。 |
 | `evaluation/eval_pyiqa.py` | 使用 PyIQA 计算 LPIPS、DISTS 等感知指标。 |
-| `evaluation/eval_sewar.py` | 使用 sewar 计算传统图像质量指标。 |
+| `evaluation/eval_sewar.py` | Wuhan 的 RMSE/UIQI/PSNR/SAM(rad、deg)/ERGAS 指标。 |
 
 ## `scripts/`
 

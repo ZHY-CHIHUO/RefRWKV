@@ -9,6 +9,7 @@ from typing import Any
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from data.dataset import SuperResolutionDataset
+from data.refsr.wuhan import WuhanSTFDataset
 from runtime.common import resolve_path
 from runtime.config import (
     normalize_lr_provenance,
@@ -137,6 +138,99 @@ def _combine(datasets: list[Dataset]) -> Dataset:
     return datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
 
+def _is_wuhan_dataset(config: Mapping[str, Any]) -> bool:
+    """Identify the temporal-pair TIFF layout without importing config code."""
+    dataset = config.get("dataset", {})
+    if not isinstance(dataset, Mapping):
+        dataset = {}
+    values = (
+        dataset.get("id"),
+        dataset.get("kind"),
+        dataset.get("format"),
+        config.get("data", {}).get("dataset_format") if isinstance(config.get("data", {}), Mapping) else None,
+        config.get("data", {}).get("dataset_kind") if isinstance(config.get("data", {}), Mapping) else None,
+        config.get("data", {}).get("format") if isinstance(config.get("data", {}), Mapping) else None,
+        Path(str(config.get("data", {}).get("root", ""))).name
+        if isinstance(config.get("data", {}), Mapping)
+        else None,
+    )
+    normalized = {str(value).strip().lower() for value in values if value is not None}
+    return bool(
+        {"wuhan", "wuhan_dataset", "wuhan-stf", "wuhan_stf", "stf_tiff"} & normalized
+        or any("wuhan" in value for value in normalized)
+    )
+
+
+def _wuhan_roots(data: Mapping[str, Any], required_splits: tuple[str, ...]) -> list[Path]:
+    """Resolve one or more Wuhan roots and check split directories."""
+    roots = _configured_roots(data)
+    for root in roots:
+        missing = [root / split for split in required_splits if not (root / split).is_dir()]
+        if missing:
+            raise FileNotFoundError(
+                "incomplete Wuhan dataset root "
+                f"{root}: missing {', '.join(str(path) for path in missing)}"
+            )
+    return roots
+
+
+def _wuhan_kwargs(data: Mapping[str, Any], *, mode: str, patch_size: int | None, max_samples) -> dict[str, Any]:
+    """Materialize the shared Wuhan TIFF loader options."""
+    return {
+        "mode": mode,
+        "patch_size": patch_size,
+        "scale": int(data.get("scale", 1)),
+        "augment": bool(data.get("augment", mode == "train")),
+        "max_samples": max_samples,
+        "sample_seed": int(data.get("sample_seed", 42)),
+        "lr_key": str(data.get("lr_key", "lr")),
+        "hr_key": str(data.get("hr_key", "hr")),
+        "ref_key": str(data.get("ref_key", "ref")),
+        "return_quadruple": bool(data.get("return_quadruple", False)),
+        "target_time": str(data.get("target_time", "t2")),
+        "reference_time": str(data.get("reference_time", "t1")),
+        "value_scale": float(data.get("value_scale", data.get("normalization_scale", 11848.0))),
+        "clip_range": bool(data.get("clip_range", True)),
+        "cache": bool(data.get("cache", data.get("path_cache", True))),
+        "cache_size": data.get("cache_size"),
+        "lr_source": str(data.get("lr_source", "stored")),
+        "lr_native_scale": data.get("lr_native_scale", 1),
+        "lr_provenance": str(data.get("lr_provenance", "sensor")),
+    }
+
+
+def _build_wuhan_loaders(config: Mapping[str, Any]):
+    """Build direct-RefSR loaders for aligned Wuhan temporal TIFF pairs."""
+    data = config["data"]
+    roots = _wuhan_roots(data, ("train", "val"))
+    max_samples = _max_samples(data)
+    seed = int(data.get("sample_seed", config.get("train", {}).get("seed", 42)))
+    train_kwargs = _wuhan_kwargs(
+        {**data, "sample_seed": seed},
+        mode="train",
+        patch_size=data.get("patch_size", 128),
+        max_samples=max_samples,
+    )
+    val_kwargs = _wuhan_kwargs(
+        {**data, "sample_seed": seed},
+        mode="val",
+        patch_size=data.get("val_patch_size"),
+        max_samples=max_samples,
+    )
+    train = _combine([WuhanSTFDataset(root, **train_kwargs) for root in roots])
+    val = _combine([WuhanSTFDataset(root, **val_kwargs) for root in roots])
+    if not len(train) or not len(val):
+        raise ValueError("Wuhan training and validation splits must be non-empty")
+    return _loader(train, data, train=True), _loader(val, data, train=False)
+
+
+def build_wuhan_loaders(config: Mapping[str, Any]):
+    """Public alias for constructing Wuhan train/validation loaders."""
+    if not _is_wuhan_dataset(config):
+        raise ValueError("build_wuhan_loaders requires dataset.id/kind identifying Wuhan")
+    return _build_wuhan_loaders(config)
+
+
 def _loader(dataset, data: Mapping[str, Any], *, train: bool) -> DataLoader:
     workers = int(data.get("num_workers" if train else "val_num_workers", 4 if train else 2))
     kwargs: dict[str, Any] = {
@@ -202,6 +296,8 @@ def build_sr_loaders(config: Mapping[str, Any]):
 def build_refsr_loaders(config: Mapping[str, Any]):
     """Build paired or LR-derived RefSR loaders through one Dataset class."""
     validate_refsr_reference_contract(config)
+    if _is_wuhan_dataset(config):
+        return _build_wuhan_loaders(config)
     data = config["data"]
     reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
     paired = reference_mode == "paired"
@@ -325,6 +421,27 @@ def build_refsr_test_loader(
     train/evaluate RefSRWKV without a real reference image.
     """
     validate_refsr_reference_contract(config)
+    if _is_wuhan_dataset(config):
+        data = config["data"]
+        roots = _wuhan_roots(data, (split,))
+        max_samples = _max_samples(data)
+        seed = int(data.get("sample_seed", config.get("train", {}).get("seed", 42)))
+        datasets = [
+            WuhanSTFDataset(
+                root,
+                **_wuhan_kwargs(
+                    {**data, "sample_seed": seed, "augment": False},
+                    mode=split,
+                    patch_size=data.get("test_patch_size"),
+                    max_samples=max_samples,
+                ),
+            )
+            for root in roots
+        ]
+        dataset = _combine(datasets)
+        if not len(dataset):
+            raise ValueError(f"test split {split!r} is empty")
+        return _test_loader(dataset, data, batch_size=batch_size)
     data = config["data"]
     reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
     paired = reference_mode == "paired"
@@ -358,4 +475,5 @@ __all__ = [
     "build_refsr_loaders",
     "build_sr_test_loader",
     "build_refsr_test_loader",
+    "build_wuhan_loaders",
 ]

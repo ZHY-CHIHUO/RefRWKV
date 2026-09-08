@@ -1,125 +1,106 @@
-import argparse
+"""Standalone Wuhan image-quality metrics.
+
+Historically this module delegated to :mod:`sewar`, which did not expose
+ERGAS consistently and only returned SAM in degrees.  The implementation now
+uses the repository's dependency-light metric functions and reports both
+radian and degree spectral angles.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
-from sewar.full_ref import (psnr, ssim, sam, rmse)
 
-# ==============================================================================
-# 评估核心函数
-# ==============================================================================
-def evaluate(pred: np.ndarray, 
-             gt: np.ndarray, 
-             max_val: float = 1.0) -> dict:
+from metrics.wuhan import compute_wuhan_metrics
+
+
+def evaluate(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    max_val: float = 1.0,
+    *,
+    resolution_ratio: float = 30.0 / 8.0,
+) -> dict[str, Any]:
+    """Evaluate one HWC/CHW image in the requested numeric range.
+
+    ``max_val`` is retained for compatibility. Inputs are converted to
+    reflectance ``[0,1]`` before calculating RMSE, UIQI, PSNR, SAM and ERGAS.
     """
-    计算全参考图像质量指标。
-
-    参数:
-        pred : 预测图像， (H, W, C) 或 (H, W)，范围 [0, max_val]
-        gt   : 参考图像， (H, W, C) 或 (H, W)，范围 [0, max_val]
-        max_val: 数据的最大像素值，通常 1.0 或 255.0
-
-    返回:
-        字典，包含 PSNR, SSIM, SAM, ERGAS, CC, RMSE, UQI 等 (缺失波段时可能跳过)
-    """
-    # 确保数据类型和维度一致
-    assert pred.shape == gt.shape, f"形状不一致: pred {pred.shape}, gt {gt.shape}"
-    pred = pred.astype(np.float64)
-    gt   = gt.astype(np.float64)
-
-    results = {}
-
-    # ---- PSNR ----
-    results['PSNR'] = psnr(gt, pred, MAX=max_val)
-
-    # ---- SSIM (多通道均值) ----
-    # sewar 的 ssim 直接支持多通道图像 (H,W,C)
-    results['SSIM'] = ssim(gt, pred, MAX=max_val)[0]
-
-    # ---- SAM (光谱角，单位: 度) ----
-    # 仅当图像有多个波段时计算，否则设为 None
-    if pred.ndim == 3 and pred.shape[2] > 1:
-        results['SAM'] = sam(gt, pred)
-    else:
-        results['SAM'] = None
-
-    # ---- RMSE ----
-    results['RMSE'] = rmse(gt, pred)
-
-    return results
+    if pred.shape != gt.shape:
+        raise ValueError(f"形状不一致: pred {pred.shape}, gt {gt.shape}")
+    if max_val <= 0:
+        raise ValueError("max_val must be positive")
+    pred_value = np.asarray(pred, dtype=np.float32) / float(max_val)
+    gt_value = np.asarray(gt, dtype=np.float32) / float(max_val)
+    result = compute_wuhan_metrics(
+        pred_value,
+        gt_value,
+        resolution_ratio=resolution_ratio,
+        value_range="zero_one",
+    )
+    # Preserve the old uppercase names and add explicit angular units.
+    return {
+        "PSNR": result["psnr"],
+        "UIQI": result["uiqi"],
+        "SAM_rad": result["sam_rad"],
+        "SAM_deg": result["sam_deg"],
+        "SAM": result["sam_deg"],
+        "ERGAS": result["ergas"],
+        "RMSE": result["rmse"],
+        "RMSE_per_band": result["rmse_per_band"],
+        "resolution_ratio": result["resolution_ratio"],
+    }
 
 
-def print_metrics(metrics: dict, title: str = "Evaluation Results"):
-    """美观地打印指标字典。"""
-    print(f"\n{'='*40}")
-    print(f"  {title}")
-    print('='*40)
-    for k, v in metrics.items():
-        if v is not None:
-            # 根据值的大小选择合适的小数位数
-            if isinstance(v, (int, float)):
-                if abs(v) < 0.01:
-                    print(f"  {k:8s} : {v:.6f}")
-                else:
-                    print(f"  {k:8s} : {v:.4f}")
-            else:
-                print(f"  {k:8s} : {v}")
+def print_metrics(metrics: dict, title: str = "Evaluation Results") -> None:
+    print(f"\n{'=' * 40}\n  {title}\n{'=' * 40}")
+    for key, value in metrics.items():
+        if isinstance(value, (int, float, np.number)):
+            print(f"  {key:16s}: {float(value):.6f}")
         else:
-            print(f"  {k:8s} : N/A (计算失败或不适用)")
-    print('='*40)
+            print(f"  {key:16s}: {value}")
+    print("=" * 40)
 
-def evaluate_CHW(pred: np.ndarray,
-                 gt: np.ndarray,
-                 max_val: float = 1.0,
-                 print_result: bool = True,
-                 title: str = "Evaluation (CHW -> HWC)") -> dict:
-    """
-    接收 (C, H, W) 格式的图像，自动转换为 (H, W, C) 后评估并打印结果。
-    这是为了方便深度学习 pipeline 中直接使用模型输出（通常为 CHW 格式）。
-    
-    参数:
-        pred, gt : 形状为 (C, H, W) 或 (H, W) 的单/多波段图像
-        print_result : 是否打印结果
-        title : 打印时的标题
-    返回:
-        指标字典
-    """
-    # 维度转换：如果输入是 3D 且第一维为通道数，则转置
+
+def evaluate_CHW(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    max_val: float = 1.0,
+    print_result: bool = True,
+    title: str = "Evaluation (CHW -> HWC)",
+    *,
+    resolution_ratio: float = 30.0 / 8.0,
+) -> dict[str, Any]:
+    """Evaluate CHW (or 2D) arrays and optionally print the result."""
     if pred.ndim == 3:
-        # 假设输入是 (C, H, W)，转为 (H, W, C)
         pred = np.transpose(pred, (1, 2, 0))
-        gt   = np.transpose(gt, (1, 2, 0))
-    # 如果是 2D 单波段，直接使用
-    
-    metrics = evaluate(pred, gt, max_val=max_val)
-    
+        gt = np.transpose(gt, (1, 2, 0))
+    result = evaluate(pred, gt, max_val=max_val, resolution_ratio=resolution_ratio)
     if print_result:
-        print_metrics(metrics, title=title)
-    
-    return metrics
+        print_metrics(result, title=title)
+    return result
+
 
 def average_metrics(results_list: list[dict]) -> dict:
-    """
-    对每个指标求平均，自动跳过 None 值。
-    """
-    avg_res = {}
+    """Average numeric metrics while preserving per-band lists."""
     if not results_list:
-        return avg_res
-
-    for k in results_list[0].keys():
-        # 过滤掉 None
-        valid_values = [r[k] for r in results_list if r[k] is not None]
-        if len(valid_values) == 0:
-            avg_res[k] = None
+        return {}
+    result: dict[str, Any] = {}
+    for key in results_list[0]:
+        values = [item[key] for item in results_list if item.get(key) is not None]
+        if not values:
+            result[key] = None
+        elif isinstance(values[0], (list, tuple, np.ndarray)):
+            result[key] = np.asarray(values, dtype=np.float64).mean(axis=0).tolist()
+        elif isinstance(values[0], (int, float, np.number)):
+            result[key] = float(np.mean(values))
         else:
-            avg_res[k] = float(np.mean(valid_values))
-    return avg_res
+            result[key] = values[0]
+    return result
 
 
-# ==============================================================================
-# 示例：直接运行或作为模块使用
-# ==============================================================================
-if __name__ == '__main__':
-    pred = np.random.rand(10,2,2)
-    gt   = np.random.rand(10,2,2)
-    print(gt)
-    print(pred)
-    res = evaluate_CHW(pred, gt)
-    print(res)
+if __name__ == "__main__":  # pragma: no cover
+    pred = np.random.rand(4, 8, 8)
+    gt = np.random.rand(4, 8, 8)
+    print_metrics(evaluate_CHW(pred, gt))

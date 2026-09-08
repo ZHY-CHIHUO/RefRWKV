@@ -70,12 +70,67 @@ def _strip_outer_prefixes(key: str) -> str:
     return key
 
 
+_RGB_MULTIBAND_BOUNDARY_SUFFIXES = (
+    "lr_up.0.weight",
+    "ref_to_level1.0.weight",
+    "ref_to_level1.2.weight",
+)
+
+
+def _resize_rgb_axis(value: torch.Tensor, target_size: int, axis: int) -> torch.Tensor | None:
+    """Copy RGB weights and initialize an added band with their mean."""
+    source_size = int(value.shape[axis])
+    if source_size == target_size:
+        return value
+    if {source_size, int(target_size)} != {3, 4}:
+        return None
+    result_shape = list(value.shape)
+    result_shape[axis] = int(target_size)
+    result = value.new_empty(result_shape)
+    common = min(source_size, int(target_size))
+    result.narrow(axis, 0, common).copy_(value.narrow(axis, 0, common))
+    if target_size > source_size:
+        mean = value.mean(dim=axis, keepdim=True)
+        result.narrow(axis, source_size, target_size - source_size).copy_(mean.expand_as(result.narrow(axis, source_size, target_size - source_size)))
+    return result
+
+
+def _adapt_rgb_multiband_boundary(
+    key: str, source: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor | None:
+    """Adapt safe RefSR RGB boundary tensors to four spectral bands.
+
+    This intentionally does *not* try to adapt scale-dependent PixelUnshuffle
+    layers, the reconstruction head, or a task/fusion head with a different
+    reconstruction scale. Those components remain newly initialized for
+    HRMS-SCD x4 -> Wuhan x1 transfer.
+    """
+    if not key.endswith(_RGB_MULTIBAND_BOUNDARY_SUFFIXES):
+        return None
+    if source.ndim != target.ndim or source.ndim not in {1, 4}:
+        return None
+    if source.ndim == 1:
+        return _resize_rgb_axis(source, int(target.shape[0]), 0)
+    if source.shape[2:] != target.shape[2:]:
+        return None
+    value = _resize_rgb_axis(source, int(target.shape[0]), 0)
+    if value is None:
+        return None
+    value = _resize_rgb_axis(value, int(target.shape[1]), 1)
+    if value is None or tuple(value.shape) != tuple(target.shape):
+        return None
+    return value
+
+
 def _matching_state(
-    target_state: Mapping[str, torch.Tensor], source_state: Mapping[str, torch.Tensor]
-) -> tuple[dict[str, torch.Tensor], int, int]:
+    target_state: Mapping[str, torch.Tensor],
+    source_state: Mapping[str, torch.Tensor],
+    *,
+    channel_adaptation: str = "none",
+) -> tuple[dict[str, torch.Tensor], int, int, int]:
     """Match Lightning-wrapped and raw architecture state dictionaries."""
     matched: dict[str, torch.Tensor] = {}
-    missing_source, shape_mismatch = 0, 0
+    missing_source, shape_mismatch, adapted = 0, 0, 0
     for source_key, value in source_state.items():
         if not torch.is_tensor(value):
             continue
@@ -94,15 +149,29 @@ def _matching_state(
         if target_key is None:
             missing_source += 1
             continue
-        if tuple(value.shape) != tuple(target_state[target_key].shape):
-            shape_mismatch += 1
+        target = target_state[target_key]
+        if tuple(value.shape) != tuple(target.shape):
+            adapted_value = (
+                _adapt_rgb_multiband_boundary(target_key, value, target)
+                if channel_adaptation == "rgb_mean"
+                else None
+            )
+            if adapted_value is None:
+                shape_mismatch += 1
+                continue
+            matched[target_key] = adapted_value
+            adapted += 1
             continue
         matched[target_key] = value
-    return matched, missing_source, shape_mismatch
+    return matched, missing_source, shape_mismatch, adapted
 
 
 def load_model_weights(
-    model: torch.nn.Module, checkpoint: Any, *, prefer_ema: bool = True
+    model: torch.nn.Module,
+    checkpoint: Any,
+    *,
+    prefer_ema: bool = True,
+    channel_adaptation: str = "none",
 ) -> dict[str, int | str | bool]:
     """Load raw state plus optional EMA parameters into a selected model.
 
@@ -110,11 +179,16 @@ def load_model_weights(
     then overwrite matching trainable parameters, which preserves the usual
     EMA evaluation behavior without requiring EMA to duplicate buffers.
     """
+    channel_adaptation = str(channel_adaptation).strip().lower()
+    if channel_adaptation not in {"none", "rgb_mean"}:
+        raise ValueError("channel_adaptation must be none or rgb_mean")
     target_state = model.state_dict()
     raw_source = _find_tensor_mapping(checkpoint)
     if not raw_source:
         raise ValueError("checkpoint does not contain a tensor state dictionary")
-    raw_matched, raw_unused, raw_mismatch = _matching_state(target_state, raw_source)
+    raw_matched, raw_unused, raw_mismatch, raw_adapted = _matching_state(
+        target_state, raw_source, channel_adaptation=channel_adaptation
+    )
     if not raw_matched:
         raise RuntimeError("checkpoint has no parameter compatible with the selected model")
     model.load_state_dict(raw_matched, strict=False)
@@ -123,8 +197,11 @@ def load_model_weights(
         "raw_matched": len(raw_matched),
         "raw_unused": raw_unused,
         "raw_shape_mismatch": raw_mismatch,
+        "raw_channel_adapted": raw_adapted,
+        "channel_adaptation": channel_adaptation,
         "ema_applied": False,
         "ema_matched": 0,
+        "ema_channel_adapted": 0,
     }
     if not prefer_ema or not isinstance(checkpoint, Mapping):
         return report
@@ -139,12 +216,15 @@ def load_model_weights(
     shadow = ema_state.get("shadow") if isinstance(ema_state, Mapping) else None
     if not isinstance(shadow, Mapping):
         return report
-    ema_matched, _unused, _mismatch = _matching_state(target_state, shadow)
+    ema_matched, _unused, _mismatch, ema_adapted = _matching_state(
+        target_state, shadow, channel_adaptation=channel_adaptation
+    )
     if not ema_matched:
         return report
     model.load_state_dict(ema_matched, strict=False)
     report["ema_applied"] = True
     report["ema_matched"] = len(ema_matched)
+    report["ema_channel_adapted"] = ema_adapted
     return report
 
 

@@ -31,9 +31,17 @@ dist/
 /data/**/*.jpeg
 /data/**/*.tif
 /data/**/*.tiff
+# Wuhan temporal-pair TIFFs live in a dataset-specific directory and are
+# intentionally kept out of git while the accompanying loader/config remain
+# versioned.
+/data/refsr/Wuhan-dataset/**/*.tif
+/data/refsr/Wuhan-dataset/**/*.tiff
 /data/**/*.npy
 /data/**/manifest.jsonl
 /data/**/metadata.json
+!/data/refsr/Wuhan-dataset/metadata.json
+!/data/refsr/Wuhan-dataset/SPLIT_MANIFEST.md
+!/data/refsr/Wuhan-dataset/split_manifest.json
 
 # Model weights and run outputs are local artifacts.
 /weights/*
