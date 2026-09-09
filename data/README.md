@@ -31,6 +31,8 @@ data/refsr/<dataset>/<split>/{HR,LR,Ref}/<same-name>.*
 
 `reference_mode: lr_up` 只用 LR 生成自参考，`reference_mode: paired` 才读取磁盘 `Ref/`。测试和对比必须保持同一 split 的 `sample_id` 配对。
 
+常规 Dataset 会保留文件本身的通道数，不再统一转换为 RGB。`PNG/JPEG/BMP/TIFF` 和 NumPy `.npy` 均可作为 `HR`、`LR` 或 `Ref` 文件；灰度 PAN 返回 1 通道，多波段 TIFF/NPY 返回对应通道数。整数栅格默认按 dtype 满量程归一化到 `[-1, 1]`，传感器或浮点数据可在配置中设置 `data.value_scale`，必要时用 `data.clip_range: false` 保留范围外值。NPY 约定为 `HWC`，栅格读取器对常见 `C,H,W` TIFF 会自动转置。
+
 ## Wuhan
 
 `data/refsr/Wuhan-dataset/` 是四通道、已配准到同一像素网格的 temporal-pair TIFF 数据。网络倍率为 `1`，`3.75` 只用于 ERGAS 的物理分辨率项。完整网格测试使用重叠 tile，具体配置在 `configs/runs/refsrwkv/wuhan.yaml`。

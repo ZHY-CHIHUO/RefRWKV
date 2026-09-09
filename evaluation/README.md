@@ -4,7 +4,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `runner.py` | 根据 checkpoint 配置构造 loader/model，运行一个 split，保存预测图和 `metrics.json`。 |
+| `runner.py` | 根据 checkpoint 配置构造 loader/model，运行一个 split，保存预测图和 `metrics.json`；1/3 通道写 PNG，其他通道写 float32 TIFF/NPY。 |
 | `eval_pyiqa.py` | 可选的 PyIQA 感知指标。 |
 | `eval_sewar.py` | Wuhan 的 RMSE、UIQI、PSNR、SAM、ERGAS 等指标。 |
 

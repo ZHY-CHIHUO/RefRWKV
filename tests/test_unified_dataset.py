@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -115,6 +116,52 @@ class UnifiedDatasetTests(unittest.TestCase):
             train_loader, val_loader = build_sr_loaders(config)
             self.assertEqual(set(next(iter(train_loader))), {"lr", "hr"})
             self.assertEqual(set(next(iter(val_loader))), {"lr", "hr"})
+
+    def test_grayscale_and_multiband_samples_keep_their_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for split in ("train",):
+                for folder, shape in (("HR", (8, 8)), ("LR", (4, 4)), ("Ref", (8, 8))):
+                    path = root / split / folder / "gray.png"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    Image.fromarray(np.full(shape, 127, dtype=np.uint8), mode="L").save(path)
+            gray = SuperResolutionDataset(
+                root,
+                mode="train",
+                scale=2,
+                lr_source="stored",
+                return_items=("lr", "hr", "ref"),
+                reference_source="stored",
+            )[0]
+            self.assertEqual(gray["lr"].shape, (1, 4, 4))
+            self.assertEqual(gray["hr"].shape, (1, 8, 8))
+            self.assertEqual(gray["ref"].shape, (1, 8, 8))
+
+            for folder, array in (
+                ("HR", np.zeros((8, 8, 4), dtype=np.uint8)),
+                ("LR", np.zeros((4, 4, 4), dtype=np.uint8)),
+                ("Ref", np.zeros((8, 8, 1), dtype=np.uint8)),
+            ):
+                path = root / "train" / folder / "multiband.npy"
+                np.save(path, array)
+            multiband = SuperResolutionDataset(
+                root,
+                mode="train",
+                scale=2,
+                lr_source="stored",
+                return_items=("lr", "hr", "ref"),
+                reference_source="stored",
+            )[1]
+            self.assertEqual(multiband["lr"].shape, (4, 4, 4))
+            self.assertEqual(multiband["hr"].shape, (4, 8, 8))
+            self.assertEqual(multiband["ref"].shape, (1, 8, 8))
+
+    def test_signed_integer_raster_is_zero_centered(self) -> None:
+        values = np.array([[-32768, 0, 32767]], dtype=np.int16)
+        normalized = SuperResolutionDataset._normalize_array(values[..., None])
+        np.testing.assert_allclose(
+            normalized[..., 0], [[-1.0, 0.0, 0.9999695]], rtol=0, atol=1e-6
+        )
 
 
 if __name__ == "__main__":

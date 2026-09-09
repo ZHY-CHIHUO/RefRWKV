@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -18,7 +19,8 @@ from models.refsr.refsrwkv.model import (  # noqa: E402
     RefSRWKV,
     normalize_fusion_match_config,
 )
-from runtime.config import load_config  # noqa: E402
+import models.refsr.refsrwkv.model as refsrwkv_module  # noqa: E402
+from runtime.config import load_config, validate_config  # noqa: E402
 
 
 class FusionMatchConfigTests(unittest.TestCase):
@@ -155,6 +157,83 @@ class RefSRWKVStructureTests(unittest.TestCase):
         self.assertTrue(all(not fusion.conf_enabled for fusion in fusions))
         self.assertTrue(all(not fusion.quality_enabled for fusion in fusions))
         self.assertEqual({fusion.window_size for fusion in fusions}, {3})
+
+    def test_unequal_reference_channels_keep_lr_output_channels(self) -> None:
+        model = self.build(inp_channels=4, ref_channels=1, out_channels=4)
+        self.assertEqual(model.inp_channels, 4)
+        self.assertEqual(model.ref_channels, 1)
+        self.assertEqual(model.out_channels, 4)
+        self.assertEqual(model.lr_up[0].in_channels, 4)
+        self.assertEqual(model.ref_to_level1[0].in_channels, 1)
+        self.assertEqual(model.output_conv.out_channels, 4)
+
+        ref = torch.randn(2, 1, 8, 10)
+        target = torch.randn(2, 4, 8, 10)
+        matched = model._match_color(ref, target)
+        self.assertEqual(matched.shape, ref.shape)
+        self.assertTrue(torch.isfinite(matched).all())
+
+    def test_channel_contract_rejects_invalid_output_or_reference(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ref_channels"):
+            self.build(inp_channels=3, ref_channels=4, out_channels=3)
+        with self.assertRaisesRegex(ValueError, "out_channels"):
+            self.build(inp_channels=4, ref_channels=1, out_channels=3)
+
+    def test_same_channel_color_matching_remains_per_band(self) -> None:
+        model = self.build(inp_channels=3, ref_channels=3, out_channels=3)
+        ref = torch.randn(2, 3, 8, 10)
+        target = torch.randn(2, 3, 8, 10)
+        matched = model._match_color(ref, target)
+        self.assertTrue(torch.allclose(matched.mean(dim=(2, 3)), target.mean(dim=(2, 3)), atol=1e-5))
+
+    def test_forward_crops_padded_non_multiple_lr_geometry(self) -> None:
+        model = self.build(inp_channels=4, ref_channels=1, out_channels=4)
+        # The production WKV operator is CUDA-only. Returning its value keeps
+        # this regression test focused on tensor geometry and channel flow.
+        with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+            with torch.no_grad():
+                output = model(
+                    torch.randn(1, 4, 5, 6),
+                    torch.randn(1, 1, 10, 12),
+                )
+        self.assertEqual(output.shape, (1, 4, 10, 12))
+        self.assertTrue(torch.isfinite(output).all())
+
+
+class RefSRWKVConfigChannelTests(unittest.TestCase):
+    @staticmethod
+    def _config() -> dict:
+        return {
+            "model": {
+                "name": "RefSRWKV",
+                "inp_channels": 4,
+                "out_channels": 4,
+                "ref_channels": 1,
+            },
+            "data": {"root": "/tmp/data", "scale": 2},
+            "train": {},
+            "loss": {},
+            "output": {},
+        }
+
+    def test_accepts_lr_channels_greater_than_reference_channels(self) -> None:
+        validate_config(self._config(), require_data=False)
+
+    def test_allows_derived_channel_fields_to_be_null(self) -> None:
+        config = self._config()
+        config["model"]["out_channels"] = None
+        config["model"]["ref_channels"] = None
+        validate_config(config, require_data=False)
+
+    def test_rejects_invalid_channel_order(self) -> None:
+        config = self._config()
+        config["model"]["ref_channels"] = 5
+        with self.assertRaisesRegex(ValueError, "ref_channels"):
+            validate_config(config, require_data=False)
+        config = self._config()
+        config["model"]["out_channels"] = 3
+        with self.assertRaisesRegex(ValueError, "out_channels"):
+            validate_config(config, require_data=False)
 
 
 if __name__ == "__main__":

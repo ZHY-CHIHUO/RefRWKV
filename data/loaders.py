@@ -258,6 +258,8 @@ def build_sr_loaders(config: Mapping[str, Any]):
         "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
         "lr_key": data.get("lr_key", "lr"),
         "hr_key": data.get("hr_key", "hr"),
+        "value_scale": data.get("value_scale"),
+        "clip_range": bool(data.get("clip_range", True)),
         **_lr_contract(data),
     }
     roots = _dataset_roots(
@@ -308,6 +310,8 @@ def build_refsr_loaders(config: Mapping[str, Any]):
         "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
         "lr_key": data.get("lr_key", "lr"),
         "hr_key": data.get("hr_key", "hr"),
+        "value_scale": data.get("value_scale"),
+        "clip_range": bool(data.get("clip_range", True)),
         **_lr_contract(data),
     }
     extra: dict[str, Any] = {
@@ -378,6 +382,8 @@ def _test_dataset_kwargs(config: Mapping[str, Any], split: str) -> dict[str, Any
         "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
         "lr_key": data.get("lr_key", "lr"),
         "hr_key": data.get("hr_key", "hr"),
+        "value_scale": data.get("value_scale"),
+        "clip_range": bool(data.get("clip_range", True)),
         "return_sample_id": True,
         **_lr_contract(data),
     }

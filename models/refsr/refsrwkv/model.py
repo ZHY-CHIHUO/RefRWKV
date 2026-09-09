@@ -660,7 +660,7 @@ class RefSRWKV(nn.Module):
     def __init__(
         self,
         inp_channels: int = 3,
-        out_channels: int = 3,
+        out_channels: int | None = None,
         dim: int = 48,
         num_blocks: tuple = (4, 6, 6, 8),
         num_refinement_blocks: int = 4,
@@ -669,7 +669,7 @@ class RefSRWKV(nn.Module):
         color_match: str = "global",
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
-        ref_channels: int = None,
+        ref_channels: int | None = None,
         windows=None,
         fusion_match=None,
         decoder_refusion: bool = True,
@@ -709,18 +709,24 @@ class RefSRWKV(nn.Module):
             or int(hidden_rate * dim) < 1
         ):
             raise ValueError("hidden_rate 必须为正数")
-        if ref_channels is None:
-            # Reference colour statistics are matched against the LR image,
-            # so the reference stream follows the input channel count.
-            ref_channels = inp_channels
-        if not isinstance(inp_channels, int) or inp_channels < 1:
+        if not isinstance(inp_channels, int) or isinstance(inp_channels, bool) or inp_channels < 1:
             raise ValueError("inp_channels 必须为正整数")
-        if not isinstance(out_channels, int) or out_channels < 1:
+        if out_channels is None:
+            out_channels = inp_channels
+        if not isinstance(out_channels, int) or isinstance(out_channels, bool) or out_channels < 1:
             raise ValueError("out_channels 必须为正整数")
-        if not isinstance(ref_channels, int) or ref_channels < 1:
+        if ref_channels is None:
+            ref_channels = inp_channels
+        if not isinstance(ref_channels, int) or isinstance(ref_channels, bool) or ref_channels < 1:
             raise ValueError("ref_channels 必须为正整数")
-        if ref_channels != inp_channels:
-            raise ValueError("当前颜色对齐路径要求 ref_channels == inp_channels")
+        if ref_channels > inp_channels:
+            raise ValueError(
+                "ref_channels 不能大于 inp_channels；当前融合契约要求 LR 通道数 >= Ref 通道数"
+            )
+        if out_channels != inp_channels:
+            raise ValueError(
+                "out_channels 必须等于 inp_channels；模型输出通道数跟随 LR 通道数"
+            )
         if isinstance(decoder_refusion, bool) is False:
             raise ValueError("decoder_refusion 必须是 bool")
         if (
@@ -739,7 +745,11 @@ class RefSRWKV(nn.Module):
         shuffle_factors = _pixel_shuffle_factors(scale)
         fusion_config = normalize_fusion_match_config(fusion_match)
         self.scale = scale
-        self.inp_channels, self.ref_channels = inp_channels, ref_channels
+        self.inp_channels, self.ref_channels, self.out_channels = (
+            inp_channels,
+            ref_channels,
+            out_channels,
+        )
         self.upsampler, self.color_match = upsampler, color_match
         self.fusion_match_config = fusion_config
         self.decoder_refusion = decoder_refusion
@@ -1003,10 +1013,19 @@ class RefSRWKV(nn.Module):
         # enough precision to create visible colour shifts on flat patches.
         input_dtype = ref.dtype
         ref_f, target_f = ref.float(), target.float()
-        ref_mean = ref_f.mean(dim=(2, 3), keepdim=True)
-        ref_std = ref_f.std(dim=(2, 3), keepdim=True, unbiased=False).clamp_min(1e-6)
-        tgt_mean = target_f.mean(dim=(2, 3), keepdim=True)
-        tgt_std = target_f.std(dim=(2, 3), keepdim=True, unbiased=False).clamp_min(1e-6)
+        if ref.shape[1] == target.shape[1]:
+            # Preserve the original per-band behaviour for the conventional
+            # RGB/4-band same-channel contract.
+            reduce_dims = (2, 3)
+        else:
+            # There is no one-to-one colour correspondence for PAN, MS/HS,
+            # or other unequal-band inputs.  Match the complete image
+            # distribution instead of repeating or dropping spectral bands.
+            reduce_dims = (1, 2, 3)
+        ref_mean = ref_f.mean(dim=reduce_dims, keepdim=True)
+        ref_std = ref_f.std(dim=reduce_dims, keepdim=True, unbiased=False).clamp_min(1e-6)
+        tgt_mean = target_f.mean(dim=reduce_dims, keepdim=True)
+        tgt_std = target_f.std(dim=reduce_dims, keepdim=True, unbiased=False).clamp_min(1e-6)
         matched = (ref_f - ref_mean) / ref_std * tgt_std + tgt_mean
         return matched.to(input_dtype)
 
@@ -1097,6 +1116,11 @@ class RefSRWKV(nn.Module):
             raise RuntimeError(
                 "输出头没有按 scale 重建到 LR x scale: "
                 f"{tuple(out_feat.shape[2:])} vs {padded_hr_size}"
+            )
+        if out_feat.shape[1] != self.inp_channels:
+            raise RuntimeError(
+                "输出头没有保持 LR 通道数: "
+                f"{out_feat.shape[1]} vs {self.inp_channels}"
             )
         output = lr_hr + out_feat
         output = output[:, :, :target_hr_h, :target_hr_w]

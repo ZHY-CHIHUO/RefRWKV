@@ -224,7 +224,7 @@ python scripts/test/run.py \
 
 ```text
 experiments/test/<task>/<model>/<dataset>/x<scale>/<run>/<split>/
-├── images/                        # 预测 PNG
+├── images/                        # 1/3 通道为 PNG；其他通道为 float32 TIFF（无 tifffile 时为 NPY）
 └── metrics.json                   # PSNR/SSIM；Wuhan 另含 RMSE/UIQI/SAM/ERGAS
 ```
 

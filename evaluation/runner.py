@@ -1,8 +1,8 @@
 """Model-agnostic inference and metric writing for native test splits.
 
-The runner keeps the filesystem contract in one place.  Task-specific model
+The runner keeps the filesystem contract in one place. Task-specific model
 construction remains in ``models/sr`` and ``models/refsr``; this module only
-normalizes batches, invokes the model, writes PNG files, and aggregates metrics.
+normalizes batches, invokes the model, writes prediction rasters, and aggregates metrics.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -222,15 +223,49 @@ def _normalize_sample_ids(value: Any, batch_size: int) -> list[str]:
     return result
 
 
-def _save_png(batch: torch.Tensor, output_dir: Path, sample_ids: list[str]) -> None:
+def _save_predictions(batch: torch.Tensor, output_dir: Path, sample_ids: list[str]) -> None:
+    """Save predictions without collapsing non-RGB bands into a PNG mode.
+
+    PNG remains convenient for grayscale/RGB previews. Four-band and wider
+    predictions are scientific rasters, so keep their floating-point values
+    in TIFF (or NPY when the optional TIFF dependency is unavailable).
+    """
+    if batch.ndim != 4:
+        raise ValueError(f"prediction batch must be NCHW, got {tuple(batch.shape)}")
     output_dir.mkdir(parents=True, exist_ok=True)
     if len(sample_ids) != int(batch.shape[0]):
         raise ValueError(
             f"sample_id count {len(sample_ids)} does not match image batch {int(batch.shape[0])}"
         )
+    channels = int(batch.shape[1])
+    if channels < 1:
+        raise ValueError("prediction batch must contain at least one channel")
+    raster_writer = None
+    if channels not in {1, 3}:
+        try:
+            import tifffile  # type: ignore
+
+            raster_writer = tifffile.imwrite
+        except ImportError:  # pragma: no cover - requirements include tifffile
+            raster_writer = None
     for offset, image in enumerate(batch.detach().cpu()):
-        array = (image.permute(1, 2, 0).numpy() * 255.0 + 0.5).clip(0, 255).astype("uint8")
-        Image.fromarray(array).save(output_dir / f"{sample_ids[offset]}.png")
+        array = image.permute(1, 2, 0).numpy()
+        sample_id = sample_ids[offset]
+        if channels in {1, 3}:
+            png_array = (array * 255.0 + 0.5).clip(0, 255).astype("uint8")
+            if channels == 1:
+                png_array = png_array[..., 0]
+            Image.fromarray(png_array).save(output_dir / f"{sample_id}.png")
+            continue
+        raster = array.astype(np.float32, copy=False)
+        if raster_writer is not None:
+            raster_writer(
+                output_dir / f"{sample_id}.tif",
+                raster,
+                photometric="minisblack",
+            )
+        else:
+            np.save(output_dir / f"{sample_id}.npy", raster)
 
 
 def _build_refsr_model(
@@ -507,7 +542,7 @@ def run_inference(
                 duplicate = sorted(set(batch_sample_ids) & set(sample_ids))
                 raise ValueError(f"duplicate sample_id encountered during evaluation: {duplicate}")
             if save_predictions:
-                _save_png(prediction_png, image_root, batch_sample_ids)
+                _save_predictions(prediction_png, image_root, batch_sample_ids)
             sample_ids.extend(batch_sample_ids)
             sample_count += int(prediction_png.shape[0])
 

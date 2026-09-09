@@ -500,6 +500,28 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
             raise ValueError(f"{section} 必须是 mapping")
     data, model = config.get("data", {}), config.get("model", {})
     test = config.get("test", {})
+    if isinstance(model, Mapping):
+        declared_channels: dict[str, int] = {}
+        for field in ("inp_channels", "out_channels", "ref_channels"):
+            if field not in model:
+                continue
+            value = model[field]
+            if value is None and field in {"out_channels", "ref_channels"}:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"model.{field} 必须是正整数")
+            declared_channels[field] = value
+        inp_channels = declared_channels.get("inp_channels")
+        out_channels = declared_channels.get("out_channels")
+        ref_channels = declared_channels.get("ref_channels")
+        if inp_channels is not None and out_channels is not None and out_channels != inp_channels:
+            raise ValueError(
+                "model.out_channels 必须等于 model.inp_channels；输出通道数跟随 LR"
+            )
+        if inp_channels is not None and ref_channels is not None and ref_channels > inp_channels:
+            raise ValueError(
+                "model.ref_channels 不能大于 model.inp_channels；LR 通道数必须 >= Ref 通道数"
+            )
     if test and isinstance(test, Mapping):
         splits = test.get("split", test.get("splits", ["test"]))
         if isinstance(splits, str):
@@ -572,7 +594,7 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
                 if isinstance(value_scale, bool) or not isinstance(value_scale, (int, float)) or value_scale <= 0:
                     raise ValueError("data.value_scale 必须是正数")
             for field in ("inp_channels", "out_channels", "ref_channels"):
-                if field in model and model[field] != 4:
+                if field in model and model[field] is not None and model[field] != 4:
                     raise ValueError(f"Wuhan 四通道模型要求 model.{field}=4")
     if not str(model.get("name", "")).strip():
         raise ValueError("model.name 必须是非空字符串")
