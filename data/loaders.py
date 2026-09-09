@@ -196,6 +196,7 @@ def _wuhan_kwargs(data: Mapping[str, Any], *, mode: str, patch_size: int | None,
         "lr_source": str(data.get("lr_source", "stored")),
         "lr_native_scale": data.get("lr_native_scale", 1),
         "lr_provenance": str(data.get("lr_provenance", "sensor")),
+        "return_sample_id": bool(data.get("return_sample_id", False)),
     }
 
 
@@ -377,6 +378,7 @@ def _test_dataset_kwargs(config: Mapping[str, Any], split: str) -> dict[str, Any
         "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
         "lr_key": data.get("lr_key", "lr"),
         "hr_key": data.get("hr_key", "hr"),
+        "return_sample_id": True,
         **_lr_contract(data),
     }
 
@@ -430,7 +432,7 @@ def build_refsr_test_loader(
             WuhanSTFDataset(
                 root,
                 **_wuhan_kwargs(
-                    {**data, "sample_seed": seed, "augment": False},
+                    {**data, "sample_seed": seed, "augment": False, "return_sample_id": True},
                     mode=split,
                     patch_size=data.get("test_patch_size"),
                     max_samples=max_samples,

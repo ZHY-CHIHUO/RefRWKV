@@ -2,17 +2,17 @@
 set -euo pipefail
 
 # Compatibility launcher for cluster submit commands.  The actual command
-# definitions live in scripts/shortcuts/ so local and remote runs share one
+# definitions live in scripts/shortcuts/train/ so local and remote runs share one
 # source of truth.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SHORTCUT_DIR="$SCRIPT_DIR/shortcuts"
+SHORTCUT_DIR="$SCRIPT_DIR/shortcuts/train"
 DEFAULT_SHORTCUT="${REFRWKV_SHORTCUT:-swinir_hrms_scd_sr_x4.sh}"
 
 usage() {
   cat <<'EOF'
 用法:
-  submit_train.sh                              运行默认快捷脚本
-  submit_train.sh <快捷脚本名>                  运行指定快捷脚本
+  submit_train.sh                              运行默认训练快捷脚本
+  submit_train.sh <快捷脚本名>                  运行指定训练快捷脚本
   submit_train.sh --list                       列出可用快捷脚本
   submit_train.sh <快捷脚本名> --print          只打印训练命令
 
@@ -43,7 +43,7 @@ if [[ "$shortcut" != *.sh ]]; then
   shortcut="${shortcut}.sh"
 fi
 if [[ "$shortcut" == */* || "$shortcut" == .* ]]; then
-  printf '快捷脚本必须是 shortcuts 目录中的文件名：%s\n' "$shortcut" >&2
+  printf '训练快捷脚本必须是 shortcuts/train 目录中的文件名：%s\n' "$shortcut" >&2
   exit 2
 fi
 

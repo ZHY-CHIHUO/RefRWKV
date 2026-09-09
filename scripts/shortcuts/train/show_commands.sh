@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 用途：只打印所有训练快捷脚本的命令，不启动训练。
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then

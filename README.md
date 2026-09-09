@@ -2,7 +2,7 @@
 
 RefRWKV 是一个参考图超分辨率（RefSR）和单图超分辨率（SR）实验仓库。代码、数据、权重、训练运行和测试结果按生命周期分开；添加模型只需要加入自己的模型目录、配置和入口注册，不需要复制数据加载或评估逻辑。
 
-项目目录和文件用途见 [docs/project_guide.md](docs/project_guide.md)；目录约定、数据契约和扩展规则见 [docs/architecture.md](docs/architecture.md)。
+各一级目录的具体说明放在对应的 `README.md`：[`configs/`](configs/README.md)、[`data/`](data/README.md)、[`models/`](models/README.md)、[`scripts/`](scripts/README.md)、[`runtime/`](runtime/README.md)、[`experiments/`](experiments/README.md) 等。本文只保留项目总览和常用入口。
 
 ## 目录
 
@@ -39,7 +39,9 @@ RefRWKV/
 ├── scripts/
 │   ├── train/                    # sr.py、refsr.py、refsrwkv.py、refdiffrwkv.py
 │   ├── test/                     # sr.py、refsr.py
-│   ├── shortcuts/                # 按模型/数据集/任务/倍率命名的快捷训练脚本
+│   ├── shortcuts/
+│   │   ├── train/                # 训练快捷脚本
+│   │   └── test/                 # 测试快捷脚本
 │   ├── prepare/                  # 数据准备脚本
 │   └── evaluate.py               # 统一评估入口
 ├── experiments/
@@ -50,7 +52,7 @@ RefRWKV/
 │   └── exports/                  # 明确导出的部署权重
 ├── tests/                        # smoke/regression tests
 ├── environments/                 # 可选官方基线的独立 Conda 环境定义
-└── docs/                         # 架构、数据和对比实验说明
+└── README.md                     # 项目总览；各目录内另有 README.md
 ```
 
 `RefSRWKV` 和 `RefDiffRWKV` 都属于 `models/refsr/`。扩散模型可以通过 `model.sr.ckpt_path` 使用 RefSRWKV 或其他可作为先验的 SR 网络，扩散相关代码和配置均位于 RefSR 的模型与运行目录中。
@@ -74,7 +76,7 @@ Stage 4 还需要 `vision_aided_loss`，其上游安装命令写在 `requirement
 EDSR、RCAN、HAT、MambaIRv2、TTSR、MASA-SR、DATSR 的可训练 compatibility
 基线已包含在主环境；官方旧代码或编译依赖不要混装进 `rwkv7`。环境 YAML、风险
 和结果可比性边界见 [环境说明](environments/README.md) 与
-[完整基线表](docs/models/baselines.md)。
+完整基线协议和模型说明见 [`models/README.md`](models/README.md)。
 
 ## 配置
 
@@ -104,7 +106,7 @@ Wuhan 的 `L`/`G` TIFF 已在文件中对齐为同一 1000×1000 网格，RefSRW
 
 ```bash
 python scripts/train/refsrwkv.py --config configs/runs/refsrwkv/wuhan.yaml
-python scripts/evaluate.py --config configs/runs/refsrwkv/wuhan.yaml \
+python scripts/test/run.py --config configs/test/test.yaml \
   --checkpoint experiments/train/refsr/refsrwkv/wuhan/x1/wuhan/checkpoints/last.ckpt \
   --split test
 ```
@@ -128,7 +130,7 @@ python scripts/train/refsrwkv.py \
   --config experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/config.yaml
 ```
 
-如果目标完整配置已经存在，工具默认拒绝覆盖，以免丢失手工修改；确认需要重新展开时使用 `--force`。完整 YAML 已经包含数据、模型、训练和输出字段，不再依赖 `base`，可以直接作为所有训练或测试入口的 `--config` 参数。直接传入完整 YAML 时会尊重该文件本身，不会再跳转到其他快照。
+如果目标完整配置已经存在，工具默认拒绝覆盖，以免丢失手工修改；确认需要重新展开时使用 `--force`。完整训练 YAML 已经包含数据、模型、训练和输出字段，不再依赖 `base`，可以直接作为训练入口的 `--config` 参数。测试入口使用 `configs/test/test.yaml`，模型和数据配置从 checkpoint 内嵌的训练 YAML 读取。
 
 SR（SwinIR-M，AID x4）：
 
@@ -162,7 +164,7 @@ python scripts/train/refsrwkv.py \
 
 完整对比集合（Bicubic、EDSR、RCAN、SwinIR、HAT、MambaIRv2、RefSRWKV、TTSR、
 MASA-SR、DATSR）的配置、快捷入口、参数量和复现边界见
-[HRMS-SCD x4 对比基线](docs/models/baselines.md)。其中 Bicubic 只评估，其余
+[`models/README.md`](models/README.md)。其中 Bicubic 只评估，其余
 模型统一使用 `1e-4`、plateau、每 epoch 验证、L1、`max_epochs: -1`、
 `max_steps: 50000` 和无 early stopping。
 
@@ -191,25 +193,34 @@ tensorboard --logdir experiments/train
 
 ## 测试与评估
 
-SR：
+测试使用独立 YAML。模型、数据集和架构设置直接从 checkpoint 内嵌的最终
+`trainer_config` 读取，不会重新加载 `configs/runs` 中的训练配置：
 
 ```bash
-python scripts/test/sr.py \
-  --config configs/runs/sr/swinir/aid_x4.yaml \
-  --checkpoint experiments/train/sr/swinir/aid/x4/aid_x4/checkpoints/last.ckpt \
-  --split test
+python scripts/test/run.py \
+  --config configs/test/test.yaml \
+  --checkpoint experiments/train/sr/swinir/aid/x4/aid_x4/checkpoints/last.ckpt
 ```
 
-RefSRWKV、TTSR、MASA-SR、DATSR 或 RefDiffRWKV：
+`configs/test/test.yaml` 只控制 split、指标、是否保存图片、设备、batch size、
+采样步数和输出路径。命令行参数可以临时覆盖这些设置：
 
 ```bash
-python scripts/test/refsr.py \
-  --config configs/runs/refsrwkv/hrms_scd_x4.yaml \
-  --checkpoint experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_x4/checkpoints/last.ckpt \
-  --split test
+python scripts/test/run.py \
+  --config configs/test/test.yaml \
+  --checkpoint experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/checkpoints/last.ckpt \
+  --metrics psnr ssim rmse --no-save-images
 ```
 
-也可以使用统一入口 `python scripts/evaluate.py ...`。测试输出为：
+Bicubic 没有 checkpoint，可改用它自己的完整配置提供数据和倍率元信息：
+
+```bash
+python scripts/test/run.py \
+  --config configs/test/test.yaml \
+  --training-config configs/runs/sr/bicubic/hrms_scd_x4.yaml
+```
+
+测试输出为：
 
 ```text
 experiments/test/<task>/<model>/<dataset>/x<scale>/<run>/<split>/
@@ -217,7 +228,19 @@ experiments/test/<task>/<model>/<dataset>/x<scale>/<run>/<split>/
 └── metrics.json                   # PSNR/SSIM；Wuhan 另含 RMSE/UIQI/SAM/ERGAS
 ```
 
-`test` 是推荐的测试目录名；RefSR-HRMS 的 `test_easy`、`test_hard` 是数据集 split，统一写在同一个实验目录下面。
+测试根目录还会保存本次实际使用的 `test_easy.yaml`、`test_hard.yaml`：
+
+```text
+experiments/test/<task>/<model>/<dataset>/x<scale>/<run>/
+├── test_easy.yaml                 # 可编辑；下一次 test_easy 优先读取
+├── test_hard.yaml                 # 可编辑；下一次 test_hard 优先读取
+├── test_easy/metrics.json
+└── test_hard/metrics.json
+```
+
+首次运行时由 `configs/test/test.yaml` 生成这两个文件；生成后直接编辑输出目录里的
+对应 YAML 即可生效。只有需要给新实验提供默认策略时，才修改
+`configs/test/test.yaml`。
 
 ## 权重和日志放置规则
 

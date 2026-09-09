@@ -8,7 +8,7 @@ can be trained in the repository's ``rwkv7`` environment.  The adapters expose
 the same ``[-1, 1]`` tensor contract as SwinIR.
 
 For exact paper numbers, use the official bridge environments documented in
-``docs/models/baselines.md`` and load the corresponding upstream checkpoint.
+``models/README.md`` and load the corresponding upstream checkpoint.
 """
 
 from __future__ import annotations

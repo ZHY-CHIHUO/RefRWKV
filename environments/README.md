@@ -6,7 +6,7 @@
 以免破坏 RefRWKV 的主环境。
 
 下列 YAML 是“官方实现桥接”用的独立环境定义，不会在安装主项目时自动
-创建。使用前请先阅读 [`../docs/models/baselines.md`](../docs/models/baselines.md)
+创建。使用前请先阅读 [`../models/README.md`](../models/README.md)
 中关于官方实现与 native 版本不可混用的说明。
 
 ```bash

@@ -1,0 +1,10 @@
+# Standalone evaluation policy.  Model, dataset and architecture settings are
+# read from the checkpoint's embedded trainer_config, not from configs/runs.
+test:
+  splits: [test_easy, test_hard]
+  metrics: [psnr, ssim]
+  save_images: true
+  device: null
+  batch_size: null
+  steps: null
+  output: null

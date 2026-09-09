@@ -16,7 +16,7 @@ families* runnable in the main environment:
 They are registered as ``native_compatibility`` implementations.  They are
 not checkpoint-compatible copies of their official repositories; the exact
 upstream environments are documented in ``environments/`` and
-``docs/models/baselines.md``.
+``models/README.md``.
 """
 
 from __future__ import annotations

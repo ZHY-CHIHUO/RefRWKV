@@ -1,0 +1,26 @@
+# Zero-shot AID protocol for the HRMS-trained RefSRWKV-SR arm.
+# The checkpoint remains the source of model and architecture settings;
+# dataset/data below are the explicit cross-dataset evaluation override.
+test:
+  splits: [test]
+  metrics: [psnr, ssim]
+  save_images: false
+  device: cuda
+  batch_size: 1
+  steps: null
+  output: null
+
+dataset:
+  id: aid
+  name: AID (Aerial Image Dataset)
+  kind: synthetic_sisr
+  root: data/sr/AID
+
+data:
+  root: data/sr/AID
+  reference_mode: lr_up
+  max_samples_test: 500
+  sample_seed: 42
+  lr_source: auto
+  lr_native_scale: 4
+  lr_provenance: bicubic

@@ -67,6 +67,7 @@ class WuhanSTFDataset(Dataset):
         lr_source: str = "stored",
         lr_native_scale: int | None = 1,
         lr_provenance: str = "sensor",
+        return_sample_id: bool = False,
     ) -> None:
         mode = str(mode).strip().lower()
         if mode not in self._VALID_MODES:
@@ -111,6 +112,7 @@ class WuhanSTFDataset(Dataset):
         self.sample_seed = sample_seed
         self.augment = bool(augment) and mode == "train"
         self.lr_key, self.hr_key, self.ref_key = lr_key, hr_key, ref_key
+        self.return_sample_id = bool(return_sample_id)
         self.return_quadruple = bool(return_quadruple)
         self.target_time, self.reference_time = target_time, reference_time
         self.value_scale = float(value_scale)
@@ -348,10 +350,13 @@ class WuhanSTFDataset(Dataset):
                     "hr_t2": images["g_t2"],
                 }
             )
-        return {
+        result = {
             key: self._to_tensor(value)
             for key, value in values.items()
         }
+        if self.return_sample_id:
+            result["sample_id"] = pair["name"]
+        return result
 
     def __len__(self) -> int:
         return len(self.pairs)

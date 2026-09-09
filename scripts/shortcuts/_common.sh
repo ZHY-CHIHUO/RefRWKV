@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 用途：训练快捷脚本共享的项目根目录、环境和命令执行逻辑。
+
 shortcut_root() {
   cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
 }

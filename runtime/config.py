@@ -408,12 +408,109 @@ def load_config(
     return materialize_config(source, config_path)
 
 
+def load_test_yaml(
+    path: str | os.PathLike[str], overrides: list[str] | None = None
+) -> tuple[dict[str, Any], Path]:
+    """Load a standalone evaluation YAML without resolving a training run.
+
+    Test YAMLs intentionally contain only evaluation policy (the ``test``
+    mapping).  Model, dataset, and architecture settings are supplied by the
+    checkpoint's embedded ``trainer_config`` instead of being re-read from a
+    file under ``configs/runs``.
+    """
+    config_path = resolve_path(path, prefer_cwd=True)
+    source = apply_overrides(load_yaml_file(config_path), overrides)
+    test = source.get("test")
+    if not isinstance(test, Mapping):
+        raise ValueError(
+            f"独立测试配置必须包含 test mapping: {config_path}"
+        )
+    return source, config_path
+
+
+def merge_test_policy(
+    training_config: Mapping[str, Any],
+    test_config: Mapping[str, Any],
+    *,
+    test_config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Overlay an independent test policy onto a complete training config."""
+    if not isinstance(training_config, Mapping) or not training_config:
+        raise ValueError("训练配置必须是非空 mapping")
+    if not isinstance(test_config, Mapping) or not isinstance(test_config.get("test"), Mapping):
+        raise ValueError("独立测试配置必须包含 test mapping")
+    # The standalone test policy is authoritative as a whole.  Replacing the
+    # section (instead of recursively merging it) prevents stale fields such
+    # as an old ``test.split`` in the training checkpoint from overriding the
+    # current ``test.splits`` setting.
+    merged = deep_merge(dict(training_config), dict(test_config))
+    test = copy.deepcopy(dict(test_config["test"]))
+    merged["test"] = test
+    if not isinstance(test, dict):
+        raise ValueError("test 必须是 mapping")
+    test.setdefault("splits", ["test"])
+    test.setdefault("metrics", ["psnr", "ssim"])
+    test.setdefault("save_images", True)
+    test.setdefault("device", None)
+    test.setdefault("batch_size", None)
+    test.setdefault("steps", None)
+    test.setdefault("output", None)
+    if test_config_path is not None:
+        merged["_test_config_path"] = str(Path(test_config_path).resolve())
+    return merged
+
+
+def merge_test_config(
+    test_config: Mapping[str, Any],
+    checkpoint: Any,
+    *,
+    test_config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Overlay an independent test policy onto a checkpoint configuration."""
+    from .checkpoint import checkpoint_config, load_checkpoint
+
+    if isinstance(checkpoint, (str, os.PathLike)):
+        checkpoint = load_checkpoint(checkpoint)
+    training_config = checkpoint_config(checkpoint)
+    if not training_config:
+        raise ValueError(
+            "checkpoint 不包含 trainer_config；请使用保存了最终训练 YAML 的 checkpoint"
+        )
+    return merge_test_policy(
+        training_config,
+        test_config,
+        test_config_path=test_config_path,
+    )
+
+
+def load_test_config(
+    path: str | os.PathLike[str],
+    checkpoint: Any,
+    overrides: list[str] | None = None,
+) -> dict[str, Any]:
+    """Load an independent test YAML and merge it with checkpoint metadata."""
+    source, config_path = load_test_yaml(path, overrides)
+    return merge_test_config(source, checkpoint, test_config_path=config_path)
+
+
 def validate_config(config: dict[str, Any], *, require_data: bool = True) -> None:
     """Validate fields shared by all native loaders and Lightning runners."""
-    for section in ("data", "model", "train", "loss", "output"):
+    for section in ("data", "model", "train", "loss", "output", "test"):
         if section in config and not isinstance(config[section], dict):
             raise ValueError(f"{section} 必须是 mapping")
     data, model = config.get("data", {}), config.get("model", {})
+    test = config.get("test", {})
+    if test and isinstance(test, Mapping):
+        splits = test.get("split", test.get("splits", ["test"]))
+        if isinstance(splits, str):
+            splits = [splits]
+        if not isinstance(splits, (list, tuple)) or not splits or any(str(split) not in {"test", "test_easy", "test_hard"} for split in splits):
+            raise ValueError("test.splits 必须是 test、test_easy、test_hard 的非空列表")
+        save_images = test.get("save_images", True)
+        if not isinstance(save_images, bool):
+            raise ValueError("test.save_images 必须是布尔值")
+    elif test:
+        raise ValueError("test 必须是 mapping")
     if require_data:
         if not data.get("root"):
             raise ValueError("data.root 未设置")
@@ -495,7 +592,11 @@ __all__ = [
     "apply_overrides",
     "DIRECT_REFSR_MODEL_NAMES",
     "load_config",
+    "load_test_config",
+    "load_test_yaml",
     "load_yaml_file",
+    "merge_test_config",
+    "merge_test_policy",
     "materialize_config",
     "PAIRED_REFERENCE_MODEL_NAMES",
     "REFSR_MODEL_NAMES",

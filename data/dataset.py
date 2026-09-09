@@ -75,6 +75,7 @@ class SuperResolutionDataset(Dataset):
         ref_aug_strengths: Sequence[float] | None = None,
         ref_aug_probs: Sequence[float] | None = None,
         ref_gray_prob: float = 0.2,
+        return_sample_id: bool = False,
     ) -> None:
         if mode not in self._VALID_MODES:
             raise ValueError(f"Unknown mode: {mode}")
@@ -160,6 +161,7 @@ class SuperResolutionDataset(Dataset):
         self.ref_aug_strengths = tuple(float(value) for value in ref_aug_strengths)
         self.ref_aug_probs = tuple(float(value) for value in ref_aug_probs)
         self.ref_gray_prob = float(ref_gray_prob)
+        self.return_sample_id = bool(return_sample_id)
 
         split_dir = self.data_dir / mode
         self.lr_dir = split_dir / "LR"
@@ -427,6 +429,8 @@ class SuperResolutionDataset(Dataset):
         for item in self.return_items:
             array = np.ascontiguousarray(np.transpose(images[item], (2, 0, 1)))
             result[key_map[item]] = torch.from_numpy(array)
+        if self.return_sample_id:
+            result["sample_id"] = name
         return result
 
     def __len__(self) -> int:
