@@ -176,6 +176,7 @@ def _parse_p(values: list[str] | None) -> list[float]:
 def _write_summary_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
+        "reference_type",
         "p",
         "control",
         "samples",
@@ -200,6 +201,7 @@ def _write_per_image_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "sample_id",
+        "reference_type",
         "p",
         "psnr",
         "ssim",
@@ -225,19 +227,38 @@ def _write_plot(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         LOGGER.warning("matplotlib is unavailable; skipping the sensitivity plot")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    plotted = [row for row in rows if float(row["p"]) > 0.0]
+    plotted = [
+        row
+        for row in rows
+        if row.get("reference_type") == "synthetic_sensor_mix"
+        and row.get("p") is not None
+        and float(row["p"]) > 0.0
+    ]
     plt.figure(figsize=(7.0, 4.8))
     plt.plot(
         [float(row["p"]) for row in plotted],
         [float(row["delta_psnr_mean"]) for row in plotted],
         marker="o",
         linewidth=2.0,
+        label="Synthetic sensor mix",
     )
+    direct = [row for row in rows if row.get("reference_type") == "hr_direct"]
+    if direct:
+        plt.scatter(
+            [1.0],
+            [float(direct[0]["delta_psnr_mean"])],
+            marker="*",
+            s=130,
+            zorder=3,
+            label="HR direct reference",
+        )
     plt.axhline(0.0, color="black", linewidth=1.0)
     plt.xlabel("Reference intensity p")
     plt.ylabel("TRefSR - SR PSNR (dB)")
     plt.title("AID reference sensitivity (HRMS zero-shot)")
     plt.grid(alpha=0.25)
+    plt.legend()
+    plt.xlim(-0.05, 1.08)
     plt.tight_layout()
     plt.savefig(path, dpi=180)
     plt.close()
@@ -285,6 +306,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--p", action="append", dest="p_values", help="reference intensity in [0,1]")
+    parser.add_argument(
+        "--include-hr-direct",
+        action="store_true",
+        help="also evaluate the ideal upper-bound reference made directly from HR",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--raw-weights", action="store_true")
     parser.add_argument("--overrides", nargs="*", default=None)
@@ -314,8 +340,14 @@ def main() -> None:
     output = resolve_path(args.output, prefer_cwd=True)
     output.mkdir(parents=True, exist_ok=True)
     per_image_rows: list[dict[str, Any]] = []
-    grouped: dict[float, dict[str, list[float]]] = {
-        p: {key: [] for key in ("psnr", "ssim", "delta", "correlation")} for p in p_values
+    scan_specs: list[tuple[str, float | None]] = [
+        ("synthetic_sensor_mix", p) for p in p_values
+    ]
+    if args.include_hr_direct:
+        scan_specs.append(("hr_direct", None))
+    grouped: dict[tuple[str, float | None], dict[str, list[float]]] = {
+        spec: {key: [] for key in ("psnr", "ssim", "delta", "correlation")}
+        for spec in scan_specs
     }
     seen: list[str] = []
     with torch.inference_mode():
@@ -345,30 +377,54 @@ def main() -> None:
                 seed=args.seed,
             )
             hr_metric, _ = _image_tensor(hr, value_range="minus_one_one")
-            for p in p_values:
-                reference = ((1.0 - p) * ((degraded + 1.0) * 0.5) + p * ((sensor + 1.0) * 0.5))
-                reference = reference.clamp(0.0, 1.0) * 2.0 - 1.0
+            for reference_type, p in scan_specs:
+                if reference_type == "hr_direct":
+                    reference = hr
+                else:
+                    assert p is not None
+                    if p == 0.0:
+                        # Keep the control numerically identical to the
+                        # lr_up reference used by the standalone SR run.
+                        reference = degraded
+                    else:
+                        reference = (
+                            (1.0 - p) * ((degraded + 1.0) * 0.5)
+                            + p * ((sensor + 1.0) * 0.5)
+                        )
+                        reference = reference.clamp(0.0, 1.0) * 2.0 - 1.0
                 prediction = tiled_forward(model, lr, reference, scale=4)
                 prediction_metric, _ = _image_tensor(prediction, value_range="minus_one_one")
                 psnr_values = per_image_psnr(prediction_metric, hr_metric).detach().cpu().tolist()
                 ssim_values = gaussian_ssim(prediction_metric, hr_metric).detach().cpu().tolist()
                 correlations = _pearson_per_image(reference, hr).detach().cpu().tolist()
+                values = grouped[(reference_type, p)]
                 for index, sample_id in enumerate(sample_ids):
                     delta = float(psnr_values[index]) - baseline[sample_id]
-                    grouped[p]["psnr"].append(float(psnr_values[index]))
-                    grouped[p]["ssim"].append(float(ssim_values[index]))
-                    grouped[p]["delta"].append(delta)
-                    grouped[p]["correlation"].append(float(correlations[index]))
+                    values["psnr"].append(float(psnr_values[index]))
+                    values["ssim"].append(float(ssim_values[index]))
+                    values["delta"].append(delta)
+                    values["correlation"].append(float(correlations[index]))
                     per_image_rows.append(
                         {
                             "sample_id": sample_id,
+                            "reference_type": reference_type,
                             "p": p,
                             "psnr": float(psnr_values[index]),
                             "ssim": float(ssim_values[index]),
                             "baseline_psnr": baseline[sample_id],
                             "delta_psnr": delta,
                             "reference_correlation": float(correlations[index]),
-                            **provenance[index],
+                            **(
+                                provenance[index]
+                                if reference_type == "synthetic_sensor_mix"
+                                else {
+                                    "brightness": None,
+                                    "contrast": None,
+                                    "gamma": None,
+                                    "shift_dy": None,
+                                    "shift_dx": None,
+                                }
+                            ),
                         }
                     )
     if len(seen) != len(set(seen)):
@@ -378,13 +434,14 @@ def main() -> None:
         raise ValueError(f"AID sample set mismatch: unexpected={extra[:5]}")
 
     summary_rows: list[dict[str, Any]] = []
-    for p in p_values:
-        values = grouped[p]
+    for reference_type, p in scan_specs:
+        values = grouped[(reference_type, p)]
         deltas = values["delta"]
         summary_rows.append(
             {
+                "reference_type": reference_type,
                 "p": p,
-                "control": p == 0.0,
+                "control": reference_type == "synthetic_sensor_mix" and p == 0.0,
                 "samples": len(deltas),
                 "psnr_mean": _mean(values["psnr"]),
                 "psnr_std": _std(values["psnr"]),
@@ -407,8 +464,10 @@ def main() -> None:
         "sample_seed": args.seed,
         "split": "AID/test",
         "p_values": p_values,
+        "include_hr_direct": args.include_hr_direct,
         "p_zero_is_control": True,
         "reference_definition": "Ref(p) = (1-p) * bicubic(LR) + p * SensorMismatch(HR)",
+        "hr_direct_definition": "Ref = HR directly (ideal reference upper bound)",
         "spectral_response": SPECTRAL_RESPONSE,
         "photometric_ranges": {
             "brightness": [0.88, 1.12],
