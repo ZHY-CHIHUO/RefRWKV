@@ -1,0 +1,71 @@
+{
+  "split": "test_easy",
+  "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/checkpoints/epoch=0149-step=089400.ckpt",
+  "sr_run": "/home/zhy/PROJECT/RefRWKV/experiments/test/refsr/refsrwkv/hrms_scd/x4/hrms_scd_sr_x4",
+  "alphas": [
+    0.0,
+    0.2,
+    0.4,
+    0.6,
+    0.8,
+    1.0
+  ],
+  "rows": [
+    {
+      "alpha": 0.0,
+      "samples": 500,
+      "reference_correlation": 0.9071335160732269,
+      "reference_correlation_std": 0.03144958360280089,
+      "trefsr_psnr": 25.215426849365233,
+      "sr_psnr": 25.39399884414673,
+      "delta_psnr": -0.1785719947814961
+    },
+    {
+      "alpha": 0.2,
+      "samples": 500,
+      "reference_correlation": 0.9404342504739761,
+      "reference_correlation_std": 0.020219006388471135,
+      "trefsr_psnr": 25.339870136260988,
+      "sr_psnr": 25.39399884414673,
+      "delta_psnr": -0.054128707885741534
+    },
+    {
+      "alpha": 0.4,
+      "samples": 500,
+      "reference_correlation": 0.9668569589853286,
+      "reference_correlation_std": 0.01112774757937511,
+      "trefsr_psnr": 26.485776279449464,
+      "sr_psnr": 25.39399884414673,
+      "delta_psnr": 1.0917774353027347
+    },
+    {
+      "alpha": 0.6,
+      "samples": 500,
+      "reference_correlation": 0.9856175029277802,
+      "reference_correlation_std": 0.0047128967444014505,
+      "trefsr_psnr": 28.074988945007323,
+      "sr_psnr": 25.39399884414673,
+      "delta_psnr": 2.680990100860594
+    },
+    {
+      "alpha": 0.8,
+      "samples": 500,
+      "reference_correlation": 0.996531830072403,
+      "reference_correlation_std": 0.001095457726497122,
+      "trefsr_psnr": 29.37502618408203,
+      "sr_psnr": 25.39399884414673,
+      "delta_psnr": 3.9810273399353022
+    },
+    {
+      "alpha": 1.0,
+      "samples": 500,
+      "reference_correlation": 1.0,
+      "reference_correlation_std": 0.0,
+      "trefsr_psnr": 30.142146862030028,
+      "sr_psnr": 25.39399884414673,
+      "delta_psnr": 4.748148017883299
+    }
+  ],
+  "reference_definition": "alpha * HR + (1 - alpha) * bicubic(LR)",
+  "correlation": "per-image Pearson correlation over channels and pixels, then averaged"
+}

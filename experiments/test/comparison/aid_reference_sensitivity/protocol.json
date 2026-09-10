@@ -1,0 +1,52 @@
+{
+  "experiment": "HRMS-trained RefSRWKV zero-shot reference sensitivity on AID",
+  "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/checkpoints/last.ckpt",
+  "baseline_sr_metrics": "/home/zhy/PROJECT/RefRWKV/experiments/test/refsr/refsrwkv/aid/x4/hrms_scd_sr_x4_zero_shot/test/metrics.json",
+  "samples": 500,
+  "sample_seed": 42,
+  "split": "AID/test",
+  "p_values": [
+    0.0,
+    0.2,
+    0.4,
+    0.6,
+    0.8,
+    1.0
+  ],
+  "p_zero_is_control": true,
+  "reference_definition": "Ref(p) = (1-p) * bicubic(LR) + p * SensorMismatch(HR)",
+  "spectral_response": [
+    [
+      0.86,
+      0.1,
+      0.04
+    ],
+    [
+      0.05,
+      0.9,
+      0.05
+    ],
+    [
+      0.03,
+      0.11,
+      0.86
+    ]
+  ],
+  "photometric_ranges": {
+    "brightness": [
+      0.88,
+      1.12
+    ],
+    "contrast": [
+      0.9,
+      1.1
+    ],
+    "gamma": [
+      0.95,
+      1.05
+    ]
+  },
+  "translation": "independent dy/dx chosen from {-4,-3,-2,2,3,4}; edge replication",
+  "baseline_psnr_mean": 27.84075611114502,
+  "device": "cuda"
+}

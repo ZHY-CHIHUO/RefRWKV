@@ -43,12 +43,30 @@ dist/
 !/data/refsr/Wuhan-dataset/SPLIT_MANIFEST.md
 !/data/refsr/Wuhan-dataset/split_manifest.json
 
-# Model weights and run outputs are local artifacts.
+# Model weights and generated image/log artifacts are local files. Experiment
+# metadata, metrics, configs, and comparison reports remain versioned so runs
+# can be inspected without committing large binary outputs.
 /weights/*
 !/weights/.gitkeep
 !/weights/README.md
-/experiments/*
-!/experiments/.gitkeep
+
+/experiments/**/images/
+/experiments/**/checkpoints/
+/experiments/**/logs/
+/experiments/**/*.png
+/experiments/**/*.jpg
+/experiments/**/*.jpeg
+/experiments/**/*.webp
+/experiments/**/*.bmp
+/experiments/**/*.tif
+/experiments/**/*.tiff
+/experiments/**/*.ckpt
+/experiments/**/*.pt
+/experiments/**/*.pth
+/experiments/**/*.safetensors
+/experiments/**/*.bin
+/experiments/**/*.log
+/experiments/**/events.out.tfevents.*
 
 # Optional derived LR cache. Native loaders derive non-storage scales in RAM,
 # so this remains empty unless an experiment explicitly enables a cache.

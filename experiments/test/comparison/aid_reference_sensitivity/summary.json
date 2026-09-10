@@ -1,0 +1,146 @@
+{
+  "protocol": {
+    "experiment": "HRMS-trained RefSRWKV zero-shot reference sensitivity on AID",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/checkpoints/last.ckpt",
+    "baseline_sr_metrics": "/home/zhy/PROJECT/RefRWKV/experiments/test/refsr/refsrwkv/aid/x4/hrms_scd_sr_x4_zero_shot/test/metrics.json",
+    "samples": 500,
+    "sample_seed": 42,
+    "split": "AID/test",
+    "p_values": [
+      0.0,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0
+    ],
+    "p_zero_is_control": true,
+    "reference_definition": "Ref(p) = (1-p) * bicubic(LR) + p * SensorMismatch(HR)",
+    "spectral_response": [
+      [
+        0.86,
+        0.1,
+        0.04
+      ],
+      [
+        0.05,
+        0.9,
+        0.05
+      ],
+      [
+        0.03,
+        0.11,
+        0.86
+      ]
+    ],
+    "photometric_ranges": {
+      "brightness": [
+        0.88,
+        1.12
+      ],
+      "contrast": [
+        0.9,
+        1.1
+      ],
+      "gamma": [
+        0.95,
+        1.05
+      ]
+    },
+    "translation": "independent dy/dx chosen from {-4,-3,-2,2,3,4}; edge replication",
+    "baseline_psnr_mean": 27.84075611114502,
+    "device": "cuda"
+  },
+  "rows": [
+    {
+      "p": 0.0,
+      "control": true,
+      "samples": 500,
+      "psnr_mean": 27.7737855758667,
+      "psnr_std": 5.137649377051549,
+      "ssim_mean": 0.7048327336907387,
+      "ssim_std": 0.13373877462990003,
+      "delta_psnr_mean": -0.06697053527832031,
+      "delta_psnr_std": 0.19444538966574917,
+      "improved_fraction": 0.204,
+      "paired_t_pvalue": 7.291577046146591e-14,
+      "reference_correlation_mean": 0.9397507129907609,
+      "reference_correlation_std": 0.045398125510670496
+    },
+    {
+      "p": 0.2,
+      "control": false,
+      "samples": 500,
+      "psnr_mean": 27.907231868743896,
+      "psnr_std": 5.099706783015015,
+      "ssim_mean": 0.7117584300041199,
+      "ssim_std": 0.12830248181810935,
+      "delta_psnr_mean": 0.06647575759887696,
+      "delta_psnr_std": 0.26676821406422485,
+      "improved_fraction": 0.59,
+      "paired_t_pvalue": 4.124501062863204e-08,
+      "reference_correlation_mean": 0.9365159759521484,
+      "reference_correlation_std": 0.04955749422184785
+    },
+    {
+      "p": 0.4,
+      "control": false,
+      "samples": 500,
+      "psnr_mean": 28.142421390533446,
+      "psnr_std": 5.128841340080352,
+      "ssim_mean": 0.7229197354316711,
+      "ssim_std": 0.12635364031787996,
+      "delta_psnr_mean": 0.30166527938842774,
+      "delta_psnr_std": 0.5236048673183062,
+      "improved_fraction": 0.634,
+      "paired_t_pvalue": 5.488884808267046e-33,
+      "reference_correlation_mean": 0.9207908998727798,
+      "reference_correlation_std": 0.0684392006102824
+    },
+    {
+      "p": 0.6,
+      "control": false,
+      "samples": 500,
+      "psnr_mean": 28.48417529296875,
+      "psnr_std": 5.137049684174547,
+      "ssim_mean": 0.7395836560726166,
+      "ssim_std": 0.12136608142850966,
+      "delta_psnr_mean": 0.6434191818237305,
+      "delta_psnr_std": 0.6359452806580169,
+      "improved_fraction": 0.868,
+      "paired_t_pvalue": 1.6196310249908374e-78,
+      "reference_correlation_mean": 0.8939367128610611,
+      "reference_correlation_std": 0.0969318947506078
+    },
+    {
+      "p": 0.8,
+      "control": false,
+      "samples": 500,
+      "psnr_mean": 28.75684916305542,
+      "psnr_std": 5.156041014335626,
+      "ssim_mean": 0.752530127286911,
+      "ssim_std": 0.11720949997399101,
+      "delta_psnr_mean": 0.9160930519104004,
+      "delta_psnr_std": 0.6844369652093679,
+      "improved_fraction": 0.948,
+      "paired_t_pvalue": 1.8763625460588915e-113,
+      "reference_correlation_mean": 0.8588703596591949,
+      "reference_correlation_std": 0.12926814183761337
+    },
+    {
+      "p": 1.0,
+      "control": false,
+      "samples": 500,
+      "psnr_mean": 28.880524253845216,
+      "psnr_std": 5.190096533320652,
+      "ssim_mean": 0.7581194459199906,
+      "ssim_std": 0.11624329659280842,
+      "delta_psnr_mean": 1.0397681427001952,
+      "delta_psnr_std": 0.7306302091068673,
+      "improved_fraction": 0.978,
+      "paired_t_pvalue": 3.5009195596079234e-122,
+      "reference_correlation_mean": 0.8188418653607369,
+      "reference_correlation_std": 0.16119738624670085
+    }
+  ]
+}

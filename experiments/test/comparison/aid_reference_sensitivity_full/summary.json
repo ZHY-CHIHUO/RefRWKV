@@ -1,0 +1,170 @@
+{
+  "protocol": {
+    "experiment": "HRMS-trained RefSRWKV zero-shot reference sensitivity on AID",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/checkpoints/last.ckpt",
+    "baseline_sr_metrics": "/home/zhy/PROJECT/RefRWKV/experiments/test/refsr/refsrwkv/aid/x4/hrms_scd_sr_x4_full_test/test/metrics.json",
+    "samples": 1493,
+    "sample_seed": 42,
+    "split": "AID/test",
+    "p_values": [
+      0.0,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0
+    ],
+    "include_hr_direct": true,
+    "p_zero_is_control": true,
+    "reference_definition": "Ref(p) = (1-p) * bicubic(LR) + p * SensorMismatch(HR)",
+    "hr_direct_definition": "Ref = HR directly (ideal reference upper bound)",
+    "spectral_response": [
+      [
+        0.86,
+        0.1,
+        0.04
+      ],
+      [
+        0.05,
+        0.9,
+        0.05
+      ],
+      [
+        0.03,
+        0.11,
+        0.86
+      ]
+    ],
+    "photometric_ranges": {
+      "brightness": [
+        0.88,
+        1.12
+      ],
+      "contrast": [
+        0.9,
+        1.1
+      ],
+      "gamma": [
+        0.95,
+        1.05
+      ]
+    },
+    "translation": "independent dy/dx chosen from {-4,-3,-2,2,3,4}; edge replication",
+    "baseline_psnr_mean": 27.66118517452171,
+    "device": "cuda"
+  },
+  "rows": [
+    {
+      "reference_type": "synthetic_sensor_mix",
+      "p": 0.0,
+      "control": true,
+      "samples": 1493,
+      "psnr_mean": 27.586427913443483,
+      "psnr_std": 5.0721923573654655,
+      "ssim_mean": 0.6996773179752749,
+      "ssim_std": 0.13322861122812696,
+      "delta_psnr_mean": -0.07475726107822835,
+      "delta_psnr_std": 0.32629335043942653,
+      "improved_fraction": 0.19290020093770932,
+      "paired_t_pvalue": 2.3691236543353903e-18,
+      "reference_correlation_mean": 0.9363673937376601,
+      "reference_correlation_std": 0.04860701428763626
+    },
+    {
+      "reference_type": "synthetic_sensor_mix",
+      "p": 0.2,
+      "control": false,
+      "samples": 1493,
+      "psnr_mean": 27.71503041210545,
+      "psnr_std": 5.040996790395574,
+      "ssim_mean": 0.7063771710648125,
+      "ssim_std": 0.12892617193621844,
+      "delta_psnr_mean": 0.0538452375837404,
+      "delta_psnr_std": 0.3711292970091917,
+      "improved_fraction": 0.5907568653717348,
+      "paired_t_pvalue": 2.463042443186512e-08,
+      "reference_correlation_mean": 0.9338443191037111,
+      "reference_correlation_std": 0.05169489378976552
+    },
+    {
+      "reference_type": "synthetic_sensor_mix",
+      "p": 0.4,
+      "control": false,
+      "samples": 1493,
+      "psnr_mean": 27.95687883202054,
+      "psnr_std": 5.0628562232069205,
+      "ssim_mean": 0.7181432991521277,
+      "ssim_std": 0.12678378361022857,
+      "delta_psnr_mean": 0.2956936574988292,
+      "delta_psnr_std": 0.5582442836509878,
+      "improved_fraction": 0.6597454789015406,
+      "paired_t_pvalue": 2.978631479912294e-82,
+      "reference_correlation_mean": 0.9186179307747909,
+      "reference_correlation_std": 0.07116492608549635
+    },
+    {
+      "reference_type": "synthetic_sensor_mix",
+      "p": 0.6,
+      "control": false,
+      "samples": 1493,
+      "psnr_mean": 28.306898087682296,
+      "psnr_std": 5.07777355839236,
+      "ssim_mean": 0.7352801236983362,
+      "ssim_std": 0.1217455912296664,
+      "delta_psnr_mean": 0.645712913160586,
+      "delta_psnr_std": 0.6344979753936553,
+      "improved_fraction": 0.8633623576691226,
+      "paired_t_pvalue": 1.138489588640847e-232,
+      "reference_correlation_mean": 0.8922120176021157,
+      "reference_correlation_std": 0.10020888799301081
+    },
+    {
+      "reference_type": "synthetic_sensor_mix",
+      "p": 0.8,
+      "control": false,
+      "samples": 1493,
+      "psnr_mean": 28.585097280350293,
+      "psnr_std": 5.105572272850268,
+      "ssim_mean": 0.7484213915632941,
+      "ssim_std": 0.11791965835235681,
+      "delta_psnr_mean": 0.9239121058285835,
+      "delta_psnr_std": 0.670109809807081,
+      "improved_fraction": 0.9531145344943067,
+      "paired_t_pvalue": 0.0,
+      "reference_correlation_mean": 0.8576377935243468,
+      "reference_correlation_std": 0.13246804246898713
+    },
+    {
+      "reference_type": "synthetic_sensor_mix",
+      "p": 1.0,
+      "control": false,
+      "samples": 1493,
+      "psnr_mean": 28.71526786231867,
+      "psnr_std": 5.147480326848796,
+      "ssim_mean": 0.7541878826252503,
+      "ssim_std": 0.11715780461600536,
+      "delta_psnr_mean": 1.0540826877969587,
+      "delta_psnr_std": 0.716253427722308,
+      "improved_fraction": 0.9772270596115205,
+      "paired_t_pvalue": 0.0,
+      "reference_correlation_mean": 0.8181341278796538,
+      "reference_correlation_std": 0.1639625193065703
+    },
+    {
+      "reference_type": "hr_direct",
+      "p": null,
+      "control": false,
+      "samples": 1493,
+      "psnr_mean": 29.310717395544852,
+      "psnr_std": 5.1491129811747705,
+      "ssim_mean": 0.7808082747882593,
+      "ssim_std": 0.10552357495810342,
+      "delta_psnr_mean": 1.6495322210231405,
+      "delta_psnr_std": 0.6181121852631315,
+      "improved_fraction": 1.0,
+      "paired_t_pvalue": 0.0,
+      "reference_correlation_mean": 1.0,
+      "reference_correlation_std": 0.0
+    }
+  ]
+}

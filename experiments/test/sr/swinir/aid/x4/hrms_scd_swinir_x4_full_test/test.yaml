@@ -1,0 +1,25 @@
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - ssim
+  save_images: false
+  device: cuda
+  batch_size: 2
+  steps: null
+  output: experiments/test/sr/swinir/aid/x4/hrms_scd_swinir_x4_full_test
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/sr/swinir/hrms_scd/x4/hrms_scd_swinir_x4/checkpoints/last.ckpt
+source_config: configs/test/test.yaml
+split: test
+overrides:
+- dataset.id=aid
+- dataset.name=AID (Aerial Image Dataset)
+- dataset.kind=synthetic_sisr
+- dataset.root=data/sr/AID
+- data.root=data/sr/AID
+- data.max_samples_test=1493
+- data.sample_seed=42
+- data.lr_source=auto
+- data.lr_native_scale=4
+- data.lr_provenance=bicubic

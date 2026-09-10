@@ -1,0 +1,64 @@
+{
+  "split": "test",
+  "dataset": "aid",
+  "samples": 1493,
+  "runs": {
+    "Bicubic": "experiments/test/sr/bicubic/aid/x4/hrms_scd_bicubic_x4_full_test",
+    "SwinIR": "experiments/test/sr/swinir/aid/x4/hrms_scd_swinir_x4_full_test",
+    "RefSRWKV-SR": "experiments/test/refsr/refsrwkv/aid/x4/hrms_scd_sr_x4_full_test",
+    "TRefSR": "experiments/test/refsr/refsrwkv/aid/x4/hrms_scd_trefsr_x4_full_test"
+  },
+  "sources": {
+    "Bicubic": "metrics.sample_ids",
+    "SwinIR": "metrics.sample_ids",
+    "RefSRWKV-SR": "metrics.sample_ids",
+    "TRefSR": "metrics.sample_ids"
+  },
+  "comparisons": {
+    "TRefSR - Bicubic": {
+      "n": 1493,
+      "mean": 0.007734255270117972,
+      "median": 0.06652069091796875,
+      "std": 0.4847125500288225,
+      "min": -8.849140167236328,
+      "max": 1.4535408020019531,
+      "p05": -0.6165737152099608,
+      "p25": -0.13970184326171875,
+      "p75": 0.23462867736816406,
+      "p95": 0.5169532775878907,
+      "improved": 0.5894172806430007,
+      "t_stat": 0.6165440931199138,
+      "p_value": 0.5376295389250534
+    },
+    "TRefSR - SwinIR": {
+      "n": 1493,
+      "mean": -0.001363830924113964,
+      "median": -0.0490875244140625,
+      "std": 0.6970412682164933,
+      "min": -4.894908905029297,
+      "max": 15.442014694213867,
+      "p05": -0.2622966766357422,
+      "p25": -0.10149002075195312,
+      "p75": -0.008388519287109375,
+      "p95": 0.223809051513671,
+      "improved": 0.21366376423308775,
+      "t_stat": -0.07560176702121525,
+      "p_value": 0.9397460660058554
+    },
+    "TRefSR - RefSRWKV-SR": {
+      "n": 1493,
+      "mean": -0.07498100214330286,
+      "median": -0.04077911376953125,
+      "std": 0.3256916437795468,
+      "min": -8.49313735961914,
+      "max": 0.7364711761474609,
+      "p05": -0.25905609130859375,
+      "p25": -0.08382797241210938,
+      "p75": -0.008365631103515625,
+      "p95": 0.05750350952148399,
+      "improved": 0.19156061620897522,
+      "t_stat": -8.895585297625482,
+      "p_value": 1.6428561271983828e-18
+    }
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "protocol": {
+    "dataset": "AID",
+    "split": "test",
+    "samples": 500,
+    "sample_seed": 42,
+    "scale": 4,
+    "sample_id_pairing": true,
+    "sample_ids_equal": true
+  },
+  "methods": {
+    "RefSRWKV-SR": {
+      "samples": 500,
+      "psnr_mean": 27.84075611114502,
+      "ssim_mean": 0.7073549265265465,
+      "metrics_path": "/home/zhy/PROJECT/RefRWKV/experiments/test/refsr/refsrwkv/aid/x4/hrms_scd_sr_x4_zero_shot/test/metrics.json"
+    },
+    "SwinIR": {
+      "samples": 500,
+      "psnr_mean": 27.7804882850647,
+      "ssim_mean": 0.7073767893314361,
+      "metrics_path": "/home/zhy/PROJECT/RefRWKV/experiments/test/sr/swinir/aid/x4/hrms_scd_swinir_x4_zero_shot/test/metrics.json"
+    },
+    "Bicubic": {
+      "samples": 500,
+      "psnr_mean": 27.764489696502686,
+      "ssim_mean": 0.7046177399754524,
+      "metrics_path": "/home/zhy/PROJECT/RefRWKV/experiments/test/sr/bicubic/aid/x4/hrms_scd_bicubic_x4_zero_shot/test/metrics.json"
+    }
+  },
+  "comparisons": {
+    "RefSRWKV-SR - SwinIR": {
+      "psnr": {
+        "n": 500,
+        "mean": 0.060267826080322266,
+        "median": -0.015221595764160156,
+        "std": 0.7045348259269001,
+        "min": -1.547780990600586,
+        "max": 11.111011505126953,
+        "p05": -0.12197303771972656,
+        "p25": -0.0491185188293457,
+        "p75": 0.022359848022460938,
+        "p95": 0.24660282135009656,
+        "improved_fraction": 0.364,
+        "improved_count": 182,
+        "worse_count": 318,
+        "tie_count": 0,
+        "t_stat": 1.9127933923555656,
+        "p_value": 0.05634660782498877
+      },
+      "ssim": {
+        "n": 500,
+        "mean": -2.1862804889678957e-05,
+        "median": -0.0009439289569854736,
+        "std": 0.009372152705556915,
+        "min": -0.019797205924987793,
+        "max": 0.10148817300796509,
+        "p05": -0.006283515691757202,
+        "p25": -0.0025553107261657715,
+        "p75": 0.00023749470710754395,
+        "p95": 0.005675238370895318,
+        "improved_fraction": 0.292,
+        "improved_count": 146,
+        "worse_count": 354,
+        "tie_count": 0,
+        "t_stat": -0.05216167453519097,
+        "p_value": 0.9584207448843236
+      }
+    },
+    "RefSRWKV-SR - Bicubic": {
+      "psnr": {
+        "n": 500,
+        "mean": 0.07626641464233398,
+        "median": 0.11776924133300781,
+        "std": 0.3492810767192044,
+        "min": -1.5828056335449219,
+        "max": 1.4472618103027344,
+        "p05": -0.5249776840209961,
+        "p25": -0.1042928695678711,
+        "p75": 0.2920966148376465,
+        "p95": 0.5661228179931632,
+        "improved_fraction": 0.644,
+        "improved_count": 322,
+        "worse_count": 178,
+        "tie_count": 0,
+        "t_stat": 4.882511504553763,
+        "p_value": 1.412360139789034e-06
+      },
+      "ssim": {
+        "n": 500,
+        "mean": 0.0027371865510940553,
+        "median": 0.0030953586101531982,
+        "std": 0.017513189672391214,
+        "min": -0.16031807661056519,
+        "max": 0.0462721586227417,
+        "p05": -0.022005617618560788,
+        "p25": -0.005063191056251526,
+        "p75": 0.012712880969047546,
+        "p95": 0.026684680581092832,
+        "improved_fraction": 0.6,
+        "improved_count": 300,
+        "worse_count": 200,
+        "tie_count": 0,
+        "t_stat": 3.494814656745977,
+        "p_value": 0.0005166500759725448
+      }
+    },
+    "SwinIR - Bicubic": {
+      "psnr": {
+        "n": 500,
+        "mean": 0.01599858856201172,
+        "median": 0.12142467498779297,
+        "std": 0.8388138870625222,
+        "min": -11.882087707519531,
+        "max": 1.6069927215576172,
+        "p05": -0.7711430549621582,
+        "p25": -0.10154199600219727,
+        "p75": 0.3087344169616699,
+        "p95": 0.6192751884460448,
+        "improved_fraction": 0.654,
+        "improved_count": 327,
+        "worse_count": 173,
+        "tie_count": 0,
+        "t_stat": 0.4264823475203428,
+        "p_value": 0.6699403301612171
+      },
+      "ssim": {
+        "n": 500,
+        "mean": 0.002759049355983734,
+        "median": 0.00465548038482666,
+        "std": 0.022185091890924175,
+        "min": -0.19275593757629395,
+        "max": 0.04826241731643677,
+        "p05": -0.02643089145421982,
+        "p25": -0.004866436123847961,
+        "p75": 0.01425352692604065,
+        "p95": 0.02892328202724455,
+        "improved_fraction": 0.632,
+        "improved_count": 316,
+        "worse_count": 184,
+        "tie_count": 0,
+        "t_stat": 2.780886346375933,
+        "p_value": 0.005626043145226066
+      }
+    }
+  }
+}

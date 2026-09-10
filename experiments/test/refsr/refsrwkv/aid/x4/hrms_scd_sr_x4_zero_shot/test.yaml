@@ -1,0 +1,14 @@
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - ssim
+  save_images: false
+  device: cuda
+  batch_size: 1
+  steps: null
+  output: experiments/test/refsr/refsrwkv/aid/x4/hrms_scd_sr_x4_zero_shot
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_sr_x4/checkpoints/last.ckpt
+source_config: configs/test/aid_reference_sensitivity.yaml
+split: test

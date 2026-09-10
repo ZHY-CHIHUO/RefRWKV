@@ -1,0 +1,26 @@
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - ssim
+  save_images: false
+  device: cuda
+  batch_size: 4
+  steps: null
+  output: experiments/test/sr/bicubic/aid/x4/hrms_scd_bicubic_x4_zero_shot
+checkpoint: null
+source_config: configs/test/test.yaml
+split: test
+training_config: /home/zhy/PROJECT/RefRWKV/configs/runs/sr/bicubic/hrms_scd_x4.yaml
+overrides:
+- dataset.id=aid
+- dataset.name=AID (Aerial Image Dataset)
+- dataset.kind=synthetic_sisr
+- dataset.root=data/sr/AID
+- data.root=data/sr/AID
+- data.max_samples_test=500
+- data.sample_seed=42
+- data.lr_source=auto
+- data.lr_native_scale=4
+- data.lr_provenance=bicubic
