@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from models.refsr.refsrwkv.model import (  # noqa: E402
     GatedFusion,
     RefSRWKV,
+    SpectralDetailFusion,
     normalize_fusion_match_config,
 )
 import models.refsr.refsrwkv.model as refsrwkv_module  # noqa: E402
@@ -153,6 +154,42 @@ class RefSRWKVStructureTests(unittest.TestCase):
         self.assertEqual(shallow.ref_encoder, "shallow")
         self.assertEqual(deep.ref_encoder, "deep")
 
+    def test_spectral_detail_mode_builds_separate_low_high_fusion(self) -> None:
+        model = self.build(fusion_mode="spectral_detail", decoder_refusion=True)
+        self.assertEqual(model.fusion_mode, "spectral_detail")
+        self.assertIsInstance(model.fuse1, SpectralDetailFusion)
+        self.assertIsInstance(model.decoder_fuse1, SpectralDetailFusion)
+        # The grouped stem contains low/high reference channel groups.
+        self.assertEqual(model.ref_to_level1[0].in_channels, 6)
+        self.assertEqual(model.ref_to_level1[0].groups, 2)
+
+    def test_spectral_detail_residual_is_zero_initialised(self) -> None:
+        fusion = SpectralDetailFusion(4, window_size=3)
+        with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+            with torch.no_grad():
+                lr = torch.randn(1, 4, 5, 6)
+                low = torch.randn_like(lr)
+                high = torch.randn_like(lr)
+                output = fusion(lr, low, high)
+        self.assertTrue(torch.allclose(output, lr, atol=1e-6, rtol=1e-5))
+
+    def test_spectral_detail_supports_rgb_and_pan_contracts(self) -> None:
+        for inp_channels, ref_channels in ((3, 3), (4, 1), (8, 1)):
+            model = self.build(
+                inp_channels=inp_channels,
+                ref_channels=ref_channels,
+                out_channels=inp_channels,
+                fusion_mode="spectral_detail",
+            )
+            with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+                with torch.no_grad():
+                    output = model(
+                        torch.randn(1, inp_channels, 5, 6),
+                        torch.randn(1, ref_channels, 10, 12),
+                    )
+            self.assertEqual(output.shape, (1, inp_channels, 10, 12))
+            self.assertTrue(torch.isfinite(output).all())
+
     def test_fusion_options_reach_all_fusion_sites(self) -> None:
         model = self.build(
             fusion_match={"enabled": False, "window": 3, "conf": False, "quality": False}
@@ -242,6 +279,17 @@ class RefSRWKVConfigChannelTests(unittest.TestCase):
 
     def test_accepts_lr_channels_greater_than_reference_channels(self) -> None:
         validate_config(self._config(), require_data=False)
+
+    def test_validates_fusion_mode_at_config_boundary(self) -> None:
+        config = self._config()
+        config["model"]["fusion_mode"] = "spectral_detail"
+        validate_config(config, require_data=False)
+        config["model"]["fusion_mode"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "fusion_mode"):
+            validate_config(config, require_data=False)
+        config["model"]["fusion_mode"] = 1
+        with self.assertRaisesRegex(ValueError, "fusion_mode"):
+            validate_config(config, require_data=False)
 
     def test_allows_derived_channel_fields_to_be_null(self) -> None:
         config = self._config()

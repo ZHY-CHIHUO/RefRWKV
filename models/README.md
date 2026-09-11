@@ -34,3 +34,16 @@ model:
 ```
 
 或者 `inp_channels: 8, ref_channels: 3` 的高光谱/多光谱引导。`data.scale` 仍是该模型实例的固定整数倍率，输入必须满足 `Ref_H/W = LR_H/W * scale`，但 LR 高宽可以任意，网络会在内部按需补齐并裁回原尺寸。通道数不一致时，`color_match: global` 使用每张图的跨通道全局统计匹配，不复制或丢弃光谱带；同通道配置继续使用原来的逐通道统计匹配。
+
+## RefSRWKV 三分支融合
+
+Python 构造函数中的 `fusion_mode` 默认为 `legacy`，与已有 checkpoint 的 `GatedFusion` 完全兼容；
+项目配置 `configs/models/refsr/refsrwkv.yaml` 默认使用新的 `spectral_detail`。该模式将参考图先在 HR 网格分解为低频 `Ref_low` 和高频
+`Ref_high = Ref - Ref_low`，再通过同一组编码器下采样到 LR/U-Net 的四个尺度。
+
+- LR 主干保留低频和光谱信息，不被参考特征直接替换。
+- `LR_low`、`Ref_low` 和绝对差异用于光谱关系建模，产生 `g_spec` 控制的低频残差。
+- `LR_low` 作为 query、`Ref_low` 作为 key、`Ref_high` 作为 value 做局部匹配；熵置信度和质量估计形成可靠性。
+- 高频只经 `g_detail * reliability` 控制的 FiLM/SFT 残差调制 LR 特征，FiLM 最后一层零初始化，因此新模块初始等价于原 LR/SISR 路径。
+
+该设计保留两个门控：`g_spec` 管低频/光谱参考，`g_detail` 管高频空间细节；二者职责不同，不能合并为一个总门控。`fusion_match.enabled/conf/quality` 仍可用于消融局部匹配、熵置信度和质量门控。

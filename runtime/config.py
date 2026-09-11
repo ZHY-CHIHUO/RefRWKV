@@ -62,6 +62,7 @@ _PAIRED_ONLY_LOSS_KEYS = ("ref_drop_prob",)
 DIRECT_REFSR_MODEL_NAMES = frozenset({"refsrwkv", "ttsr", "masa_sr", "datsr"})
 REFSR_MODEL_NAMES = DIRECT_REFSR_MODEL_NAMES | frozenset({"refdiffrwkv"})
 PAIRED_REFERENCE_MODEL_NAMES = frozenset({"ttsr", "masa_sr", "datsr", "refdiffrwkv"})
+REFSRWKV_FUSION_MODES = frozenset({"legacy", "spectral_detail"})
 
 
 def normalize_reference_mode(value: Any) -> str:
@@ -528,6 +529,16 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
     if isinstance(model, Mapping):
         if "use_reference" in model and not isinstance(model["use_reference"], bool):
             raise ValueError("model.use_reference 必须是 bool")
+        if "fusion_mode" in model:
+            fusion_mode = model["fusion_mode"]
+            if (
+                not isinstance(fusion_mode, str)
+                or fusion_mode.strip().lower() not in REFSRWKV_FUSION_MODES
+            ):
+                options = ", ".join(sorted(REFSRWKV_FUSION_MODES))
+                raise ValueError(
+                    f"model.fusion_mode 必须是 {options}，得到 {fusion_mode!r}"
+                )
         declared_channels: dict[str, int] = {}
         for field in ("inp_channels", "out_channels", "ref_channels"):
             if field not in model:
@@ -649,6 +660,7 @@ __all__ = [
     "materialize_config",
     "PAIRED_REFERENCE_MODEL_NAMES",
     "REFSR_MODEL_NAMES",
+    "REFSRWKV_FUSION_MODES",
     "is_refsr_model",
     "normalize_reference_mode",
     "normalize_lr_source",

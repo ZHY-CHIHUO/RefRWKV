@@ -621,6 +621,190 @@ class GatedFusion(nn.Module):
         return lr_feat + self.gate(context) * (direct + quality * match_conf * matched)
 
 
+class SpectralDetailFusion(nn.Module):
+    """Low/high-frequency reference fusion with reliability-aware FiLM.
+
+    ``ref_low`` carries the reference colour/spectral relationship while
+    ``ref_high`` carries spatial detail.  The low-frequency path learns a
+    gated residual from ``(LR, Ref_low, |LR-Ref_low|)``.  The high-frequency
+    path retrieves values from ``Ref_high`` using ``Ref_low`` as the key, then
+    modulates the LR feature through a zero-initialised FiLM residual.  Ref
+    features therefore cannot directly overwrite the LR representation.
+    """
+
+    def __init__(
+        self,
+        dim,
+        reduction=4,
+        window_size=7,
+        *,
+        match_enabled=True,
+        conf_enabled=True,
+        quality_enabled=True,
+    ):
+        super().__init__()
+        if not isinstance(dim, int) or dim < 1:
+            raise ValueError("SpectralDetailFusion dim must be a positive integer")
+        if not isinstance(window_size, int) or window_size < 1 or window_size % 2 == 0:
+            raise ValueError(
+                "SpectralDetailFusion window_size must be a positive odd integer"
+            )
+        for name, value in (
+            ("match_enabled", match_enabled),
+            ("conf_enabled", conf_enabled),
+            ("quality_enabled", quality_enabled),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"SpectralDetailFusion {name} must be bool")
+
+        self.dim = dim
+        self.window_size = window_size
+        self.radius = window_size // 2
+        self.kernel = window_size * window_size
+        self.match_enabled = match_enabled
+        self.conf_enabled = conf_enabled
+        self.quality_enabled = quality_enabled
+        hidden = max(dim // reduction, 8)
+
+        # The spectral path is deliberately a residual.  Its last projection
+        # is reset to zero after model-wide initialisation below.
+        self.spectral_path = nn.Sequential(
+            nn.Conv2d(dim * 3, hidden, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, dim, 1, bias=False),
+            RMSNorm2d(dim),
+        )
+        self.spectral_out = nn.Conv2d(dim, dim, 1, bias=False)
+        self.spectral_gate = nn.Sequential(
+            nn.Conv2d(dim * 3, hidden, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, dim, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+        self.value = nn.Conv2d(dim, dim, 1, bias=False)
+        self.message = nn.Conv2d(dim, dim, 1, bias=False)
+        self.message_norm = RMSNorm2d(dim)
+        if match_enabled:
+            self.query = nn.Conv2d(dim, dim, 1, bias=False)
+            self.key = nn.Conv2d(dim, dim, 1, bias=False)
+            self.relative_bias = nn.Parameter(torch.zeros(self.kernel))
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+
+        relation_channels = dim * 3 + 1
+        self.quality = (
+            nn.Sequential(
+                nn.Conv2d(relation_channels, hidden, 1, bias=True),
+                nn.GELU(),
+                nn.Conv2d(hidden, 1, 1, bias=True),
+                nn.Sigmoid(),
+            )
+            if quality_enabled
+            else nn.Identity()
+        )
+        self.detail_gate = nn.Sequential(
+            nn.Conv2d(relation_channels, hidden, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, dim, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.film_norm = RMSNorm2d(dim)
+        self.film = nn.Sequential(
+            nn.Conv2d(relation_channels, hidden, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, dim * 2, 1, bias=True),
+        )
+        nn.init.constant_(self.spectral_gate[2].bias, -1.5)
+        nn.init.constant_(self.detail_gate[2].bias, -1.5)
+        if quality_enabled:
+            nn.init.constant_(self.quality[2].bias, -1.0)
+        self.reset_residual()
+
+    def reset_residual(self):
+        """Start both reference residuals at exactly zero."""
+        nn.init.zeros_(self.spectral_out.weight)
+        nn.init.zeros_(self.film[2].weight)
+        nn.init.zeros_(self.film[2].bias)
+
+    def _match_high(self, lr_low, ref_low, ref_high):
+        b, _, h, w = lr_low.shape
+        if not self.match_enabled:
+            matched = self.value(ref_high)
+            if self.conf_enabled:
+                confidence = (
+                    F.cosine_similarity(lr_low, ref_low, dim=1).unsqueeze(1) + 1.0
+                ) / 2.0
+            else:
+                confidence = torch.ones_like(lr_low[:, :1])
+            return matched, confidence
+
+        q = F.normalize(self.query(lr_low), dim=1, eps=1e-6)
+        k = F.normalize(self.key(ref_low), dim=1, eps=1e-6)
+        v = self.value(ref_high)
+        k = F.unfold(k, self.window_size, padding=self.radius)
+        v = F.unfold(v, self.window_size, padding=self.radius)
+        k = k.view(b, self.dim, self.kernel, h, w).permute(0, 3, 4, 2, 1)
+        v = v.view(b, self.dim, self.kernel, h, w).permute(0, 3, 4, 2, 1)
+        q = q.permute(0, 2, 3, 1).unsqueeze(-2)
+        scale = self.logit_scale.float().exp().clamp(1.0, 100.0).to(q.dtype)
+        logits = (q * k).sum(dim=-1) * scale
+        logits = logits + self.relative_bias.view(1, 1, 1, self.kernel)
+        valid = F.unfold(
+            lr_low.new_ones((b, 1, h, w)), self.window_size, padding=self.radius
+        )
+        valid = valid.view(b, self.kernel, h, w).permute(0, 2, 3, 1)
+        logits = logits.masked_fill(valid < 0.5, torch.finfo(logits.dtype).min)
+        attention = torch.softmax(logits, dim=-1)
+        matched = (attention.unsqueeze(-1) * v).sum(dim=-2)
+        matched = self.message_norm(self.message(matched.permute(0, 3, 1, 2)))
+        if self.conf_enabled and self.kernel > 1:
+            entropy = -(
+                attention.clamp_min(1e-6) * attention.clamp_min(1e-6).log()
+            ).sum(-1)
+            confidence = (1.0 - entropy / math.log(self.kernel)).clamp(0.0, 1.0)
+            confidence = confidence.unsqueeze(1)
+        else:
+            confidence = torch.ones_like(lr_low[:, :1])
+        return matched, confidence
+
+    def forward(self, lr_feat, ref_low, ref_high=None):
+        if ref_high is None:
+            raise ValueError(
+                "SpectralDetailFusion 需要分别提供 ref_low 和 ref_high 特征"
+            )
+        if ref_low.shape != lr_feat.shape or ref_high.shape != lr_feat.shape:
+            raise ValueError(
+                "SpectralDetailFusion expects equal LR/Ref feature shapes, got "
+                f"lr={tuple(lr_feat.shape)}, low={tuple(ref_low.shape)}, "
+                f"high={tuple(ref_high.shape)}"
+            )
+
+        # A small spatial low-pass keeps the relation estimator focused on
+        # colour/spectral compatibility rather than individual roof pixels.
+        lr_low = F.avg_pool2d(lr_feat, 3, stride=1, padding=1)
+        ref_low_smooth = F.avg_pool2d(ref_low, 3, stride=1, padding=1)
+        low_difference = (lr_low - ref_low_smooth).abs()
+        relation = torch.cat([lr_low, ref_low_smooth, low_difference], dim=1)
+        spectral_delta = self.spectral_out(self.spectral_path(relation))
+        spectral_delta = self.message_norm(spectral_delta)
+        g_spec = self.spectral_gate(relation)
+        spectral_feat = lr_feat + g_spec * spectral_delta
+
+        matched, match_conf = self._match_high(lr_low, ref_low_smooth, ref_high)
+        match_context = torch.cat([lr_low, ref_low_smooth, matched, match_conf], dim=1)
+        quality = self.quality(match_context) if self.quality_enabled else 1.0
+        reliability = match_conf * quality
+        film_context = torch.cat(
+            [spectral_feat, matched, low_difference, reliability], dim=1
+        )
+        gamma, beta = self.film(film_context).chunk(2, dim=1)
+        film_delta = 0.1 * (
+            torch.tanh(gamma) * self.film_norm(spectral_feat) + torch.tanh(beta)
+        )
+        g_detail = self.detail_gate(match_context)
+        return spectral_feat + g_detail * reliability * film_delta
+
+
 class GlobalLatentBlock(nn.Module):
     """Full-image context block used after the U-Net bottleneck."""
 
@@ -673,6 +857,7 @@ class RefSRWKV(nn.Module):
         use_reference: bool = True,
         windows=None,
         fusion_match=None,
+        fusion_mode: str = "legacy",
         decoder_refusion: bool = True,
         global_latent_blocks: int = 2,
         ref_encoder: str = "deep",
@@ -697,6 +882,9 @@ class RefSRWKV(nn.Module):
         color_match = str(color_match).lower()
         if color_match not in {"global", "none"}:
             raise ValueError("color_match 只能是 global 或 none")
+        fusion_mode = str(fusion_mode).strip().lower()
+        if fusion_mode not in {"legacy", "spectral_detail"}:
+            raise ValueError("fusion_mode 只能是 legacy 或 spectral_detail")
         if (
             not math.isfinite(float(drop_path_rate))
             or not 0.0 <= float(drop_path_rate) < 1.0
@@ -754,6 +942,7 @@ class RefSRWKV(nn.Module):
             out_channels,
         )
         self.upsampler, self.color_match = upsampler, color_match
+        self.fusion_mode = fusion_mode
         self.use_reference = use_reference
         self.fusion_match_config = fusion_config
         self.decoder_refusion = bool(decoder_refusion and use_reference)
@@ -779,59 +968,116 @@ class RefSRWKV(nn.Module):
 
         fusion_windows = fusion_config["window"]
         if use_reference:
-            ref_encoder_layers = [
-                nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
-                nn.GELU(),
-            ]
-            if ref_encoder == "deep":
-                # The deep encoder adds an HR-domain convolution before phase-preserving fold.
-                ref_encoder_layers.append(
-                    nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False)
-                )
-            ref_encoder_layers.extend(
-                [
-                    nn.PixelUnshuffle(scale),
-                    nn.Conv2d(ref_channels * (scale**2), dim, 1, bias=False),
-                    RMSNorm2d(dim),
-                    nn.ReLU(inplace=True),
+            if fusion_mode == "legacy":
+                ref_encoder_layers = [
+                    nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
+                    nn.GELU(),
                 ]
-            )
-            self.ref_to_level1 = nn.Sequential(*ref_encoder_layers)
-            self.ref_down2 = nn.Sequential(
-                nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False),
-                RMSNorm2d(dim * 2),
-            )
-            self.ref_down3 = nn.Sequential(
-                nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, bias=False),
-                RMSNorm2d(dim * 4),
-            )
-            self.ref_down4 = nn.Sequential(
-                nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False),
-                RMSNorm2d(dim * 8),
-            )
+                if ref_encoder == "deep":
+                    # The deep encoder adds an HR-domain convolution before phase-preserving fold.
+                    ref_encoder_layers.append(
+                        nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False)
+                    )
+                ref_encoder_layers.extend(
+                    [
+                        nn.PixelUnshuffle(scale),
+                        nn.Conv2d(ref_channels * (scale**2), dim, 1, bias=False),
+                        RMSNorm2d(dim),
+                        nn.ReLU(inplace=True),
+                    ]
+                )
+                self.ref_to_level1 = nn.Sequential(*ref_encoder_layers)
+                self.ref_down2 = nn.Sequential(
+                    nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False),
+                    RMSNorm2d(dim * 2),
+                )
+                self.ref_down3 = nn.Sequential(
+                    nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, bias=False),
+                    RMSNorm2d(dim * 4),
+                )
+                self.ref_down4 = nn.Sequential(
+                    nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False),
+                    RMSNorm2d(dim * 8),
+                )
+                fusion_cls = GatedFusion
+            else:
+                # Keep low/high reference features in two channel groups.  A
+                # grouped stem/downsampler performs one shared pyramid pass
+                # without allowing the HR high-frequency branch to replace LR
+                # features directly.
+                ref_encoder_layers = [
+                    nn.Conv2d(
+                        ref_channels * 2,
+                        ref_channels * 2,
+                        3,
+                        padding=1,
+                        groups=2,
+                        bias=False,
+                    ),
+                    nn.GELU(),
+                ]
+                if ref_encoder == "deep":
+                    ref_encoder_layers.append(
+                        nn.Conv2d(
+                            ref_channels * 2,
+                            ref_channels * 2,
+                            3,
+                            padding=1,
+                            groups=2,
+                            bias=False,
+                        )
+                    )
+                ref_encoder_layers.extend(
+                    [
+                        nn.PixelUnshuffle(scale),
+                        nn.Conv2d(
+                            ref_channels * 2 * (scale**2),
+                            dim * 2,
+                            1,
+                            groups=2,
+                            bias=False,
+                        ),
+                        RMSNorm2d(dim * 2),
+                        nn.ReLU(inplace=True),
+                    ]
+                )
+                self.ref_to_level1 = nn.Sequential(*ref_encoder_layers)
+                self.ref_down2 = nn.Sequential(
+                    nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, groups=2, bias=False),
+                    RMSNorm2d(dim * 4),
+                )
+                self.ref_down3 = nn.Sequential(
+                    nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, groups=2, bias=False),
+                    RMSNorm2d(dim * 8),
+                )
+                self.ref_down4 = nn.Sequential(
+                    nn.Conv2d(dim * 8, dim * 16, 3, stride=2, padding=1, groups=2, bias=False),
+                    RMSNorm2d(dim * 16),
+                )
+                fusion_cls = SpectralDetailFusion
             self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
-                GatedFusion(
+                fusion_cls(
                     dim,
                     window_size=fusion_windows["enc1"],
                     match_enabled=fusion_config["enabled"],
                     conf_enabled=fusion_config["conf"],
                     quality_enabled=fusion_config["quality"],
                 ),
-                GatedFusion(
+                fusion_cls(
                     dim * 2,
                     window_size=fusion_windows["enc2"],
                     match_enabled=fusion_config["enabled"],
                     conf_enabled=fusion_config["conf"],
                     quality_enabled=fusion_config["quality"],
                 ),
-                GatedFusion(
+                fusion_cls(
                     dim * 4,
                     window_size=fusion_windows["enc3"],
                     match_enabled=fusion_config["enabled"],
                     conf_enabled=fusion_config["conf"],
                     quality_enabled=fusion_config["quality"],
                 ),
-                GatedFusion(
+                fusion_cls(
                     dim * 8,
                     window_size=fusion_windows["latent"],
                     match_enabled=fusion_config["enabled"],
@@ -911,21 +1157,24 @@ class RefSRWKV(nn.Module):
             *(GlobalLatentBlock(dim * 8, num_heads=8, hidden_rate=2) for _ in range(global_latent_blocks))
         )
         if self.decoder_refusion:
-            self.decoder_fuse3 = GatedFusion(
+            decoder_fusion_cls = (
+                SpectralDetailFusion if fusion_mode == "spectral_detail" else GatedFusion
+            )
+            self.decoder_fuse3 = decoder_fusion_cls(
                 dim * 4,
                 window_size=fusion_windows["dec3"],
                 match_enabled=fusion_config["enabled"],
                 conf_enabled=fusion_config["conf"],
                 quality_enabled=fusion_config["quality"],
             )
-            self.decoder_fuse2 = GatedFusion(
+            self.decoder_fuse2 = decoder_fusion_cls(
                 dim * 2,
                 window_size=fusion_windows["dec2"],
                 match_enabled=fusion_config["enabled"],
                 conf_enabled=fusion_config["conf"],
                 quality_enabled=fusion_config["quality"],
             )
-            self.decoder_fuse1 = GatedFusion(
+            self.decoder_fuse1 = decoder_fusion_cls(
                 dim,
                 window_size=fusion_windows["dec1"],
                 match_enabled=fusion_config["enabled"],
@@ -998,6 +1247,20 @@ class RefSRWKV(nn.Module):
             )
             self.output_shuffle = nn.PixelShuffle(scale)
         self.apply(self._init_weights)
+        if self.use_reference and self.fusion_mode == "spectral_detail":
+            # ``apply`` initializes every Conv2d; restore the intended
+            # zero-residual start for all new fusion sites afterwards.
+            for module in (
+                self.fuse1,
+                self.fuse2,
+                self.fuse3,
+                self.fuse4,
+                self.decoder_fuse1,
+                self.decoder_fuse2,
+                self.decoder_fuse3,
+            ):
+                if isinstance(module, SpectralDetailFusion):
+                    module.reset_residual()
         if isinstance(self.skip_proj, nn.Conv2d):
             # Initialize the skip path from bicubic interpolation.
             nn.init.zeros_(self.skip_proj.weight)
@@ -1046,7 +1309,32 @@ class RefSRWKV(nn.Module):
         ref_2 = self.ref_down2(ref_1)
         ref_3 = self.ref_down3(ref_2)
         ref_4 = self.ref_down4(ref_3)
+        if self.fusion_mode == "spectral_detail":
+            # Grouped reference convolutions keep the first and second half
+            # independent: low-frequency/spectral and high-frequency/detail.
+            return tuple(
+                (features.chunk(2, dim=1)[0], features.chunk(2, dim=1)[1])
+                for features in (ref_1, ref_2, ref_3, ref_4)
+            )
         return ref_1, ref_2, ref_3, ref_4
+
+    def _split_reference_components(self, ref):
+        """Return HR low/high reference components for spectral-detail mode."""
+        if self.fusion_mode != "spectral_detail":
+            return ref
+        # The pooling radius follows the physical LR/Ref ratio.  It removes
+        # pixel-scale texture while retaining building-scale spectral trends.
+        radius = max(1, int(self.scale))
+        kernel = 2 * radius + 1
+        ref_low = F.avg_pool2d(ref, kernel, stride=1, padding=radius)
+        ref_high = ref - ref_low
+        return torch.cat([ref_low, ref_high], dim=1)
+
+    def _apply_fusion(self, module, lr_feat, ref_features):
+        if self.fusion_mode == "spectral_detail":
+            ref_low, ref_high = ref_features
+            return module(lr_feat, ref_low, ref_high)
+        return module(lr_feat, ref_features)
 
     def forward(self, lr, ref=None):
         if lr.ndim != 4:
@@ -1114,11 +1402,18 @@ class RefSRWKV(nn.Module):
 
         fea = self.lr_up(lr_internal)
         if self.use_reference:
-            ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_internal)
-            e1 = self.encoder_level1(self.fuse1(fea, ref_1))
-            e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
-            e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
-            latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
+            ref_features = self._split_reference_components(ref_internal)
+            ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_features)
+            e1 = self.encoder_level1(self._apply_fusion(self.fuse1, fea, ref_1))
+            e2 = self.encoder_level2(
+                self._apply_fusion(self.fuse2, self.down1_2(e1), ref_2)
+            )
+            e3 = self.encoder_level3(
+                self._apply_fusion(self.fuse3, self.down2_3(e2), ref_3)
+            )
+            latent = self.latent(
+                self._apply_fusion(self.fuse4, self.down3_4(e3), ref_4)
+            )
         else:
             e1 = self.encoder_level1(fea)
             e2 = self.encoder_level2(self.down1_2(e1))
@@ -1128,15 +1423,15 @@ class RefSRWKV(nn.Module):
 
         d3_input = self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))
         if self.decoder_refusion:
-            d3_input = self.decoder_fuse3(d3_input, ref_3)
+            d3_input = self._apply_fusion(self.decoder_fuse3, d3_input, ref_3)
         d3 = self.decoder_level3(d3_input)
         d2_input = self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], dim=1))
         if self.decoder_refusion:
-            d2_input = self.decoder_fuse2(d2_input, ref_2)
+            d2_input = self._apply_fusion(self.decoder_fuse2, d2_input, ref_2)
         d2 = self.decoder_level2(d2_input)
         d1_input = self.reduce_chan_level1(torch.cat([self.up2_1(d2), e1], dim=1))
         if self.decoder_refusion:
-            d1_input = self.decoder_fuse1(d1_input, ref_1)
+            d1_input = self._apply_fusion(self.decoder_fuse1, d1_input, ref_1)
         d1 = self.decoder_level1(d1_input)
         d1 = self.refinement(d1)
 
