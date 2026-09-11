@@ -41,6 +41,9 @@ model:
   # Existing checkpoints without this field still resolve to ``legacy`` in
   # the Python constructor for parameter-name compatibility.
   fusion_mode: spectral_detail
+  # Independent ablation switches: reference spectral correction and spatial detail.
+  g_spec: true
+  g_detail: true
   decoder_refusion: true
   global_latent_blocks: 2
   ref_encoder: deep

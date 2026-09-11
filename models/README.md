@@ -47,3 +47,11 @@ Python 构造函数中的 `fusion_mode` 默认为 `legacy`，与已有 checkpoin
 - 高频只经 `g_detail * reliability` 控制的 FiLM/SFT 残差调制 LR 特征，FiLM 最后一层零初始化，因此新模块初始等价于原 LR/SISR 路径。
 
 该设计保留两个门控：`g_spec` 管低频/光谱参考，`g_detail` 管高频空间细节；二者职责不同，不能合并为一个总门控。`fusion_match.enabled/conf/quality` 仍可用于消融局部匹配、熵置信度和质量门控。
+
+`g_spec` 和 `g_detail` 是独立的模型配置开关，不是“参考信息不足”时的自适应开关，而是用于归因消融：
+
+- `g_spec=true, g_detail=false`：Ref 只提供低频/光谱校正；
+- `g_spec=false, g_detail=true`：Ref 只提供高频/空间细节；
+- `g_spec=false, g_detail=false`：跳过参考路径，作为 SISR 下界基线。
+
+两条路径关闭时不执行参考颜色匹配、参考金字塔和局部高频匹配，可直接用同一个 paired 测试配置完成三档对比。

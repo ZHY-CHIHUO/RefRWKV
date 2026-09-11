@@ -34,6 +34,8 @@ class FusionMatchConfigTests(unittest.TestCase):
                 "model.fusion_match.window=3",
                 "model.fusion_match.conf=false",
                 "model.fusion_match.quality=false",
+                "model.g_spec=false",
+                "model.g_detail=true",
                 "model.decoder_refusion=false",
                 "model.global_latent_blocks=0",
                 "model.ref_encoder=shallow",
@@ -44,6 +46,8 @@ class FusionMatchConfigTests(unittest.TestCase):
         self.assertEqual(model["fusion_match"]["window"], 3)
         self.assertFalse(model["fusion_match"]["conf"])
         self.assertFalse(model["fusion_match"]["quality"])
+        self.assertFalse(model["g_spec"])
+        self.assertTrue(model["g_detail"])
         self.assertFalse(model["decoder_refusion"])
         self.assertEqual(model["global_latent_blocks"], 0)
         self.assertEqual(model["ref_encoder"], "shallow")
@@ -173,6 +177,73 @@ class RefSRWKVStructureTests(unittest.TestCase):
                 output = fusion(lr, low, high)
         self.assertTrue(torch.allclose(output, lr, atol=1e-6, rtol=1e-5))
 
+    def test_spectral_and_detail_switches_skip_their_respective_paths(self) -> None:
+        lr = torch.randn(1, 4, 5, 6)
+        low = torch.randn_like(lr)
+        high = torch.randn_like(lr)
+
+        spec_off = SpectralDetailFusion(4, window_size=3, g_spec=False, g_detail=True)
+        with patch.object(spec_off.spectral_path, "forward", side_effect=AssertionError):
+            with torch.no_grad():
+                output = spec_off(lr, low, high)
+        self.assertTrue(torch.isfinite(output).all())
+
+        detail_off = SpectralDetailFusion(4, window_size=3, g_spec=True, g_detail=False)
+        with patch.object(detail_off, "_match_high", side_effect=AssertionError):
+            with torch.no_grad():
+                output = detail_off(lr, low, high)
+        self.assertTrue(torch.isfinite(output).all())
+
+        all_off = SpectralDetailFusion(4, window_size=3, g_spec=False, g_detail=False)
+        with patch.object(all_off.spectral_path, "forward", side_effect=AssertionError):
+            with patch.object(all_off, "_match_high", side_effect=AssertionError):
+                with torch.no_grad():
+                    output = all_off(lr, low, high)
+        self.assertTrue(torch.allclose(output, lr, atol=1e-6, rtol=1e-5))
+
+    def test_model_switches_reach_all_spectral_detail_fusion_sites(self) -> None:
+        for g_spec, g_detail in ((True, False), (False, True), (False, False)):
+            model = self.build(
+                fusion_mode="spectral_detail",
+                g_spec=g_spec,
+                g_detail=g_detail,
+            )
+            self.assertEqual((model.g_spec, model.g_detail), (g_spec, g_detail))
+            fusions = (
+                model.fuse1,
+                model.fuse2,
+                model.fuse3,
+                model.fuse4,
+                model.decoder_fuse1,
+                model.decoder_fuse2,
+                model.decoder_fuse3,
+            )
+            if g_spec or g_detail:
+                self.assertTrue(
+                    all(
+                        isinstance(fusion, SpectralDetailFusion)
+                        and fusion.g_spec == g_spec
+                        and fusion.g_detail == g_detail
+                        for fusion in fusions
+                    )
+                )
+            else:
+                self.assertFalse(model.reference_fusion_enabled)
+                self.assertFalse(model.decoder_refusion)
+                self.assertIsInstance(model.ref_to_level1, nn.Identity)
+
+    def test_all_switches_off_runs_as_sisr_without_reference_tensor(self) -> None:
+        model = self.build(
+            fusion_mode="spectral_detail",
+            g_spec=False,
+            g_detail=False,
+        )
+        with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+            with torch.no_grad():
+                output = model(torch.randn(1, 3, 5, 6))
+        self.assertEqual(output.shape, (1, 3, 10, 12))
+        self.assertTrue(torch.isfinite(output).all())
+
     def test_spectral_detail_supports_rgb_and_pan_contracts(self) -> None:
         for inp_channels, ref_channels in ((3, 3), (4, 1), (8, 1)):
             model = self.build(
@@ -290,6 +361,17 @@ class RefSRWKVConfigChannelTests(unittest.TestCase):
         config["model"]["fusion_mode"] = 1
         with self.assertRaisesRegex(ValueError, "fusion_mode"):
             validate_config(config, require_data=False)
+
+    def test_validates_spectral_detail_switches_at_config_boundary(self) -> None:
+        config = self._config()
+        config["model"]["g_spec"] = False
+        config["model"]["g_detail"] = True
+        validate_config(config, require_data=False)
+        for branch in ("g_spec", "g_detail"):
+            config["model"][branch] = 1
+            with self.assertRaisesRegex(ValueError, branch):
+                validate_config(config, require_data=False)
+            config["model"][branch] = True
 
     def test_allows_derived_channel_fields_to_be_null(self) -> None:
         config = self._config()

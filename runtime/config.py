@@ -539,6 +539,9 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
                 raise ValueError(
                     f"model.fusion_mode 必须是 {options}，得到 {fusion_mode!r}"
                 )
+        for branch in ("g_spec", "g_detail"):
+            if branch in model and not isinstance(model[branch], bool):
+                raise ValueError(f"model.{branch} 必须是 bool")
         declared_channels: dict[str, int] = {}
         for field in ("inp_channels", "out_channels", "ref_channels"):
             if field not in model:

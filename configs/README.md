@@ -83,5 +83,16 @@ bicubic 伪参考；真实参考实验使用 `use_reference: true` 与 `paired`�
 `g_spec` 门控，高频经局部匹配后通过可靠性门控的 FiLM 残差注入。新模式的 FiLM 输出零初始化，
 适合从已有 LR/SISR 路径微调。切换模式会改变参数结构，不能直接把 `legacy` checkpoint 当作
 完整的 `spectral_detail` 权重使用；应在新模式下重新训练或仅加载形状匹配的公共权重。
+
+新模式的两条参考路径可独立消融：`model.g_spec: false` 关闭低频/光谱校正，
+`model.g_detail: false` 关闭高频/空间细节注入。两者都为 `false` 时跳过参考编码和融合，
+输出路径等价于 SISR 下界；默认值均为 `true`。例如：
+
+```yaml
+model:
+  fusion_mode: spectral_detail
+  g_spec: true       # Ref 只提供光谱/低频校正
+  g_detail: false    # 关闭 Ref 高频细节
+```
 - `output.*` 描述实验输出根目录；通常由运行时自动生成。
 - HRMS-SCD x4 的统一比较协议在 `common/benchmark.yaml`。

@@ -25,6 +25,8 @@ _MODEL_FIELDS = {
     "windows",
     "fusion_match",
     "fusion_mode",
+    "g_spec",
+    "g_detail",
     "use_reference",
     "decoder_refusion",
     "global_latent_blocks",
