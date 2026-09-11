@@ -4,6 +4,8 @@ model:
   inp_channels: 3
   out_channels: 3
   ref_channels: 3
+  # True for paired-reference runs; false for a genuine SISR path.
+  use_reference: true
   dim: 64
   num_blocks: [6, 8, 8, 10]
   num_refinement_blocks: 6

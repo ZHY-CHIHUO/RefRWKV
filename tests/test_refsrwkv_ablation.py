@@ -20,6 +20,7 @@ from models.refsr.refsrwkv.model import (  # noqa: E402
     normalize_fusion_match_config,
 )
 import models.refsr.refsrwkv.model as refsrwkv_module  # noqa: E402
+from runtime.common import adapt_reference_channels  # noqa: E402
 from runtime.config import load_config, validate_config  # noqa: E402
 
 
@@ -130,6 +131,18 @@ class RefSRWKVStructureTests(unittest.TestCase):
         self.assertIsInstance(model.decoder_fuse2, nn.Identity)
         self.assertIsInstance(model.decoder_fuse3, nn.Identity)
 
+    def test_reference_branch_can_be_disabled_for_sisr(self) -> None:
+        model = self.build(use_reference=False)
+        self.assertFalse(model.use_reference)
+        self.assertIsInstance(model.ref_to_level1, nn.Identity)
+        self.assertIsInstance(model.fuse1, nn.Identity)
+        self.assertIsInstance(model.decoder_fuse1, nn.Identity)
+        with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+            with torch.no_grad():
+                output = model(torch.randn(1, 3, 5, 6))
+        self.assertEqual(output.shape, (1, 3, 10, 12))
+        self.assertTrue(torch.isfinite(output).all())
+
     def test_reference_encoder_depth(self) -> None:
         shallow = self.build(ref_encoder="shallow")
         deep = self.build(ref_encoder="deep")
@@ -199,6 +212,17 @@ class RefSRWKVStructureTests(unittest.TestCase):
         self.assertEqual(output.shape, (1, 4, 10, 12))
         self.assertTrue(torch.isfinite(output).all())
 
+    def test_forward_supports_wv3_eight_band_ms_and_pan(self) -> None:
+        model = self.build(inp_channels=8, ref_channels=1, out_channels=8)
+        with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+            with torch.no_grad():
+                output = model(
+                    torch.randn(1, 8, 4, 4),
+                    torch.randn(1, 1, 8, 8),
+                )
+        self.assertEqual(output.shape, (1, 8, 8, 8))
+        self.assertTrue(torch.isfinite(output).all())
+
 
 class RefSRWKVConfigChannelTests(unittest.TestCase):
     @staticmethod
@@ -234,6 +258,15 @@ class RefSRWKVConfigChannelTests(unittest.TestCase):
         config["model"]["out_channels"] = 3
         with self.assertRaisesRegex(ValueError, "out_channels"):
             validate_config(config, require_data=False)
+
+    def test_lr_derived_reference_channel_adaptation(self) -> None:
+        reference = torch.arange(2 * 4 * 2 * 2, dtype=torch.float32).reshape(2, 4, 2, 2)
+        reduced = adapt_reference_channels(reference, 1)
+        expanded = adapt_reference_channels(reduced, 3)
+        self.assertEqual(tuple(reduced.shape), (2, 1, 2, 2))
+        self.assertTrue(torch.allclose(reduced[:, 0], reference.mean(dim=1)))
+        self.assertEqual(tuple(expanded.shape), (2, 3, 2, 2))
+        self.assertTrue(torch.allclose(expanded[:, 0], expanded[:, 1]))
 
 
 if __name__ == "__main__":

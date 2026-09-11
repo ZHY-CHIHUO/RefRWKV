@@ -1,0 +1,22 @@
+dataset:
+  id: pancollection_wv3
+  name: PanCollection WorldView-3 reduced-resolution pansharpening
+  kind: pancollection_h5
+  format: pancollection_h5
+  # The H5 files live on the training server; no dataset files belong in this repo.
+  root: /mnt/sdb/datasets/全色多光谱融合数据集/PanCollection/training_wv3
+  default_scale: 4
+  lr: {native_scale: 4, provenance: sensor, source: stored}
+  value_scale: 2047.0
+  source:
+    channels: 8
+    ref_channels: 1
+    normalization: 2047.0
+    layout: NCHW
+  h5_keys: {hr: gt, lr: ms, ref: pan}
+  files:
+    train: train_wv3.h5
+    val: valid_wv3.h5
+    test: reduced_examples/test_wv3_multiExm1.h5
+    test_easy: reduced_examples/test_wv3_multiExm1.h5
+    test_hard: reduced_examples/test_wv3_multiExm1.h5

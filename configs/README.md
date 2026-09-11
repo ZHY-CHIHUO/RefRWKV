@@ -72,5 +72,9 @@ test:
 - `model.*` 描述网络结构和参考图分支。
 - `train.*` 描述优化器、验证、checkpoint 和设备。
 - `loss.*` 描述训练目标。
+
+RefSRWKV 的 `model.use_reference` 控制是否构造参考分支。纯 SR 使用
+`model.use_reference: false` 与 `data.reference_mode: none`，不会生成 LR 的
+bicubic 伪参考；真实参考实验使用 `use_reference: true` 与 `paired`。
 - `output.*` 描述实验输出根目录；通常由运行时自动生成。
 - HRMS-SCD x4 的统一比较协议在 `common/benchmark.yaml`。

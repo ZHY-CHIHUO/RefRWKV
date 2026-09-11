@@ -58,9 +58,10 @@ def _loader_config(root: Path, *, mode: str, model_name: str = "RefSRWKV") -> di
 
 
 class ReferenceContractTests(unittest.TestCase):
-    def test_lr_up_run_has_no_paired_only_settings(self) -> None:
+    def test_sisr_run_has_no_reference_settings(self) -> None:
         config = load_config("configs/runs/refsrwkv/aid_x4.yaml")
-        self.assertEqual(config["data"]["reference_mode"], "lr_up")
+        self.assertEqual(config["data"]["reference_mode"], "none")
+        self.assertFalse(config["model"]["use_reference"])
         self.assertFalse(PAIRED_ONLY_DATA_KEYS & config["data"].keys())
         self.assertNotIn("ref_drop_prob", config["loss"])
         validate_config(config)

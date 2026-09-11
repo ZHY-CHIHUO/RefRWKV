@@ -2,3 +2,6 @@ base: hrms_scd_x4.yaml
 
 run:
   name: hrms_scd_trefsr_x4
+
+model:
+  use_reference: true

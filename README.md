@@ -18,7 +18,7 @@ RefRWKV/
 ├── data/
 │   ├── dataset.py                # 统一 HR/LR/Ref Dataset
 │   ├── sr/                       # SR 数据：<dataset>/<split>/{HR[,LR]}
-│   ├── refsr/                    # RefSR 数据：<dataset>/<split>/{HR,LR[,Ref]}
+│   ├── refsr/                    # RefSR 数据：图像、Wuhan TIFF、PanCollection H5 加载器
 │   ├── raw/                      # 原始压缩包和解压内容
 │   └── archives/                 # RefSR 多卷压缩包等归档
 ├── models/
@@ -89,7 +89,7 @@ EDSR、RCAN、HAT、MambaIRv2、TTSR、MASA-SR、DATSR 的可训练 compatibilit
 
 命令行可以用 `--overrides model.dim=64 train.learning_rate=5e-5` 覆盖点路径字段。bicubic 数据会在运行时从 HR 按目标倍率生成 LR；sensor 数据保持原生观测倍率，不默认生成 `cache/`，也不会修改 `data/`。
 
-`data.root` 可以是单个数据集（如 `data/sr/AID`），也可以是任务目录（如 `data/sr`）。后者会自动聚合下一层数据集；也可用 `data.roots=[...]` 明确指定组合。常规 SR/RefSR loader 使用 `data.dataset.SuperResolutionDataset`，由 `return_items` 决定返回 `lr`、`hr`、`ref`；Wuhan 的 temporal-pair GeoTIFF 使用专用 `WuhanSTFDataset`。`data.lr_source` 支持 `auto`、`stored`、`from_hr`：AID、UC Merced 和 `data/refsr/HRMS_SCD` 的 LR 都是 HR 经 bicubic 下采样 x4 生成（可在 HR-only 目录上在线生成），Real-RefRSSRD 的 LR 是实测 Sentinel-2，配置为 `stored` 且只能使用原生 x10。RefSRWKV 使用 `data.reference_mode: lr_up` 时返回 `lr/hr`，trainer 从 LR 动态生成 bicubic 自参考；只有 `paired` 才返回并读取 `Ref`。
+`data.root` 可以是单个数据集（如 `data/sr/AID`），也可以是任务目录（如 `data/sr`）。后者会自动聚合下一层数据集；也可用 `data.roots=[...]` 明确指定组合。常规 SR/RefSR loader 使用 `data.dataset.SuperResolutionDataset`，由 `return_items` 决定返回 `lr`、`hr`、`ref`；Wuhan 的 temporal-pair GeoTIFF 使用专用 `WuhanSTFDataset`；PanCollection 的 `train_wv3.h5` 等文件使用通用 `PanCollectionH5Dataset`，由 YAML 将 `ms/pan/gt` 映射为 `lr/ref/hr`。`data.lr_source` 支持 `auto`、`stored`、`from_hr`：AID、UC Merced 和 `data/refsr/HRMS_SCD` 的 LR 都是 HR 经 bicubic 下采样 x4 生成（可在 HR-only 目录上在线生成），Real-RefRSSRD 的 LR 是实测 Sentinel-2，配置为 `stored` 且只能使用原生 x10。RefSRWKV 使用 `data.reference_mode: lr_up` 时返回 `lr/hr`，trainer 从 LR 动态生成 bicubic 自参考；只有 `paired` 才返回并读取 `Ref`。
 
 真实参考图专属字段只放在 `configs/common/refsr_paired.yaml` 和 `configs/common/refsrwkv_paired.yaml`：`augment_ref`、`ref_aug_strengths`、`ref_aug_probs`、`ref_gray_prob`、`loss.ref_drop_prob`。`lr_up` 运行配置不能设置它们，配置校验会直接报错，避免参数看似启用但实际无效。`RefDiffRWKV` 使用 `paired`，因为它的训练和采样都需要真实 `Ref`。
 

@@ -670,6 +670,7 @@ class RefSRWKV(nn.Module):
         drop_path_rate: float = 0.1,
         hidden_rate: int = 4,
         ref_channels: int | None = None,
+        use_reference: bool = True,
         windows=None,
         fusion_match=None,
         decoder_refusion: bool = True,
@@ -719,6 +720,8 @@ class RefSRWKV(nn.Module):
             ref_channels = inp_channels
         if not isinstance(ref_channels, int) or isinstance(ref_channels, bool) or ref_channels < 1:
             raise ValueError("ref_channels 必须为正整数")
+        if not isinstance(use_reference, bool):
+            raise ValueError("use_reference 必须是 bool")
         if ref_channels > inp_channels:
             raise ValueError(
                 "ref_channels 不能大于 inp_channels；当前融合契约要求 LR 通道数 >= Ref 通道数"
@@ -751,8 +754,9 @@ class RefSRWKV(nn.Module):
             out_channels,
         )
         self.upsampler, self.color_match = upsampler, color_match
+        self.use_reference = use_reference
         self.fusion_match_config = fusion_config
-        self.decoder_refusion = decoder_refusion
+        self.decoder_refusion = bool(decoder_refusion and use_reference)
         self.global_latent_blocks = global_latent_blocks
         self.ref_encoder = ref_encoder
         self.window_config = normalize_window_config(windows)
@@ -773,68 +777,76 @@ class RefSRWKV(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        ref_encoder_layers = [
-            nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
-            nn.GELU(),
-        ]
-        if ref_encoder == "deep":
-            # The deep encoder adds an HR-domain convolution before phase-preserving fold.
-            ref_encoder_layers.append(
-                nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False)
-            )
-        ref_encoder_layers.extend(
-            [
-                nn.PixelUnshuffle(scale),
-                nn.Conv2d(ref_channels * (scale**2), dim, 1, bias=False),
-                RMSNorm2d(dim),
-                nn.ReLU(inplace=True),
-            ]
-        )
-        self.ref_to_level1 = nn.Sequential(*ref_encoder_layers)
-        self.ref_down2 = nn.Sequential(
-            nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False),
-            RMSNorm2d(dim * 2),
-        )
-        self.ref_down3 = nn.Sequential(
-            nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, bias=False),
-            RMSNorm2d(dim * 4),
-        )
-        self.ref_down4 = nn.Sequential(
-            nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False),
-            RMSNorm2d(dim * 8),
-        )
-
         fusion_windows = fusion_config["window"]
-        self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
-            GatedFusion(
-                dim,
-                window_size=fusion_windows["enc1"],
-                match_enabled=fusion_config["enabled"],
-                conf_enabled=fusion_config["conf"],
-                quality_enabled=fusion_config["quality"],
-            ),
-            GatedFusion(
-                dim * 2,
-                window_size=fusion_windows["enc2"],
-                match_enabled=fusion_config["enabled"],
-                conf_enabled=fusion_config["conf"],
-                quality_enabled=fusion_config["quality"],
-            ),
-            GatedFusion(
-                dim * 4,
-                window_size=fusion_windows["enc3"],
-                match_enabled=fusion_config["enabled"],
-                conf_enabled=fusion_config["conf"],
-                quality_enabled=fusion_config["quality"],
-            ),
-            GatedFusion(
-                dim * 8,
-                window_size=fusion_windows["latent"],
-                match_enabled=fusion_config["enabled"],
-                conf_enabled=fusion_config["conf"],
-                quality_enabled=fusion_config["quality"],
-            ),
-        )
+        if use_reference:
+            ref_encoder_layers = [
+                nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False),
+                nn.GELU(),
+            ]
+            if ref_encoder == "deep":
+                # The deep encoder adds an HR-domain convolution before phase-preserving fold.
+                ref_encoder_layers.append(
+                    nn.Conv2d(ref_channels, ref_channels, 3, padding=1, bias=False)
+                )
+            ref_encoder_layers.extend(
+                [
+                    nn.PixelUnshuffle(scale),
+                    nn.Conv2d(ref_channels * (scale**2), dim, 1, bias=False),
+                    RMSNorm2d(dim),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            self.ref_to_level1 = nn.Sequential(*ref_encoder_layers)
+            self.ref_down2 = nn.Sequential(
+                nn.Conv2d(dim, dim * 2, 3, stride=2, padding=1, bias=False),
+                RMSNorm2d(dim * 2),
+            )
+            self.ref_down3 = nn.Sequential(
+                nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, bias=False),
+                RMSNorm2d(dim * 4),
+            )
+            self.ref_down4 = nn.Sequential(
+                nn.Conv2d(dim * 4, dim * 8, 3, stride=2, padding=1, bias=False),
+                RMSNorm2d(dim * 8),
+            )
+            self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
+                GatedFusion(
+                    dim,
+                    window_size=fusion_windows["enc1"],
+                    match_enabled=fusion_config["enabled"],
+                    conf_enabled=fusion_config["conf"],
+                    quality_enabled=fusion_config["quality"],
+                ),
+                GatedFusion(
+                    dim * 2,
+                    window_size=fusion_windows["enc2"],
+                    match_enabled=fusion_config["enabled"],
+                    conf_enabled=fusion_config["conf"],
+                    quality_enabled=fusion_config["quality"],
+                ),
+                GatedFusion(
+                    dim * 4,
+                    window_size=fusion_windows["enc3"],
+                    match_enabled=fusion_config["enabled"],
+                    conf_enabled=fusion_config["conf"],
+                    quality_enabled=fusion_config["quality"],
+                ),
+                GatedFusion(
+                    dim * 8,
+                    window_size=fusion_windows["latent"],
+                    match_enabled=fusion_config["enabled"],
+                    conf_enabled=fusion_config["conf"],
+                    quality_enabled=fusion_config["quality"],
+                ),
+            )
+        else:
+            # Keep public module names stable while omitting all reference
+            # parameters and local matching work from the SISR variant.
+            self.ref_to_level1 = nn.Identity()
+            self.ref_down2 = nn.Identity()
+            self.ref_down3 = nn.Identity()
+            self.ref_down4 = nn.Identity()
+            self.fuse1 = self.fuse2 = self.fuse3 = self.fuse4 = nn.Identity()
 
         total_blocks = sum(num_blocks) * 2 + num_refinement_blocks
         dp_rates = [
@@ -898,7 +910,7 @@ class RefSRWKV(nn.Module):
         self.global_latent = nn.Sequential(
             *(GlobalLatentBlock(dim * 8, num_heads=8, hidden_rate=2) for _ in range(global_latent_blocks))
         )
-        if decoder_refusion:
+        if self.decoder_refusion:
             self.decoder_fuse3 = GatedFusion(
                 dim * 4,
                 window_size=fusion_windows["dec3"],
@@ -1036,30 +1048,38 @@ class RefSRWKV(nn.Module):
         ref_4 = self.ref_down4(ref_3)
         return ref_1, ref_2, ref_3, ref_4
 
-    def forward(self, lr, ref):
-        if lr.ndim != 4 or ref.ndim != 4:
+    def forward(self, lr, ref=None):
+        if lr.ndim != 4:
+            raise ValueError(f"lr 必须是 4D NCHW 张量，得到 {lr.shape}")
+        if self.use_reference and (ref is None or ref.ndim != 4):
             raise ValueError(
-                f"lr/ref 必须是 4D NCHW 张量，得到 {lr.shape} 和 {ref.shape}"
+                "use_reference=true 时 ref 必须是 4D NCHW 张量，"
+                f"得到 {None if ref is None else ref.shape}"
             )
-        if lr.shape[0] != ref.shape[0]:
+        if self.use_reference and lr.shape[0] != ref.shape[0]:
             raise ValueError(f"lr/ref batch 不一致: {lr.shape[0]} vs {ref.shape[0]}")
         if lr.shape[1] != self.inp_channels:
             raise ValueError(f"lr 通道数应为 {self.inp_channels}，得到 {lr.shape[1]}")
-        if ref.shape[1] != self.ref_channels:
+        if self.use_reference and ref.shape[1] != self.ref_channels:
             raise ValueError(f"ref 通道数应为 {self.ref_channels}，得到 {ref.shape[1]}")
-        if lr.shape[2] < 1 or lr.shape[3] < 1 or ref.shape[2] < 1 or ref.shape[3] < 1:
+        if lr.shape[2] < 1 or lr.shape[3] < 1:
             raise ValueError("lr/ref 的空间尺寸必须为正数")
         target_hr_h, target_hr_w = lr.shape[2] * self.scale, lr.shape[3] * self.scale
-        if ref.shape[2:] != (target_hr_h, target_hr_w):
+        if self.use_reference and ref.shape[2:] != (target_hr_h, target_hr_w):
             raise ValueError(
                 "Ref 尺寸必须严格等于 LR x scale；"
                 f"得到 LR={tuple(lr.shape[2:])}, scale=x{self.scale}, "
                 f"Ref={tuple(ref.shape[2:])}"
             )
-        lr_hr_input = F.interpolate(
-            lr, size=(target_hr_h, target_hr_w), mode="bicubic", align_corners=False
-        )
-        ref_aligned = self._match_color(ref, lr_hr_input)
+        if self.use_reference:
+            lr_hr_input = F.interpolate(
+                lr, size=(target_hr_h, target_hr_w), mode="bicubic", align_corners=False
+            )
+            ref_aligned = self._match_color(ref, lr_hr_input)
+        else:
+            # SISR has no reference tensor and therefore needs no temporary
+            # HR-sized LR copy for colour matching.
+            ref_aligned = None
 
         # Three PixelUnshuffle downsampling stages require an LR multiple of
         # eight.  Pad only the bottom/right edge, and pad Ref by exactly the
@@ -1068,10 +1088,14 @@ class RefSRWKV(nn.Module):
         pad_h, pad_w = (-lr_h) % 8, (-lr_w) % 8
         if pad_h or pad_w:
             lr_internal = F.pad(lr, (0, pad_w, 0, pad_h), mode="replicate")
-            ref_internal = F.pad(
-                ref_aligned,
-                (0, pad_w * self.scale, 0, pad_h * self.scale),
-                mode="replicate",
+            ref_internal = (
+                F.pad(
+                    ref_aligned,
+                    (0, pad_w * self.scale, 0, pad_h * self.scale),
+                    mode="replicate",
+                )
+                if self.use_reference
+                else None
             )
         else:
             lr_internal, ref_internal = lr, ref_aligned
@@ -1089,12 +1113,17 @@ class RefSRWKV(nn.Module):
         )
 
         fea = self.lr_up(lr_internal)
-        ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_internal)
-
-        e1 = self.encoder_level1(self.fuse1(fea, ref_1))
-        e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
-        e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
-        latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
+        if self.use_reference:
+            ref_1, ref_2, ref_3, ref_4 = self._extract_ref_pyramid(ref_internal)
+            e1 = self.encoder_level1(self.fuse1(fea, ref_1))
+            e2 = self.encoder_level2(self.fuse2(self.down1_2(e1), ref_2))
+            e3 = self.encoder_level3(self.fuse3(self.down2_3(e2), ref_3))
+            latent = self.latent(self.fuse4(self.down3_4(e3), ref_4))
+        else:
+            e1 = self.encoder_level1(fea)
+            e2 = self.encoder_level2(self.down1_2(e1))
+            e3 = self.encoder_level3(self.down2_3(e2))
+            latent = self.latent(self.down3_4(e3))
         latent = self.global_latent(latent)
 
         d3_input = self.reduce_chan_level3(torch.cat([self.up4_3(latent), e3], dim=1))

@@ -75,6 +75,33 @@ def per_image_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 10.0 * torch.log10(4.0 / mse.clamp_min(1e-10))
 
 
+def adapt_reference_channels(reference: torch.Tensor, channels: int) -> torch.Tensor:
+    """Adapt an LR-derived reference to the model's reference band count.
+
+    A single-band guide is the mean across LR bands.  When reducing to a
+    small multispectral guide, contiguous band groups are averaged; when
+    expanding, bands are repeated deterministically.  Stored paired
+    references are never passed through this helper, so their sensor bands
+    remain untouched.
+    """
+    if reference.ndim != 4:
+        raise ValueError(f"reference must be a 4D NCHW tensor, got {tuple(reference.shape)}")
+    if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+        raise ValueError("reference channel count must be a positive integer")
+    source_channels = int(reference.shape[1])
+    if source_channels == channels:
+        return reference
+    if source_channels > channels:
+        boundaries = [(index * source_channels) // channels for index in range(channels + 1)]
+        groups = [
+            reference[:, start:end].mean(dim=1, keepdim=True)
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+        ]
+        return torch.cat(groups, dim=1)
+    repeats = (channels + source_channels - 1) // source_channels
+    return reference.repeat(1, repeats, 1, 1)[:, :channels]
+
+
 class EMA:
     """Small, model-agnostic EMA used by the training runners."""
 

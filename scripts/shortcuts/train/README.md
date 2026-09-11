@@ -17,6 +17,7 @@
 | `masa_sr_hrms_scd_ref_x4.sh` | MASA-SR 真实参考图 RefSR。 |
 | `datsr_hrms_scd_ref_x4.sh` | DATSR 真实参考图 RefSR。 |
 | `refsrwkv_wuhan.sh` | Wuhan 四通道 temporal-pair 训练，网络倍率 x1。 |
+| `refsrwkv_pancollection_wv3.sh` | PanCollection WV3 全色多光谱融合，8 通道 MS LR + 1 通道 PAN Ref，x4。 |
 
 ## 用法
 

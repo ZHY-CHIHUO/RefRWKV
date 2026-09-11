@@ -22,7 +22,7 @@ from data.loaders import build_refsr_test_loader, build_sr_test_loader
 from models.refsr import build_model as build_refsr_model
 from models.sr import build_model as build_sr_model
 from runtime.checkpoint import load_checkpoint, load_model_weights
-from runtime.common import gaussian_ssim, per_image_psnr, resolve_path
+from runtime.common import adapt_reference_channels, gaussian_ssim, per_image_psnr, resolve_path
 from runtime.config import is_refsr_model, normalize_reference_mode, validate_config
 from runtime.experiments import layout_from_config
 from runtime.tiling import tiled_forward
@@ -156,13 +156,19 @@ def _move_batch(batch: Any, device: torch.device) -> Any:
     return batch
 
 
-def _reference_from_lr(lr: torch.Tensor, hr: torch.Tensor, scale: int) -> torch.Tensor:
+def _reference_from_lr(
+    lr: torch.Tensor,
+    hr: torch.Tensor,
+    scale: int,
+    ref_channels: int | None = None,
+) -> torch.Tensor:
     expected = (int(lr.shape[-2]) * int(scale), int(lr.shape[-1]) * int(scale))
     if tuple(hr.shape[-2:]) != expected:
         raise ValueError(
             f"LR/HR 尺寸不匹配: LR={tuple(lr.shape[-2:])}, HR={tuple(hr.shape[-2:])}, x{scale}"
         )
-    return F.interpolate(lr, size=expected, mode="bicubic", align_corners=False)
+    reference = F.interpolate(lr, size=expected, mode="bicubic", align_corners=False)
+    return reference if ref_channels is None else adapt_reference_channels(reference, ref_channels)
 
 
 def _reference_for_refsr_batch(
@@ -173,10 +179,13 @@ def _reference_for_refsr_batch(
     scale: int,
     reference_mode: str,
     ref_key: str,
-) -> torch.Tensor:
+    ref_channels: int | None = None,
+) -> torch.Tensor | None:
     """Resolve the only valid reference source for one RefSR batch."""
+    if reference_mode == "none":
+        return None
     if reference_mode == "lr_up":
-        return _reference_from_lr(lr, hr, scale)
+        return _reference_from_lr(lr, hr, scale, ref_channels)
     ref = batch.get(ref_key)
     if ref is None:
         raise ValueError(
@@ -340,6 +349,8 @@ def run_inference(
         if task == "refsr"
         else None
     )
+    model_config = config.get("model", {})
+    use_reference = bool(model_config.get("use_reference", True)) if isinstance(model_config, Mapping) else True
     (
         selected_metrics,
         save_predictions,
@@ -475,6 +486,15 @@ def run_inference(
                     overlap=eval_tile_overlap,
                 )
                 prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
+            elif model_name != "refdiffrwkv" and not use_reference:
+                prediction = tiled_forward(
+                    model,
+                    lr,
+                    scale=scale,
+                    tile_size=eval_tile_size,
+                    overlap=eval_tile_overlap,
+                )
+                prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
             elif model_name != "refdiffrwkv":
                 ref = _reference_for_refsr_batch(
                     batch,
@@ -483,6 +503,9 @@ def run_inference(
                     scale=scale,
                     reference_mode=reference_mode,
                     ref_key=config["data"].get("ref_key", "ref"),
+                    ref_channels=int(model_config["ref_channels"])
+                    if model_config.get("ref_channels") is not None
+                    else None,
                 )
                 prediction = tiled_forward(
                     model,
@@ -501,6 +524,9 @@ def run_inference(
                     scale=scale,
                     reference_mode=reference_mode,
                     ref_key=config["data"].get("ref_key", "ref"),
+                    ref_channels=int(model_config["ref_channels"])
+                    if model_config.get("ref_channels") is not None
+                    else None,
                 )
                 prediction_png = generator.generate_sr(
                     lr,

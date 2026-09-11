@@ -12,8 +12,11 @@ run:
   lr_patch: 48
 
 data:
-  reference_mode: lr_up
+  reference_mode: none
   max_samples_val: 300
+
+model:
+  use_reference: false
 
 loss:
   ssim_weight: 0.0

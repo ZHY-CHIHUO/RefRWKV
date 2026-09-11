@@ -9,6 +9,7 @@ from typing import Any
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from data.dataset import SuperResolutionDataset
+from data.refsr.pancollection import PanCollectionH5Dataset
 from data.refsr.wuhan import WuhanSTFDataset
 from runtime.common import resolve_path
 from runtime.config import (
@@ -161,6 +162,126 @@ def _is_wuhan_dataset(config: Mapping[str, Any]) -> bool:
     )
 
 
+def _is_pancollection_dataset(config: Mapping[str, Any]) -> bool:
+    """Identify the H5 PanCollection layout before generic PNG discovery."""
+    dataset = config.get("dataset", {})
+    if not isinstance(dataset, Mapping):
+        dataset = {}
+    data = config.get("data", {})
+    if not isinstance(data, Mapping):
+        data = {}
+    values = (
+        dataset.get("id"),
+        dataset.get("kind"),
+        dataset.get("format"),
+        data.get("dataset_format"),
+        data.get("dataset_kind"),
+        data.get("format"),
+        Path(str(data.get("root", ""))).name,
+    )
+    normalized = {str(value).strip().lower() for value in values if value is not None}
+    return bool(
+        any("pancollection" in value for value in normalized)
+        or any(value in {"pan_h5", "pansharpening_h5", "h5_pansharpening"} for value in normalized)
+    )
+
+
+def _pancollection_file(config: Mapping[str, Any], split: str) -> Path:
+    """Resolve one PanCollection split file from dataset metadata."""
+    data = config.get("data", {})
+    if not isinstance(data, Mapping):
+        data = {}
+    dataset = config.get("dataset", {})
+    if not isinstance(dataset, Mapping):
+        dataset = {}
+    root_value = data.get("root") or dataset.get("root")
+    if not root_value:
+        raise ValueError("PanCollection data.root is required")
+    root = resolve_path(root_value)
+    files = data.get("files", dataset.get("files", {}))
+    if not isinstance(files, Mapping):
+        raise ValueError("PanCollection files must be a mapping")
+    value = files.get(split)
+    if value is None and split in {"test_easy", "test_hard"}:
+        value = files.get("test")
+    if value is None:
+        raise KeyError(f"PanCollection files has no entry for split {split!r}")
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"PanCollection H5 file not found for {split}: {path}")
+    return path
+
+
+def _pancollection_kwargs(config: Mapping[str, Any], *, mode: str, patch_size, max_samples, return_sample_id: bool = False) -> dict[str, Any]:
+    data = config["data"]
+    dataset = config.get("dataset", {})
+    if not isinstance(dataset, Mapping):
+        dataset = {}
+    model = config.get("model", {})
+    if not isinstance(model, Mapping):
+        model = {}
+    keys = data.get("h5_keys", dataset.get("h5_keys", dataset.get("keys", {})))
+    if not isinstance(keys, Mapping):
+        keys = {}
+    return {
+        "mode": mode,
+        "patch_size": patch_size,
+        "scale": int(data["scale"]),
+        "augment": bool(data.get("augment", mode == "train")),
+        "max_samples": max_samples,
+        "sample_seed": int(data.get("sample_seed", config.get("train", {}).get("seed", 42))),
+        "lr_key": str(data.get("lr_key", "lr")),
+        "hr_key": str(data.get("hr_key", "hr")),
+        "ref_key": str(data.get("ref_key", "ref")),
+        "h5_lr_key": str(data.get("h5_lr_key", keys.get("lr", "ms"))),
+        "h5_hr_key": str(data.get("h5_hr_key", keys.get("hr", "gt"))),
+        "h5_ref_key": str(data.get("h5_ref_key", keys.get("ref", "pan"))),
+        "value_scale": float(data.get("value_scale", dataset.get("value_scale", 2047.0))),
+        "clip_range": bool(data.get("clip_range", True)),
+        "expected_lr_channels": data.get("lr_channels", model.get("inp_channels")),
+        "expected_ref_channels": data.get("ref_channels", model.get("ref_channels")),
+        "expected_hr_channels": data.get("hr_channels", model.get("out_channels", model.get("inp_channels"))),
+        "return_sample_id": return_sample_id,
+    }
+
+
+def _build_pancollection_loaders(config: Mapping[str, Any]):
+    """Build RefSR loaders for PanCollection reduced-resolution H5 files."""
+    data = config["data"]
+    max_samples = _max_samples(data)
+    train = PanCollectionH5Dataset(
+        _pancollection_file(config, "train"),
+        **_pancollection_kwargs(
+            config,
+            mode="train",
+            patch_size=data.get("patch_size", 64),
+            max_samples=max_samples,
+        ),
+    )
+    val = PanCollectionH5Dataset(
+        _pancollection_file(config, "val"),
+        **_pancollection_kwargs(
+            config,
+            mode="val",
+            patch_size=data.get("val_patch_size"),
+            max_samples=max_samples,
+        ),
+    )
+    if not len(train) or not len(val):
+        raise ValueError("PanCollection training and validation splits must be non-empty")
+    return _loader(train, data, train=True), _loader(val, data, train=False)
+
+
+def build_pancollection_loaders(config: Mapping[str, Any]):
+    """Public alias for constructing PanCollection train/validation loaders."""
+    if not _is_pancollection_dataset(config):
+        raise ValueError("build_pancollection_loaders requires a PanCollection dataset")
+    return _build_pancollection_loaders(config)
+
+
 def _wuhan_roots(data: Mapping[str, Any], required_splits: tuple[str, ...]) -> list[Path]:
     """Resolve one or more Wuhan roots and check split directories."""
     roots = _configured_roots(data)
@@ -301,6 +422,8 @@ def build_refsr_loaders(config: Mapping[str, Any]):
     validate_refsr_reference_contract(config)
     if _is_wuhan_dataset(config):
         return _build_wuhan_loaders(config)
+    if _is_pancollection_dataset(config):
+        return _build_pancollection_loaders(config)
     data = config["data"]
     reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
     paired = reference_mode == "paired"
@@ -450,6 +573,21 @@ def build_refsr_test_loader(
         if not len(dataset):
             raise ValueError(f"test split {split!r} is empty")
         return _test_loader(dataset, data, batch_size=batch_size)
+    if _is_pancollection_dataset(config):
+        data = config["data"]
+        dataset = PanCollectionH5Dataset(
+            _pancollection_file(config, split),
+            **_pancollection_kwargs(
+                config,
+                mode=split,
+                patch_size=data.get("test_patch_size"),
+                max_samples=_max_samples(data),
+                return_sample_id=True,
+            ),
+        )
+        if not len(dataset):
+            raise ValueError(f"test split {split!r} is empty")
+        return _test_loader(dataset, data, batch_size=batch_size)
     data = config["data"]
     reference_mode = normalize_reference_mode(data.get("reference_mode", "paired"))
     paired = reference_mode == "paired"
@@ -484,4 +622,6 @@ __all__ = [
     "build_sr_test_loader",
     "build_refsr_test_loader",
     "build_wuhan_loaders",
+    "build_pancollection_loaders",
+    "PanCollectionH5Dataset",
 ]

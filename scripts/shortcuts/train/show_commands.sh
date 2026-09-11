@@ -29,6 +29,7 @@ shortcuts=(
   masa_sr_hrms_scd_ref_x4.sh
   datsr_hrms_scd_ref_x4.sh
   refsrwkv_wuhan.sh
+  refsrwkv_pancollection_wv3.sh
 )
 
 for shortcut in "${shortcuts[@]}"; do

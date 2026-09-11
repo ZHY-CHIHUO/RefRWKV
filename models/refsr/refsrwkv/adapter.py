@@ -24,6 +24,7 @@ _MODEL_FIELDS = {
     "ref_channels",
     "windows",
     "fusion_match",
+    "use_reference",
     "decoder_refusion",
     "global_latent_blocks",
     "ref_encoder",

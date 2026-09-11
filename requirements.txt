@@ -7,6 +7,7 @@ torch>=2.1
 torchvision>=0.16
 pytorch-lightning>=2.1
 numpy>=1.24
+h5py>=3.9
 Pillow>=10.0
 # GeoTIFF reader for the four-band Wuhan temporal-pair dataset.
 tifffile>=2023.7

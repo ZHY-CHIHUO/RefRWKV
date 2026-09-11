@@ -1,0 +1,40 @@
+base:
+  - ../../common/refsrwkv_paired.yaml
+  - ../../models/refsr/refsrwkv.yaml
+  - ../../common/benchmark.yaml
+
+dataset:
+  config: ../../datasets/refsr/pancollection_wv3.yaml
+
+run:
+  name: pancollection_wv3_x4
+  scale: 4
+  # PanCollection training samples are 64x64 HR / 16x16 LR patches.
+  lr_patch: 16
+
+model:
+  # WV3 pansharpening: 8-band MS LR + 1-band PAN Ref -> 8-band HR.
+  inp_channels: 8
+  ref_channels: 1
+  out_channels: 8
+  use_reference: true
+
+data:
+  reference_mode: paired
+  lr_source: stored
+  lr_native_scale: 4
+  lr_provenance: sensor
+  value_scale: 2047.0
+  patch_size: 64
+  val_patch_size: null
+  batch_size: 16
+  val_batch_size: 8
+  num_workers: 8
+  val_num_workers: 4
+  prefetch_factor: 4
+  max_samples_val: null
+
+loss:
+  ssim_weight: 0.0
+  fft_weight: 0.0
+  ref_drop_prob: 0.1

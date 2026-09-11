@@ -2,8 +2,10 @@
 
 Registered models follow the project RefSR tensor contract:
 ``forward(lr, ref) -> sr`` with inputs and output in ``[-1, 1]`` and an
-output spatial size of ``lr * scale``.  Diffusion systems remain a separate
-RefSR model family because their inference interface includes a sampler.
+output spatial size of ``lr * scale``.  RefSRWKV additionally supports its
+explicit ``use_reference=false`` SISR variant, whose call is ``forward(lr)``.
+Diffusion systems remain a separate RefSR model family because their inference
+interface includes a sampler.
 """
 
 from __future__ import annotations
