@@ -1,0 +1,13 @@
+# Fresh HRMS-SCD run for the new three-branch spectral/detail fusion.
+# The distinct run name prevents an older legacy checkpoint from being
+# auto-resumed through the materialized experiment snapshot.
+base: hrms_scd_x4.yaml
+
+run:
+  name: hrms_scd_trefsr_spectral_detail_x4
+
+model:
+  use_reference: true
+  fusion_mode: spectral_detail
+  g_spec: true
+  g_detail: true

@@ -12,12 +12,12 @@
 | `hat_hrms_scd_sr_x4.sh` | HRMS-SCD x4 HAT 单图 SR。 |
 | `mambairv2_hrms_scd_sr_x4.sh` | HRMS-SCD x4 MambaIRv2 单图 SR。 |
 | `refsrwkv_hrms_scd_sr_x4.sh` | RefSRWKV-SR，`lr_up` 自参考。 |
-| `refsrwkv_hrms_scd_ref_x4.sh` | RefSRWKV TRefSR，读取配对真实 `Ref/`。 |
+| `refsrwkv_hrms_scd_ref_x4.sh` | 从头训练新 RefSRWKV `spectral_detail`，读取 HRMS-SCD 配对真实 `Ref/`。 |
 | `ttsr_hrms_scd_ref_x4.sh` | TTSR 真实参考图 RefSR。 |
 | `masa_sr_hrms_scd_ref_x4.sh` | MASA-SR 真实参考图 RefSR。 |
 | `datsr_hrms_scd_ref_x4.sh` | DATSR 真实参考图 RefSR。 |
 | `refsrwkv_wuhan.sh` | Wuhan 四通道 temporal-pair 训练，网络倍率 x1。 |
-| `refsrwkv_pancollection_wv3.sh` | PanCollection WV3 全色多光谱融合，8 通道 MS LR + 1 通道 PAN Ref，x4。 |
+| `refsrwkv_pancollection_wv3.sh` | 从头训练新 `spectral_detail` 全色多光谱融合，8 通道 MS LR + 1 通道 PAN Ref，x4。 |
 
 ## 用法
 

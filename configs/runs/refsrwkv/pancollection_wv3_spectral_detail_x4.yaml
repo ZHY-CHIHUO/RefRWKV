@@ -1,0 +1,15 @@
+# Fresh PanCollection WV3 run for the new spectral/detail fusion.
+# WV3 maps 8-band MS LR + 1-band PAN Ref to 8-band HR output.
+base: pancollection_wv3.yaml
+
+run:
+  name: pancollection_wv3_spectral_detail_x4
+
+model:
+  inp_channels: 8
+  ref_channels: 1
+  out_channels: 8
+  use_reference: true
+  fusion_mode: spectral_detail
+  g_spec: true
+  g_detail: true

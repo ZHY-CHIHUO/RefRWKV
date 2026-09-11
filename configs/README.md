@@ -18,10 +18,14 @@
 
 ```bash
 python scripts/render_config.py \
-  --config configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml
+  --config configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml
 ```
 
 完整快照会写到对应的 `experiments/train/.../config.yaml`。训练 checkpoint 也会保存最终的 `trainer_config`。
+新模型的 HRMS-SCD 和 WV3 从头训练入口分别是
+`configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml` 和
+`configs/runs/refsrwkv/pancollection_wv3_spectral_detail_x4.yaml`；两者使用独立
+run 名称，不会复用旧 legacy 实验目录。
 
 ### `base` 覆盖顺序
 

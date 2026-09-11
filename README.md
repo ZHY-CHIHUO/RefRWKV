@@ -123,11 +123,11 @@ Wuhan 评估结果会额外写入 RMSE、UIQI、PSNR、SAM（弧度/角度）和
 
 ```bash
 python scripts/render_config.py \
-  --config configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml
+  --config configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml
 
-# 编辑 experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/config.yaml
+# 编辑 experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_spectral_detail_x4/config.yaml
 python scripts/train/refsrwkv.py \
-  --config experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/config.yaml
+  --config experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_spectral_detail_x4/config.yaml
 ```
 
 如果目标完整配置已经存在，工具默认拒绝覆盖，以免丢失手工修改；确认需要重新展开时使用 `--force`。完整训练 YAML 已经包含数据、模型、训练和输出字段，不再依赖 `base`，可以直接作为训练入口的 `--config` 参数。测试入口使用 `configs/test/test.yaml`，模型和数据配置从 checkpoint 内嵌的训练 YAML 读取。
@@ -159,7 +159,13 @@ python scripts/train/refsrwkv.py \
 
 ```bash
 python scripts/train/refsrwkv.py \
-  --config configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml
+  --config configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml
+```
+
+PanCollection WV3 全色多光谱融合（8 通道 MS LR + 1 通道 PAN Ref）：
+
+```bash
+bash scripts/shortcuts/train/refsrwkv_pancollection_wv3.sh
 ```
 
 完整对比集合（Bicubic、EDSR、RCAN、SwinIR、HAT、MambaIRv2、RefSRWKV、TTSR、

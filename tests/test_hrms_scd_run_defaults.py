@@ -23,6 +23,8 @@ RUN_CONFIGS = (
     "configs/runs/sr/mambairv2/hrms_scd_x4.yaml",
     "configs/runs/refsrwkv/hrms_scd_sr_x4.yaml",
     "configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml",
+    "configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml",
+    "configs/runs/refsrwkv/pancollection_wv3_spectral_detail_x4.yaml",
     "configs/runs/refsr/ttsr/hrms_scd_x4.yaml",
     "configs/runs/refsr/masa_sr/hrms_scd_x4.yaml",
     "configs/runs/refsr/datsr/hrms_scd_x4.yaml",
@@ -61,6 +63,25 @@ class HRMSSCDRunDefaultsTests(unittest.TestCase):
                 self.assertEqual(config["loss"]["name"], "l1")
                 self.assertEqual(config["loss"].get("ssim_weight"), 0.0)
                 self.assertEqual(config["loss"].get("fft_weight"), 0.0)
+
+    def test_new_runs_use_the_three_branch_model_explicitly(self) -> None:
+        expected = {
+            "configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml": (3, 3, 3),
+            "configs/runs/refsrwkv/pancollection_wv3_spectral_detail_x4.yaml": (8, 1, 8),
+        }
+        for path, channels in expected.items():
+            with self.subTest(path=path):
+                config = load_config(path, prefer_existing=False)
+                model = config["model"]
+                self.assertEqual(
+                    (model["inp_channels"], model["ref_channels"], model["out_channels"]),
+                    channels,
+                )
+                self.assertEqual(model["fusion_mode"], "spectral_detail")
+                self.assertTrue(model["g_spec"])
+                self.assertTrue(model["g_detail"])
+                self.assertTrue(model["use_reference"])
+                self.assertEqual(config["data"]["reference_mode"], "paired")
 
 
 if __name__ == "__main__":

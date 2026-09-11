@@ -23,6 +23,7 @@
 ```bash
 bash scripts/shortcuts/train/swinir_hrms_scd_sr_x4.sh
 bash scripts/shortcuts/train/refsrwkv_hrms_scd_ref_x4.sh --print
+bash scripts/shortcuts/train/refsrwkv_pancollection_wv3.sh --print
 bash scripts/shortcuts/train/show_commands.sh
 ```
 
