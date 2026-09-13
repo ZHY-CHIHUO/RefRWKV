@@ -11,17 +11,10 @@
 | `rcan_hrms_scd_sr_x4.sh` | HRMS-SCD x4 RCAN 单图 SR。 |
 | `hat_hrms_scd_sr_x4.sh` | HRMS-SCD x4 HAT 单图 SR。 |
 | `mambairv2_hrms_scd_sr_x4.sh` | HRMS-SCD x4 MambaIRv2 单图 SR。 |
-| `refsrwkv_hrms_scd_sr_x4.sh` | RefSRWKV-SR，`lr_up` 自参考。 |
-| `refsrwkv_hrms_scd_ref_x4.sh` | 从头训练新 RefSRWKV `spectral_detail`，读取 HRMS-SCD 配对真实 `Ref/`。 |
-| `refsrwkv_hrms_scd_hr_native_x4.sh` | 从头训练 HRMS-SCD `hr_native` 三分支模型，Ref 与 bicubic LR 全程在 HR 网格交互。 |
 | `ttsr_hrms_scd_ref_x4.sh` | TTSR 真实参考图 RefSR。 |
 | `masa_sr_hrms_scd_ref_x4.sh` | MASA-SR 真实参考图 RefSR。 |
 | `datsr_hrms_scd_ref_x4.sh` | DATSR 真实参考图 RefSR。 |
-| `refsrwkv_wuhan.sh` | Wuhan 四通道 temporal-pair 训练，网络倍率 x1。 |
-| `refsrwkv_pancollection_wv3.sh` | 从头训练新 `spectral_detail` 全色多光谱融合，8 通道 MS LR + 1 通道 PAN Ref，x4。 |
-| `refsrwkv_pancollection_wv3_hr_native.sh` | 从头训练 WV3 `hr_native` 全色融合，8 通道 MS LR + 1 通道 PAN Ref，输出 8 通道 HR。 |
 | `rdm_refsr_hrms_scd_x4.sh` | RDM-STF 时空参考超分（HRMS，同谱段不同时相）。 |
-| `rdm_refsr_pancollection_wv3.sh` | 旧 `rdm_refsr` 宽网络 WV3 全色融合（约 23M，兼容入口）。 |
 | `rdm_refsr_pancollection_wv3_pan.sh` | RDM-PAN WV3 全色融合（约 1.3M，对齐 FusionMamba 容量和 L1 训练协议）。 |
 | `fusion_mamba_pancollection_wv3_official.sh` | FusionMamba 官方 WV3 训练协议（64x64 crop、L1、Adam、StepLR、500 epoch）。 |
 
@@ -32,7 +25,7 @@
 bash scripts/shortcuts/train/swinir_hrms_scd_sr_x4.sh
 
 # 只打印最终命令
-bash scripts/shortcuts/train/refsrwkv_hrms_scd_ref_x4.sh --print
+bash scripts/shortcuts/train/rdm_refsr_pancollection_wv3_pan.sh --print
 
 # 打印所有训练命令
 bash scripts/shortcuts/train/show_commands.sh

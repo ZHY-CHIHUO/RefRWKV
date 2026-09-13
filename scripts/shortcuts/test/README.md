@@ -8,7 +8,7 @@
 
 ```bash
 bash scripts/shortcuts/test/run_test.sh \
-  experiments/train/refsr/refsrwkv/hrms_scd/x4/hrms_scd_trefsr_x4/checkpoints/last.ckpt
+  experiments/train/<task>/<model>/<dataset>/x<scale>/<run>/checkpoints/last.ckpt
 
 bash scripts/shortcuts/test/run_test.sh <checkpoint> \
   --split test_easy --metrics psnr ssim --no-save-images
