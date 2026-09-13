@@ -2,11 +2,11 @@
 # loader/configuration for the selected HSI-MSI benchmark.
 base:
   - ../../common/rdm_refsr.yaml
-  - ../../models/refsr/rdm_refsr.yaml
+  - ../../models/refsr/rdm_mhf.yaml
 
 task: refsr
 run:
-  name: hsi_msi_rdm_refsr_x4
+  name: hsi_msi_rdm_mhf_x4
   scale: 4
   lr_patch: 32
 
@@ -18,7 +18,7 @@ model:
   ref_channels: 4
   out_channels: 31
   target_channels: 31
-  reference_kind: hsi_msi
+  reference_kind: mhf
   alignment: true
   # Replace with the sensor's 31x4 spectral response when available.  The
   # uniform fallback keeps the example runnable but is not a calibrated SRF.

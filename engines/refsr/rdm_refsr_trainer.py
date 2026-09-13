@@ -35,7 +35,7 @@ class RDMRefSRTrainer(BaseTrainer):
 
     def __init__(self, model: RDMRefSR, config: Mapping[str, Any]) -> None:
         if not isinstance(model, RDMRefSR):
-            raise TypeError("RDMRefSRTrainer requires model.name=rdm_refsr")
+            raise TypeError("RDMRefSRTrainer requires an RDM model")
         validate_refsr_reference_contract(config)
         data = config.get("data", {})
         if not isinstance(data, Mapping):
@@ -84,7 +84,7 @@ class RDMRefSRTrainer(BaseTrainer):
 
         model = build_refsr_model(config["model"], scale=int(data["scale"]))
         if not isinstance(model, RDMRefSR):
-            raise TypeError("model.name must resolve to rdm_refsr")
+            raise TypeError("model.name must resolve to rdm_pan, rdm_stf, rdm_mhf, or rdm_refsr")
         return cls(model, config)
 
     def _unpack(self, batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -221,7 +221,7 @@ class RDMRefSRTrainer(BaseTrainer):
             terms["sensor"] = (
                 self._highpass(pred_intensity) - self._highpass(ref_intensity)
             ).abs().mean()
-        if self.change_weight and self.model.reference_kind in {"temporal", "hsi_msi", "msi_hsi"}:
+        if self.change_weight and self.model.reference_kind in {"stf", "mhf"}:
             change = aux.get("change")
             if change is not None:
                 change = F.interpolate(change, size=prediction.shape[-2:], mode="bilinear", align_corners=False)

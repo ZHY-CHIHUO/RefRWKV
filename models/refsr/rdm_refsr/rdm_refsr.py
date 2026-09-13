@@ -36,16 +36,19 @@ _REF_MODE_ALIASES = {
     "pan": "pan",
     "pansharpening": "pan",
     "pan_guided": "pan",
-    "temporal": "temporal",
-    "cross_temporal": "temporal",
-    "hrms": "temporal",
-    "hsi_msi": "hsi_msi",
+    "stf": "stf",
+    "temporal": "stf",
+    "cross_temporal": "stf",
+    "hrms": "stf",
+    "mhf": "mhf",
+    "hsi_msi": "mhf",
     # Keep one canonical branch for both spellings used in HSI/MSI papers.
-    "msi_hsi": "hsi_msi",
-    "hyperspectral_multispectral": "hsi_msi",
+    "msi_hsi": "mhf",
+    "hyperspectral_multispectral": "mhf",
     "generic": "generic",
     "aligned": "generic",
 }
+_CANONICAL_REFERENCE_KINDS = ("pan", "stf", "mhf", "generic")
 
 # The bundled segmented Bi-WKV kernel uses 32 token segments.  Its current
 # tail aggregation is exact for one segment but can accumulate an error when
@@ -73,9 +76,7 @@ def normalize_reference_kind(value: Any) -> str:
     try:
         return _REF_MODE_ALIASES[normalized]
     except KeyError as exc:
-        options = ", ".join(
-            sorted({"pan", "temporal", "hsi_msi", "msi_hsi", "generic"})
-        )
+        options = ", ".join(_CANONICAL_REFERENCE_KINDS)
         raise ValueError(
             f"reference kind must be one of {options}, got {value!r}"
         ) from exc
@@ -606,6 +607,7 @@ class HybridStateBlock(nn.Module):
         mamba_d_conv: int,
         mamba_expand: int,
         allow_cpu_mamba: bool,
+        high_order: bool = True,
     ) -> None:
         super().__init__()
         self.channels = channels
@@ -615,7 +617,7 @@ class HybridStateBlock(nn.Module):
             channels,
             shuffle_prob=shuffle_prob,
             shuffle_block=shuffle_block,
-            high_order=True,
+            high_order=high_order,
         )
         self.use_mamba = bool(use_mamba)
         self.mamba = (
@@ -857,6 +859,8 @@ class RDMRefSR(nn.Module):
     Parameters intentionally expose ``target_channels`` independently from
     ``ref_channels``.  This supports LR-HSI + HR-MSI as well as PAN and
     cross-temporal RGB without assuming a channel ordering relationship.
+    ``channel_multipliers`` keeps the four-stage U-Net but can cap the
+    bottleneck at FusionMamba-like widths for a dedicated PAN recipe.
     """
 
     def __init__(
@@ -868,12 +872,14 @@ class RDMRefSR(nn.Module):
         dim: int = 48,
         depths: Sequence[int] = (2, 2, 3, 4),
         decoder_depths: Sequence[int] = (3, 2, 2),
+        channel_multipliers: Sequence[int] = (1, 2, 4, 8),
         scale: int = 4,
-        reference_kind: str = "temporal",
+        reference_kind: str = "stf",
         mamba_stages: Sequence[str] = ("enc2", "latent", "dec2"),
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
+        high_order: bool = True,
         allow_cpu_mamba: bool = True,
         shuffle_prob: float = 0.15,
         shuffle_block: int = 4,
@@ -916,6 +922,19 @@ class RDMRefSR(nn.Module):
             _positive_int(value, "decoder_depths item") < 1 for value in decoder_depths
         ):
             raise ValueError("decoder_depths must contain three positive integers")
+        multipliers = tuple(
+            _positive_int(value, "channel_multipliers item")
+            for value in channel_multipliers
+        )
+        if len(multipliers) != 4:
+            raise ValueError("channel_multipliers must contain four positive integers")
+        channels = tuple(dim * value for value in multipliers)
+        for index, width in enumerate(channels):
+            if width < 16 or width % 16:
+                raise ValueError(
+                    "dim * channel_multipliers must be a multiple of 16 and >= 16 "
+                    f"at stage {index}, got {width}"
+                )
         if isinstance(mamba_stages, (str, bytes)):
             raise ValueError("mamba_stages must be a sequence of stage names")
         valid_stages = {
@@ -959,7 +978,7 @@ class RDMRefSR(nn.Module):
         )
         kind = normalize_reference_kind(reference_kind)
         if alignment is None:
-            alignment = kind in {"temporal", "hsi_msi", "msi_hsi"}
+            alignment = kind in {"stf", "mhf"}
         if not isinstance(alignment, bool):
             raise ValueError("alignment must be bool or None")
         if max_offset <= 0 or not math.isfinite(float(max_offset)):
@@ -968,6 +987,8 @@ class RDMRefSR(nn.Module):
             raise ValueError("use_reference must be bool")
         if not isinstance(clamp_output, bool):
             raise ValueError("clamp_output must be bool")
+        if not isinstance(high_order, bool):
+            raise ValueError("high_order must be bool")
         for name, value in (
             ("mamba_d_state", mamba_d_state),
             ("mamba_d_conv", mamba_d_conv),
@@ -1000,6 +1021,8 @@ class RDMRefSR(nn.Module):
         self.detail_injection_stages = normalized_detail_injection_stages
         self.match_grid = match_grid
         self.temporal_match_confidence_floor = float(temporal_match_confidence_floor)
+        self.channel_multipliers = multipliers
+        self.high_order = bool(high_order)
 
         self.ms_stem = nn.Sequential(
             nn.Conv2d(inp_channels, dim, 3, padding=1, bias=False),
@@ -1063,26 +1086,32 @@ class RDMRefSR(nn.Module):
                     "response_matrix must contain finite non-negative values"
                 )
         self.reference_lift_logits = nn.Parameter(response.clamp_min(1.0e-4).log())
-        self.radiometric = nn.Sequential(
-            nn.Linear(4, 32),
-            nn.GELU(),
-            nn.Linear(32, 2),
-        )
-        nn.init.zeros_(self.radiometric[-1].weight)
-        nn.init.zeros_(self.radiometric[-1].bias)
-        self.offset_net = nn.Sequential(
-            nn.Conv2d(2, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 2, 3, padding=1),
-        )
-        nn.init.zeros_(self.offset_net[-1].weight)
-        nn.init.zeros_(self.offset_net[-1].bias)
+        if kind == "stf":
+            # Cross-date radiometric drift is an STF problem; PAN/MHF skip it.
+            self.radiometric = nn.Sequential(
+                nn.Linear(4, 32),
+                nn.GELU(),
+                nn.Linear(32, 2),
+            )
+            nn.init.zeros_(self.radiometric[-1].weight)
+            nn.init.zeros_(self.radiometric[-1].bias)
+        else:
+            self.radiometric = None
+        if alignment:
+            self.offset_net = nn.Sequential(
+                nn.Conv2d(2, 32, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(32, 2, 3, padding=1),
+            )
+            nn.init.zeros_(self.offset_net[-1].weight)
+            nn.init.zeros_(self.offset_net[-1].bias)
+        else:
+            self.offset_net = None
         self.reliability = ReliabilityField(
             kind,
             temporal_match_confidence_floor=self.temporal_match_confidence_floor,
         )
 
-        channels = (dim, dim * 2, dim * 4, dim * 8)
         self.enc0 = self._make_stage(
             "enc0",
             channels[0],
@@ -1194,20 +1223,7 @@ class RDMRefSR(nn.Module):
             if isinstance(module, SharedDirectionalRWKV):
                 nn.init.zeros_(module.direction_gate.weight)
                 nn.init.zeros_(module.direction_gate.bias)
-        # Keep the residual head close to bicubic without making it a dead
-        # branch.  Exact zero initialization would yield zero gradients for
-        # the entire LR/RWKV/Mamba trunk until a separate bias was learned.
-        for module in (self.synthesis.low_delta, self.synthesis.detail_delta):
-            nn.init.normal_(module.weight, std=1.0e-4)
-            nn.init.zeros_(module.bias)
-        nn.init.normal_(self.synthesis.reference_detail.weight, std=5.0e-3)
-        nn.init.constant_(self.synthesis.band_gate.bias, -0.5)
-        nn.init.constant_(self.synthesis.response_gate.bias, -1.0)
-        nn.init.constant_(self.synthesis.reference_scale, 0.10)
-        nn.init.constant_(self.synthesis.response_detail_scale, 0.03)
-        for injector in (self.inject_dec1, self.inject_coeff):
-            nn.init.normal_(injector.detail.weight, std=1.0e-3)
-            nn.init.constant_(injector.alpha, 0.05)
+        self._init_reference_residuals()
 
     def _make_stage(
         self,
@@ -1232,10 +1248,37 @@ class RDMRefSR(nn.Module):
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
                 allow_cpu_mamba=allow_cpu_mamba,
+                high_order=self.high_order,
             )
             for _ in range(depth)
         ]
         return Stage(blocks)
+
+    def _init_reference_residuals(self) -> None:
+        """Restore reference residuals after the generic convolution init.
+
+        ``apply(_init_weights)`` zeroes every conv bias, including the
+        reliability head.  PAN is co-registered, so it starts with a usable
+        residual; temporal/HSI-MSI stay close to bicubic until the matcher
+        and reliability field have evidence.
+        """
+        pan = self.reference_kind == "pan"
+        nn.init.constant_(self.reliability.net[-1].bias, 0.0 if pan else -1.0)
+        nn.init.constant_(self.reliability.change_net[-1].bias, -1.0)
+        query_std = 1.0e-3 if pan else 1.0e-4
+        for module in (self.synthesis.low_delta, self.synthesis.detail_delta):
+            nn.init.normal_(module.weight, std=query_std)
+            nn.init.zeros_(module.bias)
+        nn.init.normal_(
+            self.synthesis.reference_detail.weight, std=2.0e-2 if pan else 5.0e-3
+        )
+        nn.init.constant_(self.synthesis.band_gate.bias, 0.0 if pan else -0.5)
+        nn.init.constant_(self.synthesis.response_gate.bias, -0.5 if pan else -1.0)
+        nn.init.constant_(self.synthesis.reference_scale, 0.35 if pan else 0.10)
+        nn.init.constant_(self.synthesis.response_detail_scale, 0.08 if pan else 0.03)
+        for injector in (self.inject_dec1, self.inject_coeff):
+            nn.init.normal_(injector.detail.weight, std=2.0e-2 if pan else 1.0e-3)
+            nn.init.constant_(injector.alpha, 0.25 if pan else 0.05)
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -1342,7 +1385,7 @@ class RDMRefSR(nn.Module):
         ref_low_raw, ref_detail_raw, _ = haar_dwt2d(ref)
         query_intensity = self._query_intensity(lr, output_size)
         ref_intensity = _resize(self._reference_intensity(ref), output_size)
-        if self.reference_kind == "temporal":
+        if self.reference_kind == "stf":
             stats = torch.cat(
                 (
                     query_intensity.mean(dim=(-2, -1)),
@@ -1543,7 +1586,7 @@ class RDMRefSR(nn.Module):
             response_detail=reference["response_detail"],
         )
         if self.clamp_output:
-            output = output.clamp(-1.0, 1.0)
+            output = output.clamp(0.0, 1.0)
         if not return_aux:
             return output
         return output, {
@@ -1739,7 +1782,7 @@ class ReliabilityField(nn.Module):
             change = torch.sigmoid(
                 self.change_net(torch.cat((low_difference, (qmag - rmag).abs()), dim=1))
             )
-            if self.reference_kind == "temporal":
+            if self.reference_kind == "stf":
                 prior = prior * (1.0 - change)
         # A co-registered sensor reference (PAN or MSI) should not be muted
         # solely because the learned matcher is still untrained.  Temporal
@@ -1747,9 +1790,9 @@ class ReliabilityField(nn.Module):
         # and scene change are genuine failure modes.
         if self.reference_kind == "pan":
             match_factor = 0.5 + 0.5 * match_confidence
-        elif self.reference_kind == "hsi_msi":
+        elif self.reference_kind == "mhf":
             match_factor = 0.25 + 0.75 * match_confidence
-        elif self.reference_kind == "temporal":
+        elif self.reference_kind == "stf":
             # Query/key features are unaligned at initialization, so entropy
             # confidence alone collapses every reference path to nearly zero.
             # Apply the floor only after the temporal change prior: changed
@@ -1781,13 +1824,80 @@ class HaarIDWT2D(nn.Module):
         return haar_idwt2d(low, detail, output_size)
 
 
+class RDMPan(RDMRefSR):
+    """MS LR + PAN HR pansharpening specialist.
+
+    Capacity and training contract follow FusionMamba: dim=32, 32-64-64-128
+    stages, no temporal alignment, and a usable reference residual at init.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        kind = kwargs.get("reference_kind")
+        if kind is not None and normalize_reference_kind(kind) != "pan":
+            raise ValueError(
+                "RDMPan is the pansharpening model; use rdm_stf or rdm_mhf"
+            )
+        for key, value in _PAN_DEFAULTS.items():
+            kwargs.setdefault(key, value)
+        kwargs["reference_kind"] = "pan"
+        super().__init__(**kwargs)
+
+
+class RDMStf(RDMRefSR):
+    """Same-band spatio-temporal fusion specialist (HRMS, Wuhan)."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        kind = kwargs.get("reference_kind")
+        if kind is not None and normalize_reference_kind(kind) != "stf":
+            raise ValueError(
+                "RDMStf is the spatio-temporal model; use rdm_pan or rdm_mhf"
+            )
+        kwargs.setdefault("alignment", True)
+        kwargs["reference_kind"] = "stf"
+        super().__init__(**kwargs)
+
+
+class RDMMhf(RDMRefSR):
+    """Multispectral/hyperspectral fusion specialist (LR-HSI + HR-MSI)."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        kind = kwargs.get("reference_kind")
+        if kind is not None and normalize_reference_kind(kind) != "mhf":
+            raise ValueError(
+                "RDMMhf is the MS/HS fusion model; use rdm_pan or rdm_stf"
+            )
+        kwargs.setdefault("alignment", True)
+        kwargs["reference_kind"] = "mhf"
+        super().__init__(**kwargs)
+
+
+_PAN_DEFAULTS = {
+    "dim": 32,
+    "depths": (1, 1, 1, 1),
+    "decoder_depths": (1, 1, 1),
+    "channel_multipliers": (1, 2, 2, 4),
+    "mamba_stages": ("enc2", "latent"),
+    "reference_condition_stages": ("enc1", "enc2", "latent", "dec1", "coeff"),
+    "detail_injection_stages": ("dec1", "coeff"),
+    "mamba_d_state": 8,
+    "mamba_d_conv": 4,
+    "mamba_expand": 1,
+    "high_order": False,
+    "shuffle_prob": 0.0,
+    "alignment": False,
+}
+
+
 __all__ = [
     "FourDirectionMamba",
     "HaarDWT2D",
     "HaarIDWT2D",
     "HybridStateBlock",
     "QShift",
+    "RDMMhf",
+    "RDMPan",
     "RDMRefSR",
+    "RDMStf",
     "ReliabilityField",
     "SharedDirectionalRWKV",
     "TrueMambaScan",

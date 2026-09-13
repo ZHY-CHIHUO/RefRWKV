@@ -1,0 +1,32 @@
+# RDM-MHF: multispectral/hyperspectral fusion (LR-HSI + HR-MSI).
+# Architecture currently shares the STF-width U-Net; the specialist is the
+# response_matrix lift and MHF reliability, not the PAN slim backbone.
+model:
+  name: rdm_mhf
+  family: rdm
+  variant: rdm_mhf
+  implementation: dual_grid_rwkv_mamba
+  inp_channels: 31
+  out_channels: 31
+  ref_channels: 4
+  target_channels: 31
+  dim: 48
+  depths: [2, 2, 3, 4]
+  decoder_depths: [3, 2, 2]
+  reference_kind: mhf
+  mamba_stages: [enc2, latent, dec2]
+  reference_condition_stages: [enc2, latent, dec1, coeff]
+  detail_injection_stages: [dec1, coeff]
+  mamba_d_state: 16
+  mamba_d_conv: 4
+  mamba_expand: 2
+  allow_cpu_mamba: true
+  shuffle_prob: 0.15
+  shuffle_block: 4
+  match_window: 5
+  match_dim: 16
+  match_grid: coefficient
+  alignment: true
+  max_offset: 3.0
+  use_reference: true
+  clamp_output: true

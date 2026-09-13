@@ -1,0 +1,36 @@
+# Dedicated PAN RDM on reduced-resolution WV3.
+# 8-band MS LR + 1-band PAN HR -> 8-band HR, capacity matched to FusionMamba.
+base:
+  - ../../common/rdm_pan.yaml
+  - ../../models/refsr/rdm_pan.yaml
+
+dataset:
+  config: ../../datasets/refsr/pancollection_wv3.yaml
+
+task: refsr
+run:
+  name: pancollection_wv3_rdm_pan_x4
+  scale: 4
+  lr_patch: 16
+
+data:
+  root: data/refsr/PanCollection/training_wv3
+  reference_mode: paired
+  lr_source: stored
+  lr_native_scale: 4
+  lr_provenance: sensor
+  value_scale: 2047.0
+  patch_size: 64
+  batch_size: 32
+  val_batch_size: 16
+  max_samples_val: null
+
+model:
+  # Neutral broad PAN prior; replace with calibrated WV3 band response when
+  # available.  The logits remain learnable during training.
+  sensor_response: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+test:
+  splits: [test]
+  metrics: [psnr, ssim]
+  save_images: false

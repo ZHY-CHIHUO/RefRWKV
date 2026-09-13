@@ -9,20 +9,17 @@
 | `sr/` | 单图 SR registry、SwinIR，以及 Bicubic、EDSR、RCAN、HAT、MambaIRv2 compatibility baseline。 |
 | `refsr/` | direct RefSR registry、RDMRefSR（RWKV+Mamba）、RefSRWKV、TTSR、MASA-SR、DATSR 和 RefDiffRWKV。 |
 
-SR 模型通常提供 `forward(lr)`；direct RefSR 模型提供 `forward(lr, ref)`。模型输入统一遵守项目的 `[-1, 1]` tensor 契约，Bicubic 是无参数的 `reference_only` 评测基线。
+SR 模型通常提供 `forward(lr)`；direct RefSR 模型提供 `forward(lr, ref)`。模型输入统一遵守项目的 `[0, 1]` tensor 契约，Bicubic 是无参数的 `reference_only` 评测基线。
 
 ## 模型家族
 
 - `models/sr/swinir/`：项目现有 SwinIR 网络和 adapter。
 - `models/sr/baselines.py`、`baseline_adapters.py`：轻量单图对比模型和 registry 适配。
 - `models/refsr/refsrwkv/`：参考图超分 RWKV，支持 `paired` 真实 Ref 和 `lr_up` 自参考两种数据模式。
-- `models/refsr/rdm_refsr.py`：RDMRefSR 纯血双网格模型。LR/query 负责低频和
-  光谱内容，HR Ref 固定 Haar 分解后的高频经过局部匹配与可靠性门控；共享四方向
-  Bi-WKV 建模内容长程依赖，`enc2/latent/dec2` 使用 `rwkv7` 中官方
-  `mamba_ssm.Mamba` selective scan。`reference_kind` 显式区分 `pan`、
-  `temporal` 和 `hsi_msi`，因此不把 PAN 当作普通 RGB 参考。默认
-  `reference_condition_stages=[enc2,latent,dec1,coeff]`、
-  `detail_injection_stages=[dec1,coeff]`，可在消融时显式扩大或收窄参考注入位置。
+- `models/refsr/rdm_refsr/`：RDM 双网格家族，三个独立模型。`rdm_pan` 做
+  MS+PAN 全色融合（FusionMamba 量级宽度），`rdm_stf` 做同谱段时空融合，
+  `rdm_mhf` 做 MS/HS 融合。主干仍是 Haar 高频 + 可靠性门控 + Bi-WKV，并在
+  指定 stage 使用官方 `mamba_ssm.Mamba`。
 - `models/refsr/baselines.py`、`baseline_adapters.py`：TTSR、MASA-SR、DATSR 的统一 direct RefSR 适配。
 - `models/refsr/RefDiffRWKV/`：扩散生成器、SR prior、参考适配器、判别器和采样器。
 
@@ -65,16 +62,14 @@ Python 构造函数中的 `fusion_mode` 默认为 `legacy`，与已有 checkpoin
 
 ## RDMRefSR 物理模式
 
-RDMRefSR 不根据通道数猜任务，而是由 `model.reference_kind` 选择参考适配器：
+RDM 不根据通道数猜任务，而是三个独立模型：
 
 ```text
-pan      : LR/MS + HR PAN -> HR/MS；PAN 只约束传感器响应投影的空间高频
-temporal : LR 目标时相 + HR 参考时相 -> HR 目标时相；变化图抑制参考注入
-hsi_msi  : LR HSI + HR MSI -> HR HSI；response_matrix 做 MSI->HSI 光谱提升
+rdm_pan : LR/MS + HR PAN -> HR/MS；传感器响应投影空间高频，无时相对齐
+rdm_stf : LR 目标时相 + HR 参考时相 -> HR 目标时相；变化图抑制参考注入
+rdm_mhf : LR HSI + HR MSI -> HR HSI；response_matrix 做 MSI->HSI 光谱提升
 ```
 
-三种模式共用 RWKV/Mamba 主干和 Haar 合成头，但可靠性、配准和物理损失不同。
-这也是为什么 HSI-MSI 需要换的是 reference adapter/损失与通道配置，而不是
-简单把 PAN 的单通道流程复制过去。合成头另有一条按
-`response_matrix`（PAN 使用可学习 `sensor_response`）投影的直接 Haar 高频残差，
-再经过 band gate 和 reliability；因此参考图不会直接覆盖 LR 的低频/光谱内容。
+PAN 版有自己的宽度和初始化（`configs/models/refsr/rdm_pan.yaml`，约 1.3M），
+不要把 STF 的 23M U-Net 拿去和 FusionMamba 比。STF/MHF 目前仍用较宽主干，
+后续再各自瘦身。

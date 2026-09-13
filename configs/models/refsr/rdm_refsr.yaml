@@ -1,6 +1,6 @@
-# RDMRefSR: dual-grid Haar reference adapter + shared Bi-WKV/Mamba stages.
-# The reference_kind is a physical-data declaration, not an inference guess:
-# pan = MS LR + PAN HR, temporal = cross-date HRMS, hsi_msi = LR-HSI + HR-MSI.
+# Compatibility entry for the shared RDM backbone.
+# Prefer the task specialists: rdm_pan (pansharpening), rdm_stf (HRMS/Wuhan),
+# rdm_mhf (MS/HS fusion).  reference_kind aliases: temporal->stf, hsi_msi->mhf.
 model:
   name: rdm_refsr
   family: refsr
@@ -13,7 +13,7 @@ model:
   dim: 48
   depths: [2, 2, 3, 4]
   decoder_depths: [3, 2, 2]
-  reference_kind: temporal
+  reference_kind: stf
   mamba_stages: [enc2, latent, dec2]
   # Reference statistics enter the semantic bottleneck and the final
   # reconstruction stages only; this prevents a changed HR reference from

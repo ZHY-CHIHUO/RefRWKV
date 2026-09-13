@@ -17,12 +17,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from engines.refsr import RDMRefSRTrainer  # noqa: E402
 from models.refsr import build_model, list_models  # noqa: E402
 from models.refsr.rdm_refsr.rdm_refsr import (  # noqa: E402
+    RDMMhf,
+    RDMPan,
     RDMRefSR,
+    RDMStf,
     SharedDirectionalRWKV,
     TrueMambaScan,
     _reference_biwkv,
     haar_dwt2d,
     haar_idwt2d,
+    normalize_reference_kind,
 )
 from runtime.config import load_config, validate_config  # noqa: E402
 from runtime.tiling import tiled_forward  # noqa: E402
@@ -60,8 +64,10 @@ class RDMRefSRTests(unittest.TestCase):
 
     def test_three_reference_modes_and_independent_channels(self) -> None:
         cases = (
+            ("stf", 3, 3, 3),
             ("temporal", 3, 3, 3),
             ("pan", 8, 1, 8),
+            ("mhf", 31, 4, 31),
             ("hsi_msi", 31, 4, 31),
         )
         for kind, inp, ref_channels, out_channels in cases:
@@ -137,14 +143,17 @@ class RDMRefSRTests(unittest.TestCase):
     def test_initial_prediction_is_bicubic_plus_small_residual(self) -> None:
         torch.manual_seed(3)
         model = _compact_model()
-        lr = torch.rand(1, 3, 4, 5) * 2.0 - 1.0
-        ref = torch.rand(1, 3, 8, 10) * 2.0 - 1.0
-        expected = F.interpolate(lr, size=(8, 10), mode="bicubic", align_corners=False).clamp(-1, 1)
+        lr = torch.rand(1, 3, 4, 5)
+        ref = torch.rand(1, 3, 8, 10)
+        expected = F.interpolate(lr, size=(8, 10), mode="bicubic", align_corners=False).clamp(0, 1)
         output = model(lr, ref)
         self.assertLess(float((output - expected).abs().mean()), 5.0e-3)
 
     def test_registry_and_config_profile(self) -> None:
         self.assertIn("rdm_refsr", list_models())
+        self.assertIn("rdm_pan", list_models())
+        self.assertIn("rdm_stf", list_models())
+        self.assertIn("rdm_mhf", list_models())
         config = load_config("configs/runs/rdm_refsr/hrms_scd_x4.yaml", prefer_existing=False)
         validate_config(config, require_data=False)
         compact = copy.deepcopy(config["model"])
@@ -259,6 +268,81 @@ class RDMRefSRTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(value).all())
         value.square().mean().backward()
         self.assertGreater(float(image.grad.abs().sum()), 0.0)
+
+    def test_channel_multipliers_change_stage_width(self) -> None:
+        model = _compact_model(channel_multipliers=(1, 1, 2, 4), high_order=False)
+        self.assertEqual(model.channel_multipliers, (1, 1, 2, 4))
+        self.assertEqual(model.enc0.blocks[0].channels, 16)
+        self.assertEqual(model.enc1.blocks[0].channels, 16)
+        self.assertEqual(model.enc2.blocks[0].channels, 32)
+        self.assertEqual(model.latent.blocks[0].channels, 64)
+        self.assertFalse(model.latent.blocks[0].rwkv.high_order)
+
+    def test_invalid_channel_multipliers_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            _compact_model(channel_multipliers=(1, 2, 4))
+        with self.assertRaises(ValueError):
+            _compact_model(dim=16, channel_multipliers=(1, 2, 3, 4))
+
+    def test_reference_kind_aliases_map_to_pan_stf_mhf(self) -> None:
+        self.assertEqual(normalize_reference_kind("temporal"), "stf")
+        self.assertEqual(normalize_reference_kind("hrms"), "stf")
+        self.assertEqual(normalize_reference_kind("hsi_msi"), "mhf")
+        self.assertEqual(normalize_reference_kind("pansharpening"), "pan")
+        self.assertIsInstance(RDMPan(inp_channels=8, ref_channels=1, out_channels=8, dim=16, depths=(1,1,1,1), decoder_depths=(1,1,1), mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, match_window=3, match_dim=4, shuffle_prob=0.0), RDMPan)
+        self.assertEqual(RDMStf(dim=16, depths=(1,1,1,1), decoder_depths=(1,1,1), mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, match_window=3, match_dim=4, shuffle_prob=0.0).reference_kind, "stf")
+        self.assertEqual(RDMMhf(inp_channels=8, ref_channels=4, out_channels=8, dim=16, depths=(1,1,1,1), decoder_depths=(1,1,1), mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, match_window=3, match_dim=4, shuffle_prob=0.0).reference_kind, "mhf")
+        with self.assertRaises(ValueError):
+            RDMPan(reference_kind="stf")
+
+    def test_pan_residual_init_is_stronger_than_temporal(self) -> None:
+        temporal = _compact_model()
+        pan = _compact_model(
+            inp_channels=8,
+            ref_channels=1,
+            out_channels=8,
+            target_channels=8,
+            reference_kind="pan",
+        )
+        self.assertAlmostEqual(temporal.inject_dec1.alpha.detach().mean().item(), 0.05, places=5)
+        self.assertAlmostEqual(pan.inject_dec1.alpha.detach().mean().item(), 0.25, places=5)
+        self.assertAlmostEqual(temporal.synthesis.reference_scale.detach().mean().item(), 0.10, places=5)
+        self.assertAlmostEqual(pan.synthesis.reference_scale.detach().mean().item(), 0.35, places=5)
+        self.assertAlmostEqual(temporal.reliability.net[-1].bias.detach().item(), -1.0, places=5)
+        self.assertAlmostEqual(pan.reliability.net[-1].bias.detach().item(), 0.0, places=5)
+        self.assertAlmostEqual(temporal.synthesis.band_gate.bias.detach().mean().item(), -0.5, places=5)
+        self.assertAlmostEqual(pan.synthesis.band_gate.bias.detach().mean().item(), 0.0, places=5)
+
+    def test_pan_slim_config_matches_fusion_mamba_capacity(self) -> None:
+        from models.refsr.fusion_mamba.adapter import FusionMambaRefSR
+
+        config = load_config(
+            "configs/runs/rdm_refsr/pancollection_wv3_pan_x4.yaml",
+            prefer_existing=False,
+        )
+        validate_config(config, require_data=False)
+        self.assertEqual(config["model"]["name"], "rdm_pan")
+        model = build_model(config["model"], scale=4)
+        self.assertIsInstance(model, RDMPan)
+        self.assertEqual(model.reference_kind, "pan")
+        self.assertEqual(model.channel_multipliers, (1, 2, 2, 4))
+        self.assertEqual(model.dim, 32)
+        self.assertFalse(model.high_order)
+        self.assertEqual(
+            model.reference_condition_stages,
+            frozenset({"enc1", "enc2", "latent", "dec1", "coeff"}),
+        )
+        pan_params = sum(parameter.numel() for parameter in model.parameters())
+        fusion = FusionMambaRefSR(dim=32, pan_dim=1, ms_dim=8, H=64, W=64, scale=4)
+        fusion_params = sum(parameter.numel() for parameter in fusion.parameters())
+        self.assertLess(pan_params, 1_500_000)
+        self.assertGreater(pan_params / fusion_params, 0.8)
+        self.assertLess(pan_params / fusion_params, 2.0)
+        lr = torch.rand(1, 8, 16, 16)
+        ref = torch.rand(1, 1, 64, 64)
+        output = model(lr, ref)
+        self.assertEqual(tuple(output.shape), (1, 8, 64, 64))
+        self.assertTrue(torch.isfinite(output).all())
 
 
 if __name__ == "__main__":

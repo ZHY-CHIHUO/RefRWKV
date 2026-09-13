@@ -1,9 +1,8 @@
-"""Registry adapter for the dual-grid RDMRefSR model.
+"""Registry adapters for the three RDM specialists.
 
-The adapter intentionally filters the YAML mapping before construction.  This
-keeps runtime metadata (``family``, ``variant`` and dataset-only fields) out of
-the neural-network constructor while allowing the three physical reference
-modes to share one implementation.
+``rdm_pan``, ``rdm_stf`` and ``rdm_mhf`` are separate models with locked
+physical contracts.  ``rdm_refsr`` remains as a compatibility entry that
+still reads ``reference_kind``.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from .rdm_refsr import RDMRefSR, normalize_reference_kind
+from .rdm_refsr import RDMMhf, RDMPan, RDMRefSR, RDMStf, normalize_reference_kind
 from ..registry import RefSRModelAdapter, register_adapter
 
 
@@ -25,6 +24,7 @@ _MODEL_FIELDS = {
     "dim",
     "depths",
     "decoder_depths",
+    "channel_multipliers",
     "scale",
     "reference_kind",
     "mamba_stages",
@@ -33,6 +33,7 @@ _MODEL_FIELDS = {
     "mamba_d_state",
     "mamba_d_conv",
     "mamba_expand",
+    "high_order",
     "allow_cpu_mamba",
     "shuffle_prob",
     "shuffle_block",
@@ -48,17 +49,22 @@ _MODEL_FIELDS = {
     "clamp_output",
 }
 
+_RDM_TRAIN_NAMES = ("rdm_refsr", "rdm_pan", "rdm_stf", "rdm_mhf")
+
+
+def _filtered_kwargs(model_config: Mapping[str, Any], *, scale: int) -> dict[str, Any]:
+    kwargs = {key: value for key, value in model_config.items() if key in _MODEL_FIELDS}
+    kwargs["scale"] = int(scale)
+    return kwargs
+
 
 class RDMRefSRAdapter(RefSRModelAdapter):
-    """Build the research RDMRefSR architecture from a materialized config."""
+    """Compatibility adapter that still dispatches on ``reference_kind``."""
 
     name = "rdm_refsr"
 
     def build(self, model_config: Mapping[str, Any], *, scale: int) -> nn.Module:
-        kwargs = {key: value for key, value in model_config.items() if key in _MODEL_FIELDS}
-        # The run's data.scale is authoritative.  A stale model.scale in an
-        # inherited YAML must not silently produce a different output geometry.
-        kwargs["scale"] = int(scale)
+        kwargs = _filtered_kwargs(model_config, scale=scale)
         if "reference_kind" in kwargs:
             kwargs["reference_kind"] = normalize_reference_kind(kwargs["reference_kind"])
         return RDMRefSR(**kwargs)
@@ -69,8 +75,84 @@ class RDMRefSRAdapter(RefSRModelAdapter):
             {
                 "implementation": "dual_grid_rwkv_mamba",
                 "reference_kind": normalize_reference_kind(
-                    model_config.get("reference_kind", "temporal")
+                    model_config.get("reference_kind", "stf")
                 ),
+                "family": "rdm",
+                "official_mamba_backend": "mamba_ssm.Mamba",
+                "wkv_backend": "kernels.wkv.RUN_CUDA",
+            }
+        )
+        return result
+
+
+class RDMPanAdapter(RefSRModelAdapter):
+    """Pansharpening specialist: MS LR + PAN HR."""
+
+    name = "rdm_pan"
+
+    def build(self, model_config: Mapping[str, Any], *, scale: int) -> nn.Module:
+        kwargs = _filtered_kwargs(model_config, scale=scale)
+        kwargs.pop("reference_kind", None)
+        return RDMPan(**kwargs)
+
+    def describe(self, model_config: Mapping[str, Any], *, scale: int) -> dict[str, Any]:
+        result = super().describe(model_config, scale=scale)
+        result.update(
+            {
+                "implementation": "dual_grid_rwkv_mamba",
+                "reference_kind": "pan",
+                "family": "rdm",
+                "task": "pansharpening",
+                "official_mamba_backend": "mamba_ssm.Mamba",
+                "wkv_backend": "kernels.wkv.RUN_CUDA",
+            }
+        )
+        return result
+
+
+class RDMStfAdapter(RefSRModelAdapter):
+    """Spatio-temporal fusion specialist: same-band LR/Ref, different date/GSD."""
+
+    name = "rdm_stf"
+
+    def build(self, model_config: Mapping[str, Any], *, scale: int) -> nn.Module:
+        kwargs = _filtered_kwargs(model_config, scale=scale)
+        kwargs.pop("reference_kind", None)
+        return RDMStf(**kwargs)
+
+    def describe(self, model_config: Mapping[str, Any], *, scale: int) -> dict[str, Any]:
+        result = super().describe(model_config, scale=scale)
+        result.update(
+            {
+                "implementation": "dual_grid_rwkv_mamba",
+                "reference_kind": "stf",
+                "family": "rdm",
+                "task": "spatio_temporal_fusion",
+                "official_mamba_backend": "mamba_ssm.Mamba",
+                "wkv_backend": "kernels.wkv.RUN_CUDA",
+            }
+        )
+        return result
+
+
+class RDMMhfAdapter(RefSRModelAdapter):
+    """Multispectral/hyperspectral fusion specialist."""
+
+    name = "rdm_mhf"
+
+    def build(self, model_config: Mapping[str, Any], *, scale: int) -> nn.Module:
+        kwargs = _filtered_kwargs(model_config, scale=scale)
+        kwargs.pop("reference_kind", None)
+        return RDMMhf(**kwargs)
+
+    def describe(self, model_config: Mapping[str, Any], *, scale: int) -> dict[str, Any]:
+        result = super().describe(model_config, scale=scale)
+        result.update(
+            {
+                "implementation": "dual_grid_rwkv_mamba",
+                "reference_kind": "mhf",
+                "family": "rdm",
+                "task": "ms_hs_fusion",
                 "official_mamba_backend": "mamba_ssm.Mamba",
                 "wkv_backend": "kernels.wkv.RUN_CUDA",
             }
@@ -79,5 +161,14 @@ class RDMRefSRAdapter(RefSRModelAdapter):
 
 
 register_adapter(RDMRefSRAdapter())
+register_adapter(RDMPanAdapter())
+register_adapter(RDMStfAdapter())
+register_adapter(RDMMhfAdapter())
 
-__all__ = ["RDMRefSRAdapter"]
+__all__ = [
+    "RDMMhfAdapter",
+    "RDMPanAdapter",
+    "RDMRefSRAdapter",
+    "RDMStfAdapter",
+    "_RDM_TRAIN_NAMES",
+]

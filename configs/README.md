@@ -31,15 +31,15 @@ run 名称，不会复用旧 legacy 实验目录。
 `configs/runs/refsrwkv/pancollection_wv3_hr_native_x4.yaml`。该模式先把 LR/MS
 双三次上采样到 HR，再在 HR 网格编码和融合 Ref/PAN，输出头不再执行 PixelShuffle。
 
-RDMRefSR 是独立的纯血 RWKV+Mamba 架构，入口在 `configs/runs/rdm_refsr/`，
-不会覆盖旧 `RefSRWKV`。它使用 LR/query 双网格主干、固定 Haar 参考高频、
-可靠性门控、共享四方向 Bi-WKV，并在 `enc2/latent/dec2` 使用官方
-`mamba_ssm` selective scan。`model.reference_kind` 必须按数据物理含义显式填写
-`pan`、`temporal` 或 `hsi_msi`，不能只根据通道数自动猜测。训练可直接使用
-`scripts/shortcuts/train/rdm_refsr_*.sh`。默认参考条件只进入
-`enc2/latent/dec1/coeff`，高频残差只进入 `dec1/coeff`；对应的
-`model.reference_condition_stages` 和 `model.detail_injection_stages` 可用于
-控制消融和显存/稳定性折中。
+RDM 家族拆成三个独立模型，不要靠通道数去猜任务：
+
+- `rdm_pan`：全色融合（MS LR + PAN HR）。WV3 入口
+  `configs/runs/rdm_refsr/pancollection_wv3_pan_x4.yaml`，约 1.3M，对齐
+  FusionMamba 的 0.74M，L1 训练，PAN 残差初始化更开。
+- `rdm_stf`：时空融合（LR/Ref 谱段相同，分辨率和时相不同），如 HRMS、Wuhan。
+- `rdm_mhf`：多光谱/高光谱融合（LR-HSI + HR-MSI）。
+
+旧名 `rdm_refsr` 仍可用，`temporal`/`hsi_msi` 会分别归一化成 `stf`/`mhf`。
 
 ### `base` 覆盖顺序
 

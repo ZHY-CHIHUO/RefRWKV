@@ -1,0 +1,3 @@
+# Deprecated alias. Use configs/models/refsr/rdm_pan.yaml.
+base:
+  - rdm_pan.yaml

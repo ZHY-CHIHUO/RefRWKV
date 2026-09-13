@@ -1,4 +1,6 @@
-# Reduced-resolution WV3 pansharpening: 8-band MS LR + 1-band PAN HR -> 8-band HR.
+# Full-width RDMRefSR v2 on reduced-resolution WV3 (~23M).
+# Dedicated PAN model is rdm_pan:
+# configs/runs/rdm_refsr/pancollection_wv3_pan_x4.yaml.
 base:
   - ../../common/rdm_refsr.yaml
   - ../../models/refsr/rdm_refsr.yaml

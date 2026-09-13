@@ -34,6 +34,7 @@ shortcuts=(
   refsrwkv_pancollection_wv3_hr_native.sh
   rdm_refsr_hrms_scd_x4.sh
   rdm_refsr_pancollection_wv3.sh
+  rdm_refsr_pancollection_wv3_pan.sh
   rdm_refsr_hrms_scd_quick.sh
   rdm_refsr_pancollection_wv3_quick.sh
 )

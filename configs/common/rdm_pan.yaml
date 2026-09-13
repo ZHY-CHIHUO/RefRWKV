@@ -1,0 +1,44 @@
+# FusionMamba-aligned optimizer/loss for the dedicated PAN RDM.
+# L1 only, no temporal aux losses, official WV3 crop protocol.
+base:
+  - refsr.yaml
+
+data:
+  reference_mode: paired
+  augment: false
+  augment_ref: false
+  batch_size: 32
+  val_batch_size: 16
+  num_workers: 8
+  val_num_workers: 4
+  pin_memory: true
+
+train:
+  precision: "32"
+  max_epochs: 500
+  max_steps: -1
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 10
+  accumulate_grad_batches: 1
+  learning_rate: 0.0005
+  weight_decay: 0.0
+  adam_betas: [0.9, 0.999]
+  lr_scheduler: step
+  lr_step_size: 200
+  lr_gamma: 0.5
+  grad_clip_norm: 1.0
+  use_ema: false
+  save_top_k: 3
+  early_stopping_patience: null
+  seed: 1
+
+loss:
+  name: l1
+  ssim_weight: 0.0
+  fft_weight: 0.0
+  sam_weight: 0.0
+  wavelet_weight: 0.0
+  consistency_weight: 0.0
+  sensor_weight: 0.0
+  change_weight: 0.0
+  ref_drop_prob: 0.0

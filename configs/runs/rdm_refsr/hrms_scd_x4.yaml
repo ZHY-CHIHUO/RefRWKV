@@ -1,7 +1,7 @@
 # Cross-temporal HRMS-SCD: LR target-date MS + HR reference-date MS -> HR target.
 base:
   - ../../common/rdm_refsr.yaml
-  - ../../models/refsr/rdm_refsr.yaml
+  - ../../models/refsr/rdm_stf.yaml
   - ../../common/benchmark.yaml
 
 dataset:
@@ -9,7 +9,7 @@ dataset:
 
 task: refsr
 run:
-  name: hrms_scd_rdm_refsr_v2_x4
+  name: hrms_scd_rdm_stf_x4
   scale: 4
   lr_patch: 48
 
@@ -31,5 +31,5 @@ model:
   ref_channels: 3
   out_channels: 3
   target_channels: 3
-  reference_kind: temporal
+  reference_kind: stf
   alignment: true
