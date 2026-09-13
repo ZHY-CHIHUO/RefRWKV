@@ -292,8 +292,23 @@ class BaseTrainer(pl.LightningModule, ABC):
             )
             self._plateau_scheduler = scheduler
             return [optimizer], [{"scheduler": scheduler, "interval": "epoch", "reduce_on_plateau": False}]
+        if scheduler_name == "step":
+            # Match the StepLR schedule used by the official FusionMamba
+            # training code: decay once every ``lr_step_size`` epochs.
+            step_size = int(train.get("lr_step_size", train.get("lr_step", 200)))
+            gamma = float(train.get("lr_gamma", train.get("lr_factor", 0.5)))
+            if step_size < 1:
+                raise ValueError("train.lr_step_size must be a positive integer")
+            if not 0.0 < gamma <= 1.0:
+                raise ValueError("train.lr_gamma must be in (0, 1]")
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=step_size,
+                gamma=gamma,
+            )
+            return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}]
         if scheduler_name != "cosine":
-            raise ValueError("train.lr_scheduler must be plateau or cosine")
+            raise ValueError("train.lr_scheduler must be plateau, step, or cosine")
         max_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0) or train.get("max_steps", 100000))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max(1, max_steps), eta_min=float(train.get("lr_min", 1.0e-7))

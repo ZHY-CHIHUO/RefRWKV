@@ -22,6 +22,7 @@
 | `refsrwkv_pancollection_wv3_hr_native.sh` | 从头训练 WV3 `hr_native` 全色融合，8 通道 MS LR + 1 通道 PAN Ref，输出 8 通道 HR。 |
 | `rdm_refsr_hrms_scd_x4.sh` | RDMRefSR 纯血 RWKV+官方 Mamba 时空参考超分。 |
 | `rdm_refsr_pancollection_wv3.sh` | RDMRefSR 纯血 RWKV+官方 Mamba WV3 全色融合（8-band MS + PAN）。 |
+| `fusion_mamba_pancollection_wv3_official.sh` | FusionMamba 官方 WV3 训练协议（64x64 crop、L1、Adam、StepLR、500 epoch）。 |
 
 ## 用法
 
