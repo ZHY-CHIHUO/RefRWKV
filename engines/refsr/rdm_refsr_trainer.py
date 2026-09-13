@@ -149,7 +149,12 @@ class RDMRefSRTrainer(BaseTrainer):
             pred.square().sum(dim=1).sqrt() * truth.square().sum(dim=1).sqrt() + 1.0e-6
         )
         cosine = torch.nan_to_num(cosine, nan=1.0, posinf=1.0, neginf=-1.0)
-        return torch.acos(cosine.clamp(-1.0, 1.0)).mean()
+        # ``acos`` has an infinite derivative at +/-1.  Half/bfloat16
+        # activations can quantize nearly parallel spectra to those exact
+        # endpoints, producing Inf/NaN gradients even when the loss weight
+        # is small.  Keep a narrow finite margin around both endpoints.
+        cosine = cosine.clamp(-1.0 + 1.0e-4, 1.0 - 1.0e-4)
+        return torch.acos(cosine).mean()
 
     @staticmethod
     def _highpass(value: torch.Tensor) -> torch.Tensor:

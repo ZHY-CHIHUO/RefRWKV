@@ -234,6 +234,16 @@ class RDMRefSRTests(unittest.TestCase):
         value = trainer._train_step({"lr": lr, "hr": hr, "ref": ref}, 0)
         self.assertTrue(torch.isfinite(value))
 
+    def test_sam_boundary_has_finite_gradient(self) -> None:
+        # Parallel spectra hit cosine=1 exactly; this used to make acos'
+        # derivative infinite and poison bf16 training.
+        prediction = torch.ones(2, 3, 4, 4, requires_grad=True)
+        target = prediction.detach().clone()
+        value = RDMRefSRTrainer._sam(prediction, target)
+        self.assertTrue(torch.isfinite(value))
+        value.backward()
+        self.assertTrue(torch.isfinite(prediction.grad).all())
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the official backend test")
     def test_cuda_official_mamba_and_biwkv_backward(self) -> None:
         scan = TrueMambaScan(16, d_state=2, d_conv=2, expand=1, allow_cpu_reference=False).cuda()
