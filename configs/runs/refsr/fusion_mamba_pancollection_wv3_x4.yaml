@@ -21,13 +21,17 @@ data:
   value_scale: 2047.0
   patch_size: 64
   test_patch_size: null
-  eval_tile_size: 16
-  eval_tile_overlap: 4
+  eval_tile_size: null
+  eval_tile_overlap: 0
   batch_size: 32
   val_batch_size: 32
   num_workers: 4
   val_num_workers: 2
   max_samples_test: null
+
+model:
+  input_h: 256
+  input_w: 256
 
 test:
   splits: [test]

@@ -43,11 +43,8 @@ class FusionMambaAdapter(RefSRModelAdapter):
         configured_scale = int(model_config.get("scale", scale))
         if configured_scale != int(scale):
             configured_scale = int(scale)
-        if input_h != 64 or input_w != 64:
-            raise ValueError(
-                "FusionMamba official WV3 weights require input_h=input_w=64; "
-                f"got {input_h}x{input_w}"
-            )
+        if input_h < 1 or input_w < 1:
+            raise ValueError(f"FusionMamba input_h/input_w must be positive, got {input_h}x{input_w}")
         return FusionMambaRefSR(
             dim=dim,
             pan_dim=pan_dim,
