@@ -14,24 +14,24 @@
 | `ttsr_hrms_scd_ref_x4.sh` | TTSR 真实参考图 RefSR。 |
 | `masa_sr_hrms_scd_ref_x4.sh` | MASA-SR 真实参考图 RefSR。 |
 | `datsr_hrms_scd_ref_x4.sh` | DATSR 真实参考图 RefSR。 |
-| `rdm_refsr_hrms_scd_x4.sh` | RDM-STF 时空参考超分（HRMS，同谱段不同时相）。 |
-| `rdm_refsr_pancollection_wv3_pan.sh` | RDM-PAN WV3 全色融合（约 1.3M，对齐 FusionMamba 容量和 L1 训练协议）。 |
-| `fusion_mamba_pancollection_wv3_official.sh` | FusionMamba 官方 WV3 训练协议（64x64 crop、L1、Adam、StepLR、500 epoch）。 |
+| `fusion_mamba_pancollection_wv3.sh` | FusionMamba WV3 全色融合训练，batch 32，官方 64x64 crop / L1 / Adam / StepLR / 500 epoch。 |
+| `fusion_mamba_pancollection_wv3_official.sh` | 同上，保留官方命名入口。 |
+| `rdm_refsr_pancollection_wv3.sh` | RDM-PAN WV3 全色融合训练，batch 32，训练协议与 FusionMamba 对齐。 |
 
 ## 用法
 
 ```bash
-# 直接训练
-bash scripts/shortcuts/train/swinir_hrms_scd_sr_x4.sh
+# FusionMamba WV3
+bash scripts/shortcuts/train/fusion_mamba_pancollection_wv3.sh
+
+# RDM-PAN WV3
+bash scripts/shortcuts/train/rdm_refsr_pancollection_wv3.sh
 
 # 只打印最终命令
-bash scripts/shortcuts/train/rdm_refsr_pancollection_wv3_pan.sh --print
-
-# 打印所有训练命令
-bash scripts/shortcuts/train/show_commands.sh
+bash scripts/shortcuts/train/rdm_refsr_pancollection_wv3.sh --print
 
 # 通过统一提交入口选择脚本
-bash scripts/submit_train.sh rcan_hrms_scd_sr_x4.sh
+bash scripts/submit_train.sh rdm_refsr_pancollection_wv3.sh
 bash scripts/submit_train.sh --list
 ```
 

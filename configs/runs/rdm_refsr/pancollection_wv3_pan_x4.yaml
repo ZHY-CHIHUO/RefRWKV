@@ -22,7 +22,7 @@ data:
   value_scale: 2047.0
   patch_size: 64
   batch_size: 32
-  val_batch_size: 16
+  val_batch_size: 32
   max_samples_val: null
 
 model:

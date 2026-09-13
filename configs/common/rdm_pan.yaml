@@ -8,7 +8,7 @@ data:
   augment: false
   augment_ref: false
   batch_size: 32
-  val_batch_size: 16
+  val_batch_size: 32
   num_workers: 8
   val_num_workers: 4
   pin_memory: true
