@@ -1,0 +1,34 @@
+{
+  "task": "refsr",
+  "model": "fusion_mamba",
+  "implementation": "official_u2net",
+  "variant": "official_fusion_mamba",
+  "dataset": "pancollection_wv3",
+  "scale": 4,
+  "split": "test",
+  "reference_mode": "paired",
+  "samples": 1,
+  "sample_ids": [
+    "test_wv3_multiExm1_000003"
+  ],
+  "image_naming": "sample_id",
+  "metrics": [
+    "psnr",
+    "ssim"
+  ],
+  "save_images": false,
+  "checkpoint": "/tmp/FusionMamba2/weights/420.pth",
+  "test_config": null,
+  "psnr": {
+    "mean": 39.79839324951172,
+    "per_image": [
+      39.79839324951172
+    ]
+  },
+  "ssim": {
+    "mean": 0.9815716743469238,
+    "per_image": [
+      0.9815716743469238
+    ]
+  }
+}
