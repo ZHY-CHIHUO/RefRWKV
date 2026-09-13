@@ -106,6 +106,19 @@ class PanCollectionDatasetTests(unittest.TestCase):
             self.assertEqual(tuple(train_batch["ref"].shape), (1, 1, 8, 8))
             self.assertEqual(tuple(val_batch["hr"].shape), (1, 8, 8, 8))
 
+    def test_falls_back_to_root_candidates_when_primary_root_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            actual = Path(directory) / "actual"
+            actual.mkdir()
+            self._write_file(actual / "train.h5", count=2)
+            self._write_file(actual / "valid.h5", count=1)
+            config = self._config(missing)
+            config["dataset"]["root_candidates"] = [str(actual)]
+            train_loader, val_loader = build_pancollection_loaders(config)
+            self.assertEqual(len(train_loader.dataset), 2)
+            self.assertEqual(len(val_loader.dataset), 1)
+
     def test_rejects_non_x4_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.h5"

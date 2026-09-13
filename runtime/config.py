@@ -323,6 +323,12 @@ def materialize_config(config: dict[str, Any], config_path: Path) -> dict[str, A
         data["dataset_format"] = dataset["format"]
     if "kind" in dataset and "dataset_kind" not in data:
         data["dataset_kind"] = dataset["kind"]
+    if "files" in dataset and "files" not in data:
+        data["files"] = dataset["files"]
+    if "h5_keys" in dataset and "h5_keys" not in data:
+        data["h5_keys"] = dataset["h5_keys"]
+    if "root_candidates" in dataset and "root_candidates" not in data:
+        data["root_candidates"] = dataset["root_candidates"]
     if isinstance(dataset.get("source"), Mapping):
         source = dataset["source"]
         if "channels" in source and "channels" not in data:

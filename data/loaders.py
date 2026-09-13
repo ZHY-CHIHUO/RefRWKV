@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +187,48 @@ def _is_pancollection_dataset(config: Mapping[str, Any]) -> bool:
     )
 
 
+def _as_path_list(value: Any) -> list[str]:
+    """Normalize a path or list of paths into stripped strings."""
+    if value is None:
+        return []
+    if isinstance(value, (str, os.PathLike)):
+        text = str(value).strip()
+        return [text] if text else []
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        paths: list[str] = []
+        for item in value:
+            paths.extend(_as_path_list(item))
+        return paths
+    raise ValueError(f"expected path or list of paths, got {type(value).__name__}")
+
+
+def _pancollection_root_candidates(config: Mapping[str, Any]) -> list[Path]:
+    """Return unique PanCollection roots, preferring an existing local/cluster path."""
+    data = config.get("data", {})
+    if not isinstance(data, Mapping):
+        data = {}
+    dataset = config.get("dataset", {})
+    if not isinstance(dataset, Mapping):
+        dataset = {}
+    values = _as_path_list(os.environ.get("REFRWKV_PANCOLLECTION_ROOT"))
+    values.extend(_as_path_list(data.get("root")))
+    values.extend(_as_path_list(data.get("root_candidates")))
+    values.extend(_as_path_list(dataset.get("root")))
+    values.extend(_as_path_list(dataset.get("root_candidates")))
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for value in values:
+        root = resolve_path(value)
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(root)
+    if not roots:
+        raise ValueError("PanCollection data.root is required")
+    return roots
+
+
 def _pancollection_file(config: Mapping[str, Any], split: str) -> Path:
     """Resolve one PanCollection split file from dataset metadata."""
     data = config.get("data", {})
@@ -194,10 +237,6 @@ def _pancollection_file(config: Mapping[str, Any], split: str) -> Path:
     dataset = config.get("dataset", {})
     if not isinstance(dataset, Mapping):
         dataset = {}
-    root_value = data.get("root") or dataset.get("root")
-    if not root_value:
-        raise ValueError("PanCollection data.root is required")
-    root = resolve_path(root_value)
     files = data.get("files", dataset.get("files", {}))
     if not isinstance(files, Mapping):
         raise ValueError("PanCollection files must be a mapping")
@@ -206,13 +245,20 @@ def _pancollection_file(config: Mapping[str, Any], split: str) -> Path:
         value = files.get("test")
     if value is None:
         raise KeyError(f"PanCollection files has no entry for split {split!r}")
-    path = Path(str(value)).expanduser()
-    if not path.is_absolute():
-        path = root / path
-    path = path.resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"PanCollection H5 file not found for {split}: {path}")
-    return path
+    relative = Path(str(value)).expanduser()
+    if relative.is_absolute():
+        path = relative.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"PanCollection H5 file not found for {split}: {path}")
+        return path
+    tried: list[Path] = []
+    for root in _pancollection_root_candidates(config):
+        path = (root / relative).resolve()
+        tried.append(path)
+        if path.is_file():
+            return path
+    tried_text = ", ".join(str(path) for path in tried)
+    raise FileNotFoundError(f"PanCollection H5 file not found for {split}: {tried_text}")
 
 
 def _pancollection_kwargs(config: Mapping[str, Any], *, mode: str, patch_size, max_samples, return_sample_id: bool = False) -> dict[str, Any]:

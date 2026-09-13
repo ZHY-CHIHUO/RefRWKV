@@ -49,8 +49,10 @@ hr  <- gt       # 例如 WV3: 8 x 64 x 64
 由数据集 YAML 提供，不需要为 GF2/QB/WV2 复制加载代码。WV3 的配置和训练入口分别是
 `configs/datasets/refsr/pancollection_wv3.yaml`、
 `configs/runs/refsrwkv/pancollection_wv3.yaml` 和
-`scripts/shortcuts/train/refsrwkv_pancollection_wv3.sh`。远程 H5 文件不提交到仓库，
-运行前确认 YAML 中的 `root` 在当前服务器可访问。
+`scripts/shortcuts/train/refsrwkv_pancollection_wv3.sh`。远程 H5 文件不提交到仓库。loader 会按 `root` / `root_candidates`
+依次查找，本机用 `data/refsr/PanCollection/training_wv3`，ps 上会回退到
+`/mnt/sdb/datasets/全色多光谱融合数据集/PanCollection/training_wv3`。
+也可用环境变量 `REFRWKV_PANCOLLECTION_ROOT` 覆盖。
 
 ## Wuhan
 

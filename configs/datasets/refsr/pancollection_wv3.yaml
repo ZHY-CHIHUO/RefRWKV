@@ -3,8 +3,11 @@ dataset:
   name: PanCollection WorldView-3 reduced-resolution pansharpening
   kind: pancollection_h5
   format: pancollection_h5
-  # The H5 files live on the training server; no dataset files belong in this repo.
+  # Local checkout first; the cluster copy is the fallback on ps.
   root: data/refsr/PanCollection/training_wv3
+  root_candidates:
+    - data/refsr/PanCollection/training_wv3
+    - /mnt/sdb/datasets/全色多光谱融合数据集/PanCollection/training_wv3
   default_scale: 4
   lr: {native_scale: 4, provenance: sensor, source: stored}
   value_scale: 2047.0
