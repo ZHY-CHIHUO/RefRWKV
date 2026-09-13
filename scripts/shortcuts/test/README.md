@@ -23,3 +23,15 @@ Bicubic 是无参数基线，不需要 checkpoint；快捷脚本也支持直接�
 bash scripts/shortcuts/test/run_test.sh \
   --training-config configs/runs/sr/bicubic/hrms_scd_x4.yaml
 ```
+
+官方 FusionMamba WV3 权重使用独立快捷脚本测试。默认权重路径是
+`/tmp/FusionMamba2/weights/420.pth`，也可以显式传入权重文件：
+
+```bash
+bash scripts/shortcuts/test/fusion_mamba_pancollection_wv3.sh \
+  /path/to/420.pth --batch-size 16 --no-save-images
+```
+
+该适配器固定使用官方 64x64 HR patch（16x16 MS/LR），并将项目的 `[-1, 1]`
+张量转换为 FusionMamba 所需的 `[0, 1]` 范围。测试数据根目录仍由
+`configs/datasets/refsr/pancollection_wv3.yaml` 中的 PanCollection H5 配置决定。

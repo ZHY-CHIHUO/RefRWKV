@@ -59,7 +59,7 @@ _PAIRED_ONLY_LOSS_KEYS = ("ref_drop_prob",)
 # runtime (rather than importing model packages here) lets config rendering,
 # training and evaluation agree on the task without pulling optional model
 # dependencies into the configuration parser.
-DIRECT_REFSR_MODEL_NAMES = frozenset({"refsrwkv", "rdm_refsr", "ttsr", "masa_sr", "datsr"})
+DIRECT_REFSR_MODEL_NAMES = frozenset({"refsrwkv", "rdm_refsr", "fusion_mamba", "ttsr", "masa_sr", "datsr"})
 REFSR_MODEL_NAMES = DIRECT_REFSR_MODEL_NAMES | frozenset({"refdiffrwkv"})
 PAIRED_REFERENCE_MODEL_NAMES = frozenset({"ttsr", "masa_sr", "datsr", "refdiffrwkv"})
 REFSRWKV_FUSION_MODES = frozenset(

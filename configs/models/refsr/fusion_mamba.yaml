@@ -1,0 +1,15 @@
+model:
+  name: fusion_mamba
+  family: refsr
+  variant: official_fusion_mamba
+  implementation: official_u2net
+  inp_channels: 8
+  out_channels: 8
+  ref_channels: 1
+  ms_dim: 8
+  pan_dim: 1
+  dim: 32
+  input_h: 64
+  input_w: 64
+  scale: 4
+  use_reference: true

@@ -59,6 +59,7 @@ def _load_builtins() -> None:
     # registry independent of concrete model implementations.
     from . import baseline_adapters, refsrwkv  # noqa: F401
     from .rdm_refsr import rdm_adapter  # noqa: F401
+    from .fusion_mamba import adapter as fusion_mamba_adapter  # noqa: F401
 
     _BUILTINS_LOADED = True
 

@@ -1,0 +1,33 @@
+base:
+  - ../../common/refsr_paired.yaml
+  - ../../models/refsr/fusion_mamba.yaml
+  - ../../common/benchmark.yaml
+
+dataset:
+  config: ../../datasets/refsr/pancollection_wv3.yaml
+
+task: refsr
+run:
+  name: fusion_mamba_pancollection_wv3_x4
+  scale: 4
+  lr_patch: 16
+
+data:
+  root: data/refsr/PanCollection/training_wv3
+  reference_mode: paired
+  lr_source: stored
+  lr_native_scale: 4
+  lr_provenance: sensor
+  value_scale: 2047.0
+  patch_size: 64
+  test_patch_size: 64
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 4
+  val_num_workers: 2
+  max_samples_test: null
+
+test:
+  splits: [test]
+  metrics: [psnr, ssim]
+  save_images: false
