@@ -1,9 +1,10 @@
 """Reference-based SR training engines."""
 
 from .refsrwkv_trainer import RefSRWKVTrainer
+from .rdm_refsr_trainer import RDMRefSRTrainer
 from .trainer import RefSRTrainer
 
-__all__ = ["RefSRTrainer", "RefSRWKVTrainer"]
+__all__ = ["RDMRefSRTrainer", "RefSRTrainer", "RefSRWKVTrainer"]
 
 
 def __getattr__(name):

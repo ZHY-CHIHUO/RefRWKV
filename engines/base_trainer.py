@@ -108,12 +108,15 @@ class BaseTrainer(pl.LightningModule, ABC):
         if self.eval_tile_size is None:
             return self(*inputs)
         scale = int(self.config.get("data", {}).get("scale", 1))
+        task = str(self.config.get("task", "")).strip().lower()
+        input_scales = (1, scale) if task == "refsr" and len(inputs) == 2 else None
         return tiled_forward(
             self,
             *inputs,
             scale=scale,
             tile_size=self.eval_tile_size,
             overlap=self.eval_tile_overlap,
+            input_scales=input_scales,
         )
 
     @abstractmethod

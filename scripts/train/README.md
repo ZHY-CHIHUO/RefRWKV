@@ -7,6 +7,7 @@
 | `sr.py` | SwinIR、EDSR、RCAN、HAT、MambaIRv2 等单图 SR。 |
 | `refsr.py` | TTSR、MASA-SR、DATSR 等 direct RefSR baseline。 |
 | `refsrwkv.py` | RefSRWKV。 |
+| `rdm_refsr.py` | RDMRefSR 纯血 RWKV + 官方 `mamba_ssm.Mamba`。 |
 | `refdiffrwkv.py` | RefDiffRWKV。 |
 
 入口接收训练 YAML 和可选 `--overrides`。常用模型/数据组合可通过 `scripts/shortcuts/train/` 的 shell 快捷脚本启动。

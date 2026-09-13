@@ -1,0 +1,255 @@
+"""Regression tests for the pure RWKV+Mamba RDMRefSR architecture."""
+
+from __future__ import annotations
+
+import copy
+import sys
+import unittest
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from engines.refsr import RDMRefSRTrainer  # noqa: E402
+from models.refsr import build_model, list_models  # noqa: E402
+from models.refsr.rdm_refsr.rdm_refsr import (  # noqa: E402
+    RDMRefSR,
+    SharedDirectionalRWKV,
+    TrueMambaScan,
+    _reference_biwkv,
+    haar_dwt2d,
+    haar_idwt2d,
+)
+from runtime.config import load_config, validate_config  # noqa: E402
+from runtime.tiling import tiled_forward  # noqa: E402
+
+
+def _compact_model(**updates) -> RDMRefSR:
+    options = dict(
+        inp_channels=3,
+        ref_channels=3,
+        out_channels=3,
+        target_channels=3,
+        dim=16,
+        depths=(1, 1, 1, 1),
+        decoder_depths=(1, 1, 1),
+        scale=2,
+        reference_kind="temporal",
+        mamba_d_state=2,
+        mamba_d_conv=2,
+        mamba_expand=1,
+        match_window=3,
+        match_dim=4,
+        shuffle_prob=0.0,
+    )
+    options.update(updates)
+    return RDMRefSR(**options)
+
+
+class RDMRefSRTests(unittest.TestCase):
+    def test_haar_round_trip_odd_geometry(self) -> None:
+        value = torch.randn(2, 5, 7, 9)
+        low, detail, size = haar_dwt2d(value)
+        restored = haar_idwt2d(low, detail, size)
+        self.assertEqual(tuple(restored.shape), tuple(value.shape))
+        self.assertLess(float((restored - value).abs().max()), 2.0e-6)
+
+    def test_three_reference_modes_and_independent_channels(self) -> None:
+        cases = (
+            ("temporal", 3, 3, 3),
+            ("pan", 8, 1, 8),
+            ("hsi_msi", 31, 4, 31),
+        )
+        for kind, inp, ref_channels, out_channels in cases:
+            with self.subTest(kind=kind):
+                model = _compact_model(
+                    inp_channels=inp,
+                    ref_channels=ref_channels,
+                    out_channels=out_channels,
+                    target_channels=out_channels,
+                    reference_kind=kind,
+                )
+                lr = torch.randn(1, inp, 3, 5, requires_grad=True)
+                ref = torch.randn(1, ref_channels, 6, 10)
+                output = model(lr, ref)
+                self.assertEqual(tuple(output.shape), (1, out_channels, 6, 10))
+                self.assertTrue(torch.isfinite(output).all())
+
+    def test_cpu_backward_reaches_query_and_mamba_fallback(self) -> None:
+        model = _compact_model()
+        lr = torch.randn(1, 3, 3, 4, requires_grad=True)
+        ref = torch.randn(1, 3, 6, 8)
+        loss = model(lr, ref).square().mean()
+        loss.backward()
+        self.assertIsNotNone(model.ms_stem[0].weight.grad)
+        self.assertGreater(float(model.ms_stem[0].weight.grad.abs().sum()), 0.0)
+        fallback_grads = [
+            parameter.grad
+            for name, parameter in model.named_parameters()
+            if "mamba.scan.reference" in name and parameter.grad is not None
+        ]
+        self.assertTrue(fallback_grads)
+        self.assertGreater(float(sum(gradient.abs().sum() for gradient in fallback_grads)), 0.0)
+
+    def test_pan_response_detail_path_is_band_aware(self) -> None:
+        model = _compact_model(
+            inp_channels=8,
+            ref_channels=1,
+            out_channels=8,
+            target_channels=8,
+            reference_kind="pan",
+        )
+        lr = torch.randn(1, 8, 3, 4)
+        ref = torch.randn(1, 1, 6, 8)
+        output = model(lr, ref)
+        output.square().mean().backward()
+        self.assertEqual(tuple(model._sensor_band_gains().shape), (8,))
+        self.assertIsNotNone(model.sensor_logits.grad)
+        self.assertGreater(float(model.sensor_logits.grad.abs().sum()), 0.0)
+
+    def test_long_biwkv_fallback_matches_distance_formula(self) -> None:
+        torch.manual_seed(11)
+        length, channels = 33, 16
+        key = torch.randn(1, length, channels, dtype=torch.float64) * 0.2
+        value = torch.randn(1, length, channels, dtype=torch.float64)
+        decay = torch.rand(channels, dtype=torch.float64) * 0.2 + 0.05
+        first = torch.randn(channels, dtype=torch.float64) * 0.1
+        actual = _reference_biwkv(decay, first, key, value)
+        expected = []
+        for index in range(length):
+            weights = torch.exp(
+                torch.where(
+                    torch.arange(length)[:, None] == index,
+                    first[None, :] + key[0, index][None, :],
+                    key[0] - decay[None, :] * (torch.arange(length)[:, None] - index).abs(),
+                )
+            )
+            expected.append(
+                (weights * value[0]).sum(dim=0) / (weights.sum(dim=0) + 1.0e-6)
+            )
+        expected = torch.stack(expected).unsqueeze(0)
+        self.assertTrue(torch.allclose(actual, expected, atol=2.0e-6, rtol=2.0e-6))
+
+    def test_initial_prediction_is_bicubic_plus_small_residual(self) -> None:
+        torch.manual_seed(3)
+        model = _compact_model()
+        lr = torch.rand(1, 3, 4, 5) * 2.0 - 1.0
+        ref = torch.rand(1, 3, 8, 10) * 2.0 - 1.0
+        expected = F.interpolate(lr, size=(8, 10), mode="bicubic", align_corners=False).clamp(-1, 1)
+        output = model(lr, ref)
+        self.assertLess(float((output - expected).abs().mean()), 5.0e-3)
+
+    def test_registry_and_config_profile(self) -> None:
+        self.assertIn("rdm_refsr", list_models())
+        config = load_config("configs/runs/rdm_refsr/hrms_scd_x4.yaml", prefer_existing=False)
+        validate_config(config, require_data=False)
+        compact = copy.deepcopy(config["model"])
+        compact.update(
+            dim=16,
+            depths=[1, 1, 1, 1],
+            decoder_depths=[1, 1, 1],
+            mamba_d_state=2,
+            mamba_d_conv=2,
+            mamba_expand=1,
+            match_window=3,
+            match_dim=4,
+        )
+        model = build_model(compact, scale=2)
+        self.assertIsInstance(model, RDMRefSR)
+        self.assertEqual(
+            model.reference_condition_stages,
+            frozenset({"enc2", "latent", "dec1", "coeff"}),
+        )
+        self.assertEqual(model.detail_injection_stages, frozenset({"dec1", "coeff"}))
+
+    def test_tiled_forward_accepts_hr_reference_grid(self) -> None:
+        model = _compact_model()
+        model.eval()
+        lr = torch.randn(1, 3, 5, 7)
+        ref = torch.randn(1, 3, 10, 14)
+        with torch.no_grad():
+            output = tiled_forward(
+                model,
+                lr,
+                ref,
+                scale=2,
+                tile_size=3,
+                overlap=1,
+                input_scales=(1, 2),
+            )
+        self.assertEqual(tuple(output.shape), (1, 3, 10, 14))
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_alignment_offset_is_scaled_to_haar_coefficient_grid(self) -> None:
+        model = _compact_model(alignment=True, max_offset=3.0)
+        # Replace the learned offset predictor with a constant one-pixel HR
+        # translation.  The coefficient warp should receive half a pixel.
+        class ConstantOffset(torch.nn.Module):
+            def forward(self, value):
+                return value.new_zeros(value.shape).add_(torch.atanh(value.new_tensor(1.0 / 3.0)))
+
+        model.offset_net = ConstantOffset()
+        captured = []
+        original = model._warp
+
+        def capture(image, offsets):
+            captured.append(offsets.detach().clone())
+            return original(image, offsets)
+
+        model._warp = capture
+        lr = torch.randn(1, 3, 3, 4)
+        ref = torch.randn(1, 3, 6, 8)
+        model(lr, ref)
+        self.assertEqual(len(captured), 2)
+        self.assertTrue(torch.allclose(captured[0], torch.full_like(captured[0], 0.5), atol=1e-5))
+
+    def test_trainer_physical_loss_is_finite(self) -> None:
+        config = load_config("configs/runs/rdm_refsr/pancollection_wv3_x4.yaml", prefer_existing=False)
+        config["data"]["scale"] = 2
+        config["model"].update(
+            dim=16,
+            depths=[1, 1, 1, 1],
+            decoder_depths=[1, 1, 1],
+            mamba_d_state=2,
+            mamba_d_conv=2,
+            mamba_expand=1,
+            match_window=3,
+            match_dim=4,
+        )
+        config["loss"].update(
+            sam_weight=0.01,
+            wavelet_weight=0.01,
+            consistency_weight=0.01,
+            sensor_weight=0.01,
+            change_weight=0.01,
+        )
+        trainer = RDMRefSRTrainer.from_config(config)
+        lr = torch.randn(1, 8, 3, 4)
+        hr = torch.randn(1, 8, 6, 8)
+        ref = torch.randn(1, 1, 6, 8)
+        value = trainer._train_step({"lr": lr, "hr": hr, "ref": ref}, 0)
+        self.assertTrue(torch.isfinite(value))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the official backend test")
+    def test_cuda_official_mamba_and_biwkv_backward(self) -> None:
+        scan = TrueMambaScan(16, d_state=2, d_conv=2, expand=1, allow_cpu_reference=False).cuda()
+        sequence = torch.randn(2, 7, 16, device="cuda", requires_grad=True)
+        output = scan(sequence)
+        self.assertTrue(torch.isfinite(output).all())
+        output.square().mean().backward()
+        self.assertGreater(float(sequence.grad.abs().sum()), 0.0)
+
+        rwkv = SharedDirectionalRWKV(16, shuffle_prob=0.0).cuda()
+        image = torch.randn(1, 16, 4, 5, device="cuda", requires_grad=True)
+        value = rwkv(image)
+        self.assertTrue(torch.isfinite(value).all())
+        value.square().mean().backward()
+        self.assertGreater(float(image.grad.abs().sum()), 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

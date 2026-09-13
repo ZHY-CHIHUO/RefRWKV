@@ -177,6 +177,32 @@ class RefSRWKVStructureTests(unittest.TestCase):
                 output = fusion(lr, low, high)
         self.assertTrue(torch.allclose(output, lr, atol=1e-6, rtol=1e-5))
 
+    def test_spectral_detail_v2_has_live_matched_detail_path(self) -> None:
+        fusion = SpectralDetailFusion(
+            4,
+            window_size=3,
+            direct_detail=True,
+            detail_confidence_floor=0.25,
+        )
+        fusion.initialize_v2_residual()
+        lr = torch.randn(1, 4, 5, 6)
+        low = torch.randn_like(lr)
+        high = torch.randn_like(lr)
+        output = fusion(lr, low, high)
+        output.square().mean().backward()
+        # V1's zero final projections deliberately block these gradients at
+        # initialization. V2 must train the complete detail path immediately.
+        for parameter in (
+            fusion.spectral_path[0].weight,
+            fusion.query.weight,
+            fusion.key.weight,
+            fusion.value.weight,
+            fusion.film[0].weight,
+            fusion.detail_scale,
+        ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertGreater(float(parameter.grad.abs().sum()), 0.0)
+
     def test_spectral_and_detail_switches_skip_their_respective_paths(self) -> None:
         lr = torch.randn(1, 4, 5, 6)
         low = torch.randn_like(lr)
@@ -231,6 +257,20 @@ class RefSRWKVStructureTests(unittest.TestCase):
                 self.assertFalse(model.reference_fusion_enabled)
                 self.assertFalse(model.decoder_refusion)
                 self.assertIsInstance(model.ref_to_level1, nn.Identity)
+
+    def test_spectral_detail_v2_limits_high_frequency_to_selected_decoder_stages(self) -> None:
+        model = self.build(
+            fusion_mode="spectral_detail_v2",
+            detail_fusion_stages=("dec2", "dec1"),
+        )
+        self.assertEqual(model.fusion_mode, "spectral_detail_v2")
+        self.assertEqual(model.detail_fusion_stages, frozenset({"dec2", "dec1"}))
+        for fusion in (model.fuse1, model.fuse2, model.fuse3, model.fuse4, model.decoder_fuse3):
+            self.assertFalse(fusion.g_detail)
+            self.assertTrue(fusion.direct_detail)
+        for fusion in (model.decoder_fuse2, model.decoder_fuse1):
+            self.assertTrue(fusion.g_detail)
+            self.assertTrue(fusion.direct_detail)
 
     def test_all_switches_off_runs_as_sisr_without_reference_tensor(self) -> None:
         model = self.build(
@@ -331,6 +371,68 @@ class RefSRWKVStructureTests(unittest.TestCase):
         self.assertEqual(output.shape, (1, 8, 8, 8))
         self.assertTrue(torch.isfinite(output).all())
 
+    def test_hr_native_keeps_reference_on_hr_grid(self) -> None:
+        model = self.build(
+            inp_channels=8,
+            ref_channels=1,
+            out_channels=8,
+            fusion_mode="hr_native",
+        )
+        self.assertTrue(model.hr_native)
+        self.assertIsInstance(model.output_shuffle, nn.Identity)
+        self.assertIsInstance(model.up_final, nn.Identity)
+        self.assertFalse(any(isinstance(module, nn.PixelUnshuffle) for module in model.ref_to_level1.modules()))
+        with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+            with torch.no_grad():
+                output = model(
+                    torch.randn(1, 8, 4, 4),
+                    torch.randn(1, 1, 16, 16),
+                )
+        self.assertEqual(output.shape, (1, 8, 16, 16))
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_hr_native_supports_non_multiple_hr_geometry(self) -> None:
+        model = self.build(
+            inp_channels=8,
+            ref_channels=1,
+            out_channels=8,
+            fusion_mode="hr_native",
+        )
+        with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+            with torch.no_grad():
+                output = model(
+                    torch.randn(1, 8, 3, 5),
+                    torch.randn(1, 1, 12, 20),
+                )
+        self.assertEqual(output.shape, (1, 8, 12, 20))
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_hr_native_branch_switches_are_independent(self) -> None:
+        for g_spec, g_detail in ((True, True), (False, True), (True, False), (False, False)):
+            model = self.build(
+                inp_channels=8,
+                ref_channels=1,
+                out_channels=8,
+                fusion_mode="hr_native",
+                g_spec=g_spec,
+                g_detail=g_detail,
+            )
+            self.assertEqual((model.g_spec, model.g_detail), (g_spec, g_detail))
+            if not g_spec and not g_detail:
+                self.assertFalse(model.reference_fusion_enabled)
+                with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+                    with torch.no_grad():
+                        output = model(torch.randn(1, 8, 4, 4))
+            else:
+                with patch.object(refsrwkv_module, "RUN_CUDA", side_effect=lambda w, u, k, v: v):
+                    with torch.no_grad():
+                        output = model(
+                            torch.randn(1, 8, 4, 4),
+                            torch.randn(1, 1, 16, 16),
+                        )
+            self.assertEqual(output.shape, (1, 8, 16, 16))
+            self.assertTrue(torch.isfinite(output).all())
+
 
 class RefSRWKVConfigChannelTests(unittest.TestCase):
     @staticmethod
@@ -355,6 +457,10 @@ class RefSRWKVConfigChannelTests(unittest.TestCase):
         config = self._config()
         config["model"]["fusion_mode"] = "spectral_detail"
         validate_config(config, require_data=False)
+        config["model"]["fusion_mode"] = "hr_native"
+        validate_config(config, require_data=False)
+        config["model"]["fusion_mode"] = "spectral_detail_v2"
+        validate_config(config, require_data=False)
         config["model"]["fusion_mode"] = "unknown"
         with self.assertRaisesRegex(ValueError, "fusion_mode"):
             validate_config(config, require_data=False)
@@ -372,6 +478,22 @@ class RefSRWKVConfigChannelTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, branch):
                 validate_config(config, require_data=False)
             config["model"][branch] = True
+
+    def test_validates_v2_detail_stage_controls_at_config_boundary(self) -> None:
+        config = self._config()
+        config["model"].update(
+            fusion_mode="spectral_detail_v2",
+            detail_fusion_stages=["dec2", "dec1"],
+            detail_confidence_floor=0.25,
+        )
+        validate_config(config, require_data=False)
+        config["model"]["detail_fusion_stages"] = ["unknown"]
+        with self.assertRaisesRegex(ValueError, "detail_fusion_stages"):
+            validate_config(config, require_data=False)
+        config["model"]["detail_fusion_stages"] = ["dec1"]
+        config["model"]["detail_confidence_floor"] = 1.0
+        with self.assertRaisesRegex(ValueError, "detail_confidence_floor"):
+            validate_config(config, require_data=False)
 
     def test_allows_derived_channel_fields_to_be_null(self) -> None:
         config = self._config()

@@ -1,0 +1,25 @@
+# RefSRWKV spectral-detail V2 for cross-temporal HRMS-SCD.
+# This is intentionally a fresh run: V2 changes the reference fusion
+# parameters and must not resume a V1 spectral-detail checkpoint.
+base: hrms_scd_x4.yaml
+
+run:
+  name: hrms_scd_trefsr_spectral_detail_v2_x4
+
+data:
+  # Match the historical legacy reference-training contract for a controlled
+  # architecture comparison.
+  augment_ref: true
+
+model:
+  use_reference: true
+  fusion_mode: spectral_detail_v2
+  g_spec: true
+  g_detail: true
+  # Temporal reference detail belongs in reconstruction, not low-resolution
+  # semantic encoding where changed objects can contaminate the query stream.
+  detail_fusion_stages: [dec3, dec2, dec1]
+  # Keep a nonzero early gradient through local matching; quality remains free
+  # to suppress unreliable cross-temporal regions.
+  detail_confidence_floor: 0.25
+  decoder_refusion: true

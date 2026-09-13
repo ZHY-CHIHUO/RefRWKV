@@ -52,12 +52,14 @@ def tiled_forward(
     scale: int = 1,
     tile_size: int | None = None,
     overlap: int = 0,
+    input_scales: tuple[int, ...] | list[int] | None = None,
 ) -> torch.Tensor:
     """Apply ``forward`` to aligned NCHW tiles and blend its full output.
 
-    Inputs must share batch and spatial geometry.  The output is required to
-    have the same batch size and an integer ``scale`` times the tile height and
-    width; this covers both SISR and scale-one aligned sensor fusion.
+    Inputs must share batch geometry.  By default they also share the primary
+    spatial grid; ``input_scales`` can declare an HR reference grid such as
+    ``(1, scale)`` for RefSR.  The output is required to have the same batch
+    size and an integer ``scale`` times the primary tile height and width.
     """
     if not inputs:
         raise ValueError("tiled_forward requires at least one input tensor")
@@ -72,10 +74,24 @@ def tiled_forward(
     if any(not torch.is_tensor(value) or value.ndim != 4 for value in inputs):
         raise TypeError("tiled_forward inputs must be NCHW tensors")
 
+    if input_scales is None:
+        input_scales = (1,) * len(inputs)
+    elif not isinstance(input_scales, (tuple, list)) or len(input_scales) != len(inputs):
+        raise ValueError("input_scales must contain one positive integer per input")
+    normalized_input_scales: tuple[int, ...] = tuple(int(value) for value in input_scales)
+    if any(isinstance(value, bool) or value < 1 for value in normalized_input_scales):
+        raise ValueError("input_scales values must be positive integers")
+
     primary = inputs[0]
     batch, _channels, height, width = primary.shape
-    if any(value.shape[0] != batch or value.shape[-2:] != (height, width) for value in inputs[1:]):
-        raise ValueError("all tiled_forward inputs must share batch and spatial geometry")
+    for value, input_scale in zip(inputs, normalized_input_scales):
+        expected_size = (height * input_scale, width * input_scale)
+        if value.shape[0] != batch or tuple(value.shape[-2:]) != expected_size:
+            raise ValueError(
+                "all tiled_forward inputs must share batch and spatial geometry "
+                "or match the primary grid times input_scales; "
+                f"got {tuple(value.shape[-2:])}, expected {expected_size}"
+            )
     if height <= tile_size and width <= tile_size:
         return forward(*inputs)
 
@@ -87,7 +103,14 @@ def tiled_forward(
         tile_height = min(tile_size, height - y)
         for x in x_starts:
             tile_width = min(tile_size, width - x)
-            tile_inputs = tuple(value[..., y : y + tile_height, x : x + tile_width] for value in inputs)
+            tile_inputs = tuple(
+                value[
+                    ...,
+                    y * input_scale : (y + tile_height) * input_scale,
+                    x * input_scale : (x + tile_width) * input_scale,
+                ]
+                for value, input_scale in zip(inputs, normalized_input_scales)
+            )
             tile_output = forward(*tile_inputs)
             expected = (tile_height * scale, tile_width * scale)
             if (

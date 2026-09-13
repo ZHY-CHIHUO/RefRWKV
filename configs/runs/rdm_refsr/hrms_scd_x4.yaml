@@ -1,0 +1,35 @@
+# Cross-temporal HRMS-SCD: LR target-date MS + HR reference-date MS -> HR target.
+base:
+  - ../../common/rdm_refsr.yaml
+  - ../../models/refsr/rdm_refsr.yaml
+  - ../../common/benchmark.yaml
+
+dataset:
+  config: ../../datasets/refsr/hrms_scd.yaml
+
+task: refsr
+run:
+  name: hrms_scd_rdm_refsr_v2_x4
+  scale: 4
+  lr_patch: 48
+
+data:
+  reference_mode: paired
+  max_samples_val: 300
+  # Keep the historical RefSRWKV temporal-reference augmentation contract.
+  augment_ref: true
+
+train:
+  # RDM uses batch 8 for memory; match RefSRWKV's effective batch of 32.
+  accumulate_grad_batches: 4
+
+loss:
+  ref_drop_prob: 0.2
+
+model:
+  inp_channels: 3
+  ref_channels: 3
+  out_channels: 3
+  target_channels: 3
+  reference_kind: temporal
+  alignment: true

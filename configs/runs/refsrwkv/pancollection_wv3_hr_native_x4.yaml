@@ -1,0 +1,17 @@
+# Fresh PanCollection WV3 run for native-grid PAN/MS fusion.
+# Input: 8-band MS at 1/4 resolution + 1-band PAN at HR -> 8-band HR.
+base: pancollection_wv3.yaml
+
+run:
+  name: pancollection_wv3_hr_native_x4
+
+model:
+  inp_channels: 8
+  ref_channels: 1
+  out_channels: 8
+  use_reference: true
+  fusion_mode: hr_native
+  color_match: none
+  g_spec: true
+  g_detail: true
+  decoder_refusion: true

@@ -1,0 +1,20 @@
+# RefSRWKV spectral-detail V2 for WV3 MS/PAN pansharpening.
+# The PAN image provides spatial structure, not a per-band spectral target.
+base: pancollection_wv3.yaml
+
+run:
+  name: pancollection_wv3_spectral_detail_v2_x4
+
+model:
+  inp_channels: 8
+  ref_channels: 1
+  out_channels: 8
+  use_reference: true
+  fusion_mode: spectral_detail_v2
+  # PAN should guide detail retrieval only; allowing its low-frequency branch
+  # to perform a spectral correction can create band-dependent colour drift.
+  g_spec: false
+  g_detail: true
+  detail_fusion_stages: [dec3, dec2, dec1]
+  detail_confidence_floor: 0.25
+  decoder_refusion: true

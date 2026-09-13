@@ -39,6 +39,9 @@ dist/
 /data/**/*.npy
 /data/**/manifest.jsonl
 /data/**/metadata.json
+# PanCollection HDF5 archives are downloaded locally and are too large for git.
+/data/refsr/PanCollection/**/*.h5
+/data/refsr/PanCollection/**/*.h5.*
 !/data/refsr/Wuhan-dataset/metadata.json
 !/data/refsr/Wuhan-dataset/SPLIT_MANIFEST.md
 !/data/refsr/Wuhan-dataset/split_manifest.json

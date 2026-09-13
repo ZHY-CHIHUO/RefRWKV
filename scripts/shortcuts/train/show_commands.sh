@@ -25,11 +25,17 @@ shortcuts=(
   mambairv2_hrms_scd_sr_x4.sh
   refsrwkv_hrms_scd_sr_x4.sh
   refsrwkv_hrms_scd_ref_x4.sh
+  refsrwkv_hrms_scd_hr_native_x4.sh
   ttsr_hrms_scd_ref_x4.sh
   masa_sr_hrms_scd_ref_x4.sh
   datsr_hrms_scd_ref_x4.sh
   refsrwkv_wuhan.sh
   refsrwkv_pancollection_wv3.sh
+  refsrwkv_pancollection_wv3_hr_native.sh
+  rdm_refsr_hrms_scd_x4.sh
+  rdm_refsr_pancollection_wv3.sh
+  rdm_refsr_hrms_scd_quick.sh
+  rdm_refsr_pancollection_wv3_quick.sh
 )
 
 for shortcut in "${shortcuts[@]}"; do

@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.loaders import build_refsr_loaders
-from engines.refsr import RefSRWKVTrainer
+from engines.refsr import RDMRefSRTrainer, RefSRWKVTrainer
 from runtime.checkpoint import load_checkpoint, load_model_weights
 from runtime.config import load_config, validate_config
 from runtime.callbacks import StopOnLearningRate
@@ -50,7 +50,11 @@ def run(config: dict[str, Any], *, resume: str | None = None, load_weights: str 
     with (layout.train_dir / "config.yaml").open("w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
     train_loader, val_loader = build_refsr_loaders(config)
-    module = RefSRWKVTrainer.from_config(config)
+    model_name = str(config.get("model", {}).get("name", "")).strip().lower()
+    if model_name == "rdm_refsr":
+        module = RDMRefSRTrainer.from_config(config)
+    else:
+        module = RefSRWKVTrainer.from_config(config)
     if load_weights:
         report = load_model_weights(
             module.model,

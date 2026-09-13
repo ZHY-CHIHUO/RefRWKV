@@ -1,0 +1,42 @@
+# RDMRefSR: dual-grid Haar reference adapter + shared Bi-WKV/Mamba stages.
+# The reference_kind is a physical-data declaration, not an inference guess:
+# pan = MS LR + PAN HR, temporal = cross-date HRMS, hsi_msi = LR-HSI + HR-MSI.
+model:
+  name: rdm_refsr
+  family: refsr
+  variant: rdm_refsr_v2
+  implementation: dual_grid_rwkv_mamba
+  inp_channels: 3
+  out_channels: 3
+  ref_channels: 3
+  target_channels: 3
+  dim: 48
+  depths: [2, 2, 3, 4]
+  decoder_depths: [3, 2, 2]
+  reference_kind: temporal
+  mamba_stages: [enc2, latent, dec2]
+  # Reference statistics enter the semantic bottleneck and the final
+  # reconstruction stages only; this prevents a changed HR reference from
+  # being repeatedly injected at every U-Net scale.
+  reference_condition_stages: [enc2, latent, dec1, coeff]
+  detail_injection_stages: [dec1, coeff]
+  mamba_d_state: 16
+  mamba_d_conv: 4
+  mamba_expand: 2
+  # CPU reference implementations are only for shape/gradient tests. CUDA
+  # training automatically takes the official mamba_ssm path.
+  allow_cpu_mamba: true
+  shuffle_prob: 0.15
+  shuffle_block: 4
+  match_window: 5
+  match_dim: 16
+  # Match on the Haar coefficient grid (HR/2), not the LR grid, so retrieved
+  # detail retains its spatial phase before inverse wavelet synthesis.
+  match_grid: coefficient
+  # Only offsets the untrained local-match entropy for temporal references;
+  # radiometric/change reliability can still suppress changed regions.
+  temporal_match_confidence_floor: 0.15
+  alignment: true
+  max_offset: 3.0
+  use_reference: true
+  clamp_output: true

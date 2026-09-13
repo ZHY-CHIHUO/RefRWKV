@@ -48,6 +48,27 @@ class TiledForwardTests(unittest.TestCase):
                 tile_size=8,
             )
 
+    def test_reference_grid_can_be_tiled_at_integer_scale(self) -> None:
+        lr = torch.randn(1, 2, 17, 19)
+        ref = torch.randn(1, 1, 34, 38)
+
+        def model(left: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
+            # Return a scale-two output while consuming an HR guide.
+            guide_lr = F.interpolate(guide, size=left.shape[-2:], mode="area")
+            return F.interpolate(left + guide_lr, scale_factor=2, mode="nearest")
+
+        expected = model(lr, ref)
+        actual = tiled_forward(
+            model,
+            lr,
+            ref,
+            scale=2,
+            tile_size=7,
+            overlap=2,
+            input_scales=(1, 2),
+        )
+        self.assertTrue(torch.allclose(actual, expected, atol=1.0e-6, rtol=1.0e-6))
+
 
 if __name__ == "__main__":
     unittest.main()

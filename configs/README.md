@@ -26,6 +26,20 @@ python scripts/render_config.py \
 `configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml` 和
 `configs/runs/refsrwkv/pancollection_wv3_spectral_detail_x4.yaml`；两者使用独立
 run 名称，不会复用旧 legacy 实验目录。
+若要采用 Pan-Mamba/FusionMamba 风格的 HR 网格交互，使用
+`configs/runs/refsrwkv/hrms_scd_trefsr_hr_native_x4.yaml` 和
+`configs/runs/refsrwkv/pancollection_wv3_hr_native_x4.yaml`。该模式先把 LR/MS
+双三次上采样到 HR，再在 HR 网格编码和融合 Ref/PAN，输出头不再执行 PixelShuffle。
+
+RDMRefSR 是独立的纯血 RWKV+Mamba 架构，入口在 `configs/runs/rdm_refsr/`，
+不会覆盖旧 `RefSRWKV`。它使用 LR/query 双网格主干、固定 Haar 参考高频、
+可靠性门控、共享四方向 Bi-WKV，并在 `enc2/latent/dec2` 使用官方
+`mamba_ssm` selective scan。`model.reference_kind` 必须按数据物理含义显式填写
+`pan`、`temporal` 或 `hsi_msi`，不能只根据通道数自动猜测。训练可直接使用
+`scripts/shortcuts/train/rdm_refsr_*.sh`。默认参考条件只进入
+`enc2/latent/dec1/coeff`，高频残差只进入 `dec1/coeff`；对应的
+`model.reference_condition_stages` 和 `model.detail_injection_stages` 可用于
+控制消融和显存/稳定性折中。
 
 ### `base` 覆盖顺序
 

@@ -514,6 +514,7 @@ def run_inference(
                     scale=scale,
                     tile_size=eval_tile_size,
                     overlap=eval_tile_overlap,
+                    input_scales=(1, scale),
                 )
                 prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
             else:

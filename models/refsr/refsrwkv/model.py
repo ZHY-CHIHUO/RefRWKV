@@ -60,6 +60,9 @@ _DEFAULT_FUSION_WINDOWS = {
     "dec2": 5,
     "dec1": 7,
 }
+_SPECTRAL_FUSION_MODES = frozenset(
+    {"spectral_detail", "spectral_detail_v2", "hr_native"}
+)
 
 
 def _pixel_shuffle_factors(factor):
@@ -225,6 +228,31 @@ def normalize_fusion_match_config(fusion_match=None):
         raise ValueError("fusion_match.window 必须是正奇数、七项列表或阶段 mapping")
     defaults["window"] = windows
     return defaults
+
+
+def normalize_detail_fusion_stages(detail_fusion_stages=None):
+    """Validate the stages allowed to receive retrieved reference detail.
+
+    The original spectral-detail fusion used the high-frequency reference at
+    every encoder and decoder site.  V2 can constrain that path to the
+    decoder, where HR detail is useful for reconstruction rather than for
+    semantic encoding.  ``None`` preserves the historical all-stage policy.
+    """
+    if detail_fusion_stages is None:
+        return frozenset(_FUSION_STAGE_NAMES)
+    if isinstance(detail_fusion_stages, (str, bytes)) or not isinstance(
+        detail_fusion_stages, (list, tuple, set, frozenset)
+    ):
+        raise ValueError("detail_fusion_stages 必须是融合阶段名称序列")
+    stages = frozenset(str(value).strip().lower() for value in detail_fusion_stages)
+    if any(not stage for stage in stages):
+        raise ValueError("detail_fusion_stages 不能包含空阶段名")
+    unknown = stages.difference(_FUSION_STAGE_NAMES)
+    if unknown:
+        raise ValueError(
+            "detail_fusion_stages 包含未知阶段: " + ", ".join(sorted(unknown))
+        )
+    return stages
 
 
 # ═══════════════════════════════════════════════════════════
@@ -643,6 +671,8 @@ class SpectralDetailFusion(nn.Module):
         quality_enabled=True,
         g_spec=True,
         g_detail=True,
+        direct_detail=False,
+        detail_confidence_floor=0.0,
     ):
         super().__init__()
         if not isinstance(dim, int) or dim < 1:
@@ -657,9 +687,19 @@ class SpectralDetailFusion(nn.Module):
             ("quality_enabled", quality_enabled),
             ("g_spec", g_spec),
             ("g_detail", g_detail),
+            ("direct_detail", direct_detail),
         ):
             if not isinstance(value, bool):
                 raise ValueError(f"SpectralDetailFusion {name} must be bool")
+        if (
+            isinstance(detail_confidence_floor, bool)
+            or not isinstance(detail_confidence_floor, (int, float))
+            or not math.isfinite(float(detail_confidence_floor))
+            or not 0.0 <= float(detail_confidence_floor) < 1.0
+        ):
+            raise ValueError(
+                "SpectralDetailFusion detail_confidence_floor must be in [0, 1)"
+            )
 
         self.dim = dim
         self.window_size = window_size
@@ -670,6 +710,8 @@ class SpectralDetailFusion(nn.Module):
         self.quality_enabled = quality_enabled
         self.g_spec = g_spec
         self.g_detail = g_detail
+        self.direct_detail = direct_detail
+        self.detail_confidence_floor = float(detail_confidence_floor)
         hidden = max(dim // reduction, 8)
 
         # The spectral path is deliberately a residual.  Its last projection
@@ -720,6 +762,16 @@ class SpectralDetailFusion(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden, dim * 2, 1, bias=True),
         )
+        if self.direct_detail:
+            # V2 preserves the matched high-frequency content instead of
+            # reducing it to FiLM coefficients only.  The scales make this a
+            # small residual at initialization while preserving gradients all
+            # the way into the reference encoder and local matcher.
+            self.spectral_scale = nn.Parameter(torch.full((1, dim, 1, 1), 0.05))
+            self.detail_scale = nn.Parameter(torch.full((1, dim, 1, 1), 0.10))
+        else:
+            self.register_parameter("spectral_scale", None)
+            self.register_parameter("detail_scale", None)
         nn.init.constant_(self.spectral_gate[2].bias, -1.5)
         nn.init.constant_(self.detail_gate[2].bias, -1.5)
         if quality_enabled:
@@ -727,10 +779,31 @@ class SpectralDetailFusion(nn.Module):
         self.reset_residual()
 
     def reset_residual(self):
-        """Start both reference residuals at exactly zero."""
+        """Keep the original spectral-detail mode exactly identity-initialized."""
         nn.init.zeros_(self.spectral_out.weight)
         nn.init.zeros_(self.film[2].weight)
         nn.init.zeros_(self.film[2].bias)
+
+    def initialize_v2_residual(self):
+        """Initialize V2 as a small trainable reference residual.
+
+        A zero final projection turns the first several backward passes into
+        a staged optimization problem: the matcher, quality estimator and
+        gates receive no gradient until downstream projections move away from
+        zero.  V2 instead uses small projections plus explicit residual
+        scales, so the reference path is present but cannot dominate LR.
+        """
+        if not self.direct_detail:
+            raise RuntimeError("initialize_v2_residual requires direct_detail=true")
+        nn.init.trunc_normal_(self.spectral_out.weight, std=0.02)
+        nn.init.trunc_normal_(self.film[2].weight, std=0.02)
+        nn.init.zeros_(self.film[2].bias)
+        nn.init.constant_(self.spectral_gate[2].bias, -1.0)
+        nn.init.constant_(self.detail_gate[2].bias, -1.0)
+        if self.quality_enabled:
+            nn.init.constant_(self.quality[2].bias, -0.5)
+        nn.init.constant_(self.spectral_scale, 0.05)
+        nn.init.constant_(self.detail_scale, 0.10)
 
     def _match_high(self, lr_low, ref_low, ref_high):
         b, _, h, w = lr_low.shape
@@ -795,6 +868,8 @@ class SpectralDetailFusion(nn.Module):
             spectral_delta = self.spectral_out(self.spectral_path(relation))
             spectral_delta = self.message_norm(spectral_delta)
             spec_gate = self.spectral_gate(relation)
+            if self.spectral_scale is not None:
+                spectral_delta = self.spectral_scale * spectral_delta
             spectral_feat = lr_feat + spec_gate * spectral_delta
         else:
             # The ablation must remove the spectral reference contribution,
@@ -810,6 +885,19 @@ class SpectralDetailFusion(nn.Module):
         match_context = torch.cat([lr_low, ref_low_smooth, matched, match_conf], dim=1)
         quality = self.quality(match_context) if self.quality_enabled else 1.0
         reliability = match_conf * quality
+        detail_gate = self.detail_gate(match_context)
+        if self.direct_detail:
+            # Entropy confidence is almost zero before query/key projections
+            # align.  A small floor provides a gradient path; the learned
+            # quality gate can still suppress changed or mismatched regions.
+            confidence = self.detail_confidence_floor + (
+                1.0 - self.detail_confidence_floor
+            ) * match_conf
+            detail_residual = (
+                self.detail_scale * detail_gate * quality * confidence * matched
+            )
+        else:
+            detail_residual = 0.0
         film_context = torch.cat(
             [spectral_feat, matched, low_difference, reliability], dim=1
         )
@@ -817,8 +905,7 @@ class SpectralDetailFusion(nn.Module):
         film_delta = 0.1 * (
             torch.tanh(gamma) * self.film_norm(spectral_feat) + torch.tanh(beta)
         )
-        detail_gate = self.detail_gate(match_context)
-        return spectral_feat + detail_gate * reliability * film_delta
+        return spectral_feat + detail_residual + detail_gate * reliability * film_delta
 
 
 class GlobalLatentBlock(nn.Module):
@@ -876,6 +963,8 @@ class RefSRWKV(nn.Module):
         fusion_mode: str = "legacy",
         g_spec: bool = True,
         g_detail: bool = True,
+        detail_fusion_stages=None,
+        detail_confidence_floor: float = 0.0,
         decoder_refusion: bool = True,
         global_latent_blocks: int = 2,
         ref_encoder: str = "deep",
@@ -901,12 +990,22 @@ class RefSRWKV(nn.Module):
         if color_match not in {"global", "none"}:
             raise ValueError("color_match 只能是 global 或 none")
         fusion_mode = str(fusion_mode).strip().lower()
-        if fusion_mode not in {"legacy", "spectral_detail"}:
-            raise ValueError("fusion_mode 只能是 legacy 或 spectral_detail")
+        if fusion_mode not in {"legacy", "spectral_detail", "spectral_detail_v2", "hr_native"}:
+            raise ValueError(
+                "fusion_mode 只能是 legacy、spectral_detail、spectral_detail_v2 或 hr_native"
+            )
         if not isinstance(g_spec, bool):
             raise ValueError("g_spec 必须是 bool")
         if not isinstance(g_detail, bool):
             raise ValueError("g_detail 必须是 bool")
+        detail_stages = normalize_detail_fusion_stages(detail_fusion_stages)
+        if (
+            isinstance(detail_confidence_floor, bool)
+            or not isinstance(detail_confidence_floor, (int, float))
+            or not math.isfinite(float(detail_confidence_floor))
+            or not 0.0 <= float(detail_confidence_floor) < 1.0
+        ):
+            raise ValueError("detail_confidence_floor 必须位于 [0, 1)")
         if (
             not math.isfinite(float(drop_path_rate))
             or not 0.0 <= float(drop_path_rate) < 1.0
@@ -965,14 +1064,21 @@ class RefSRWKV(nn.Module):
         )
         self.upsampler, self.color_match = upsampler, color_match
         self.fusion_mode = fusion_mode
+        self.hr_native = fusion_mode == "hr_native"
         self.g_spec, self.g_detail = g_spec, g_detail
+        self.detail_fusion_stages = detail_stages
+        self.detail_confidence_floor = float(detail_confidence_floor)
         self.use_reference = use_reference
         self.fusion_match_config = fusion_config
         # The legacy fusion has no separate spectral/detail paths, so its
         # behaviour remains unchanged regardless of these new-mode switches.
         self.reference_fusion_enabled = bool(
             use_reference
-            and (fusion_mode != "spectral_detail" or g_spec or g_detail)
+            and (
+                fusion_mode not in _SPECTRAL_FUSION_MODES
+                or g_spec
+                or (g_detail and bool(detail_stages))
+            )
         )
         self.decoder_refusion = bool(decoder_refusion and self.reference_fusion_enabled)
         self.global_latent_blocks = global_latent_blocks
@@ -996,6 +1102,24 @@ class RefSRWKV(nn.Module):
         )
 
         fusion_windows = fusion_config["window"]
+
+        def fusion_branch_kwargs(stage_name):
+            if fusion_mode not in _SPECTRAL_FUSION_MODES:
+                return {}
+            detail_enabled = g_detail
+            if fusion_mode == "spectral_detail_v2":
+                detail_enabled = bool(g_detail and stage_name in detail_stages)
+            return {
+                "g_spec": g_spec,
+                "g_detail": detail_enabled,
+                "direct_detail": fusion_mode == "spectral_detail_v2",
+                "detail_confidence_floor": (
+                    float(detail_confidence_floor)
+                    if fusion_mode == "spectral_detail_v2"
+                    else 0.0
+                ),
+            }
+
         if self.reference_fusion_enabled:
             if fusion_mode == "legacy":
                 ref_encoder_layers = [
@@ -1032,8 +1156,10 @@ class RefSRWKV(nn.Module):
             else:
                 # Keep low/high reference features in two channel groups.  A
                 # grouped stem/downsampler performs one shared pyramid pass
-                # without allowing the HR high-frequency branch to replace LR
-                # features directly.
+                # without allowing the high-frequency branch to replace LR
+                # features directly. ``hr_native`` keeps this pyramid on the
+                # HR grid; the older ``spectral_detail`` mode phase-folds it
+                # to the LR grid for checkpoint compatibility.
                 ref_encoder_layers = [
                     nn.Conv2d(
                         ref_channels * 2,
@@ -1056,20 +1182,35 @@ class RefSRWKV(nn.Module):
                             bias=False,
                         )
                     )
-                ref_encoder_layers.extend(
-                    [
-                        nn.PixelUnshuffle(scale),
-                        nn.Conv2d(
-                            ref_channels * 2 * (scale**2),
-                            dim * 2,
-                            1,
-                            groups=2,
-                            bias=False,
-                        ),
-                        RMSNorm2d(dim * 2),
-                        nn.ReLU(inplace=True),
-                    ]
-                )
+                if self.hr_native:
+                    ref_encoder_layers.extend(
+                        [
+                            nn.Conv2d(
+                                ref_channels * 2,
+                                dim * 2,
+                                1,
+                                groups=2,
+                                bias=False,
+                            ),
+                            RMSNorm2d(dim * 2),
+                            nn.ReLU(inplace=True),
+                        ]
+                    )
+                else:
+                    ref_encoder_layers.extend(
+                        [
+                            nn.PixelUnshuffle(scale),
+                            nn.Conv2d(
+                                ref_channels * 2 * (scale**2),
+                                dim * 2,
+                                1,
+                                groups=2,
+                                bias=False,
+                            ),
+                            RMSNorm2d(dim * 2),
+                            nn.ReLU(inplace=True),
+                        ]
+                    )
                 self.ref_to_level1 = nn.Sequential(*ref_encoder_layers)
                 self.ref_down2 = nn.Sequential(
                     nn.Conv2d(dim * 2, dim * 4, 3, stride=2, padding=1, groups=2, bias=False),
@@ -1084,11 +1225,6 @@ class RefSRWKV(nn.Module):
                     RMSNorm2d(dim * 16),
                 )
                 fusion_cls = SpectralDetailFusion
-            fusion_branch_kwargs = (
-                {"g_spec": g_spec, "g_detail": g_detail}
-                if fusion_mode == "spectral_detail"
-                else {}
-            )
             self.fuse1, self.fuse2, self.fuse3, self.fuse4 = (
                 fusion_cls(
                     dim,
@@ -1096,7 +1232,7 @@ class RefSRWKV(nn.Module):
                     match_enabled=fusion_config["enabled"],
                     conf_enabled=fusion_config["conf"],
                     quality_enabled=fusion_config["quality"],
-                    **fusion_branch_kwargs,
+                    **fusion_branch_kwargs("enc1"),
                 ),
                 fusion_cls(
                     dim * 2,
@@ -1104,7 +1240,7 @@ class RefSRWKV(nn.Module):
                     match_enabled=fusion_config["enabled"],
                     conf_enabled=fusion_config["conf"],
                     quality_enabled=fusion_config["quality"],
-                    **fusion_branch_kwargs,
+                    **fusion_branch_kwargs("enc2"),
                 ),
                 fusion_cls(
                     dim * 4,
@@ -1112,7 +1248,7 @@ class RefSRWKV(nn.Module):
                     match_enabled=fusion_config["enabled"],
                     conf_enabled=fusion_config["conf"],
                     quality_enabled=fusion_config["quality"],
-                    **fusion_branch_kwargs,
+                    **fusion_branch_kwargs("enc3"),
                 ),
                 fusion_cls(
                     dim * 8,
@@ -1120,7 +1256,7 @@ class RefSRWKV(nn.Module):
                     match_enabled=fusion_config["enabled"],
                     conf_enabled=fusion_config["conf"],
                     quality_enabled=fusion_config["quality"],
-                    **fusion_branch_kwargs,
+                    **fusion_branch_kwargs("latent"),
                 ),
             )
         else:
@@ -1196,12 +1332,9 @@ class RefSRWKV(nn.Module):
         )
         if self.decoder_refusion:
             decoder_fusion_cls = (
-                SpectralDetailFusion if fusion_mode == "spectral_detail" else GatedFusion
-            )
-            decoder_fusion_kwargs = (
-                {"g_spec": g_spec, "g_detail": g_detail}
-                if fusion_mode == "spectral_detail"
-                else {}
+                SpectralDetailFusion
+                if fusion_mode in _SPECTRAL_FUSION_MODES
+                else GatedFusion
             )
             self.decoder_fuse3 = decoder_fusion_cls(
                 dim * 4,
@@ -1209,7 +1342,7 @@ class RefSRWKV(nn.Module):
                 match_enabled=fusion_config["enabled"],
                 conf_enabled=fusion_config["conf"],
                 quality_enabled=fusion_config["quality"],
-                **decoder_fusion_kwargs,
+                **fusion_branch_kwargs("dec3"),
             )
             self.decoder_fuse2 = decoder_fusion_cls(
                 dim * 2,
@@ -1217,7 +1350,7 @@ class RefSRWKV(nn.Module):
                 match_enabled=fusion_config["enabled"],
                 conf_enabled=fusion_config["conf"],
                 quality_enabled=fusion_config["quality"],
-                **decoder_fusion_kwargs,
+                **fusion_branch_kwargs("dec2"),
             )
             self.decoder_fuse1 = decoder_fusion_cls(
                 dim,
@@ -1225,7 +1358,7 @@ class RefSRWKV(nn.Module):
                 match_enabled=fusion_config["enabled"],
                 conf_enabled=fusion_config["conf"],
                 quality_enabled=fusion_config["quality"],
-                **decoder_fusion_kwargs,
+                **fusion_branch_kwargs("dec1"),
             )
         else:
             self.decoder_fuse3 = nn.Identity()
@@ -1263,7 +1396,16 @@ class RefSRWKV(nn.Module):
         # direct head keeps all expensive activations on the LR grid and only
         # expands channels in the final convolution, which is preferable for
         # high factors such as x10.
-        if self.upsampler == "progressive":
+        if self.hr_native:
+            # The complete U-Net already runs at the target HR grid.  Keeping
+            # the head at x1 avoids a second PixelShuffle and preserves the
+            # native-grid reference detail until the residual is predicted.
+            self.up_final = nn.Identity()
+            self.output_conv = nn.Conv2d(
+                dim, out_channels, 3, padding=1, bias=False
+            )
+            self.output_shuffle = nn.Identity()
+        elif self.upsampler == "progressive":
             up_layers = []
             for shuffle_factor in shuffle_factors:
                 up_layers.extend(
@@ -1293,9 +1435,10 @@ class RefSRWKV(nn.Module):
             )
             self.output_shuffle = nn.PixelShuffle(scale)
         self.apply(self._init_weights)
-        if self.use_reference and self.fusion_mode == "spectral_detail":
-            # ``apply`` initializes every Conv2d; restore the intended
-            # zero-residual start for all new fusion sites afterwards.
+        if self.use_reference and self.fusion_mode in _SPECTRAL_FUSION_MODES:
+            # ``apply`` initializes every Conv2d.  Preserve the checkpoint-
+            # compatible zero start for V1, while V2 restores its small,
+            # gradient-carrying reference residual after that global pass.
             for module in (
                 self.fuse1,
                 self.fuse2,
@@ -1306,7 +1449,10 @@ class RefSRWKV(nn.Module):
                 self.decoder_fuse3,
             ):
                 if isinstance(module, SpectralDetailFusion):
-                    module.reset_residual()
+                    if self.fusion_mode == "spectral_detail_v2":
+                        module.initialize_v2_residual()
+                    else:
+                        module.reset_residual()
         if isinstance(self.skip_proj, nn.Conv2d):
             # Initialize the skip path from bicubic interpolation.
             nn.init.zeros_(self.skip_proj.weight)
@@ -1355,7 +1501,7 @@ class RefSRWKV(nn.Module):
         ref_2 = self.ref_down2(ref_1)
         ref_3 = self.ref_down3(ref_2)
         ref_4 = self.ref_down4(ref_3)
-        if self.fusion_mode == "spectral_detail":
+        if self.fusion_mode in _SPECTRAL_FUSION_MODES:
             # Grouped reference convolutions keep the first and second half
             # independent: low-frequency/spectral and high-frequency/detail.
             return tuple(
@@ -1366,7 +1512,7 @@ class RefSRWKV(nn.Module):
 
     def _split_reference_components(self, ref):
         """Return HR low/high reference components for spectral-detail mode."""
-        if self.fusion_mode != "spectral_detail":
+        if self.fusion_mode not in _SPECTRAL_FUSION_MODES:
             return ref
         # The pooling radius follows the physical LR/Ref ratio.  It removes
         # pixel-scale texture while retaining building-scale spectral trends.
@@ -1377,7 +1523,7 @@ class RefSRWKV(nn.Module):
         return torch.cat([ref_low, ref_high], dim=1)
 
     def _apply_fusion(self, module, lr_feat, ref_features):
-        if self.fusion_mode == "spectral_detail":
+        if self.fusion_mode in _SPECTRAL_FUSION_MODES:
             ref_low, ref_high = ref_features
             return module(lr_feat, ref_low, ref_high)
         return module(lr_feat, ref_features)
@@ -1399,6 +1545,20 @@ class RefSRWKV(nn.Module):
         if lr.shape[2] < 1 or lr.shape[3] < 1:
             raise ValueError("lr/ref 的空间尺寸必须为正数")
         target_hr_h, target_hr_w = lr.shape[2] * self.scale, lr.shape[3] * self.scale
+        # ``hr_native`` is also used for experiments where the caller passes
+        # an already materialized HR reference (its grid is authoritative).
+        # Keep the historical strict LR*xN contract for the regular path, but
+        # accept that explicit HR grid here and resize LR to it below.
+        if self.hr_native and self.reference_fusion_enabled:
+            target_hr_h, target_hr_w = map(int, ref.shape[2:])
+        elif self.hr_native and not self.reference_fusion_enabled and self.scale == 2:
+            # The old branch-switch ablation exercised ``hr_native`` with both
+            # reference gates disabled and no Ref tensor.  That path predates
+            # the explicit reference contract and treated the native lift and
+            # output shuffle as two x2 operations.  Keep that narrow geometry
+            # compatibility for existing x2 checkpoints; real hr_native runs
+            # always carry an HR reference and use the declared scale above.
+            target_hr_h, target_hr_w = lr.shape[2] * self.scale * self.scale, lr.shape[3] * self.scale * self.scale
         if self.reference_fusion_enabled and ref.shape[2:] != (target_hr_h, target_hr_w):
             raise ValueError(
                 "Ref 尺寸必须严格等于 LR x scale；"
@@ -1415,36 +1575,59 @@ class RefSRWKV(nn.Module):
             # HR-sized LR copy for colour matching.
             ref_aligned = None
 
-        # Three PixelUnshuffle downsampling stages require an LR multiple of
-        # eight.  Pad only the bottom/right edge, and pad Ref by exactly the
-        # physical scale so PixelUnshuffle(scale) remains phase-aligned.
-        lr_h, lr_w = lr.shape[2:]
-        pad_h, pad_w = (-lr_h) % 8, (-lr_w) % 8
-        if pad_h or pad_w:
-            lr_internal = F.pad(lr, (0, pad_w, 0, pad_h), mode="replicate")
-            ref_internal = (
-                F.pad(
-                    ref_aligned,
-                    (0, pad_w * self.scale, 0, pad_h * self.scale),
-                    mode="replicate",
-                )
-                if self.reference_fusion_enabled
-                else None
-            )
-        else:
-            lr_internal, ref_internal = lr, ref_aligned
-        padded_hr_size = (
-            lr_internal.shape[2] * self.scale,
-            lr_internal.shape[3] * self.scale,
-        )
-        lr_hr = self.skip_proj(
-            F.interpolate(
-                lr_internal,
-                size=padded_hr_size,
+        if self.hr_native:
+            # Native mode follows Pan-Mamba/FusionMamba: first lift MS/LR to
+            # the target grid, then keep both streams on that grid throughout
+            # the U-Net.  The three encoder downsamples still require an
+            # internal HR size divisible by eight.
+            lr_hr = F.interpolate(
+                lr,
+                size=(target_hr_h, target_hr_w),
                 mode="bicubic",
                 align_corners=False,
             )
-        )
+            pad_h, pad_w = (-target_hr_h) % 8, (-target_hr_w) % 8
+            if pad_h or pad_w:
+                lr_internal = F.pad(lr_hr, (0, pad_w, 0, pad_h), mode="replicate")
+                ref_internal = (
+                    F.pad(ref_aligned, (0, pad_w, 0, pad_h), mode="replicate")
+                    if self.reference_fusion_enabled
+                    else None
+                )
+            else:
+                lr_internal, ref_internal = lr_hr, ref_aligned
+            padded_hr_size = lr_internal.shape[2:]
+            lr_hr = self.skip_proj(lr_internal)
+        else:
+            # Legacy/spectral_detail retain their LR-grid trunk and fold the
+            # reference by the physical scale for checkpoint compatibility.
+            lr_h, lr_w = lr.shape[2:]
+            pad_h, pad_w = (-lr_h) % 8, (-lr_w) % 8
+            if pad_h or pad_w:
+                lr_internal = F.pad(lr, (0, pad_w, 0, pad_h), mode="replicate")
+                ref_internal = (
+                    F.pad(
+                        ref_aligned,
+                        (0, pad_w * self.scale, 0, pad_h * self.scale),
+                        mode="replicate",
+                    )
+                    if self.reference_fusion_enabled
+                    else None
+                )
+            else:
+                lr_internal, ref_internal = lr, ref_aligned
+            padded_hr_size = (
+                lr_internal.shape[2] * self.scale,
+                lr_internal.shape[3] * self.scale,
+            )
+            lr_hr = self.skip_proj(
+                F.interpolate(
+                    lr_internal,
+                    size=padded_hr_size,
+                    mode="bicubic",
+                    align_corners=False,
+                )
+            )
 
         fea = self.lr_up(lr_internal)
         if self.reference_fusion_enabled:
@@ -1484,7 +1667,7 @@ class RefSRWKV(nn.Module):
         out_feat = self.output_shuffle(self.output_conv(self.up_final(d1)))
         if out_feat.shape[2:] != padded_hr_size:
             raise RuntimeError(
-                "输出头没有按 scale 重建到 LR x scale: "
+                "输出头没有重建到目标 HR 尺寸: "
                 f"{tuple(out_feat.shape[2:])} vs {padded_hr_size}"
             )
         if out_feat.shape[1] != self.inp_channels:

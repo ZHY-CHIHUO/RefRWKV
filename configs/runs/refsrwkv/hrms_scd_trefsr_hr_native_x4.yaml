@@ -1,0 +1,17 @@
+# Fresh HRMS-SCD run for native-grid reference fusion.
+# The entire RefSRWKV trunk operates at the HR grid, following the
+# MS/PAN interaction layout used by Pan-Mamba and FusionMamba.
+base: hrms_scd_x4.yaml
+
+run:
+  name: hrms_scd_trefsr_hr_native_x4
+
+model:
+  use_reference: true
+  fusion_mode: hr_native
+  # Avoid global Ref/LR statistics remapping in the first comparison run;
+  # the low-frequency branch learns spectral correction explicitly.
+  color_match: none
+  g_spec: true
+  g_detail: true
+  decoder_refusion: true

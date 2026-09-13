@@ -27,6 +27,8 @@ _MODEL_FIELDS = {
     "fusion_mode",
     "g_spec",
     "g_detail",
+    "detail_fusion_stages",
+    "detail_confidence_floor",
     "use_reference",
     "decoder_refusion",
     "global_latent_blocks",

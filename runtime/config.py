@@ -59,10 +59,12 @@ _PAIRED_ONLY_LOSS_KEYS = ("ref_drop_prob",)
 # runtime (rather than importing model packages here) lets config rendering,
 # training and evaluation agree on the task without pulling optional model
 # dependencies into the configuration parser.
-DIRECT_REFSR_MODEL_NAMES = frozenset({"refsrwkv", "ttsr", "masa_sr", "datsr"})
+DIRECT_REFSR_MODEL_NAMES = frozenset({"refsrwkv", "rdm_refsr", "ttsr", "masa_sr", "datsr"})
 REFSR_MODEL_NAMES = DIRECT_REFSR_MODEL_NAMES | frozenset({"refdiffrwkv"})
 PAIRED_REFERENCE_MODEL_NAMES = frozenset({"ttsr", "masa_sr", "datsr", "refdiffrwkv"})
-REFSRWKV_FUSION_MODES = frozenset({"legacy", "spectral_detail"})
+REFSRWKV_FUSION_MODES = frozenset(
+    {"legacy", "spectral_detail", "spectral_detail_v2", "hr_native"}
+)
 
 
 def normalize_reference_mode(value: Any) -> str:
@@ -542,6 +544,31 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
         for branch in ("g_spec", "g_detail"):
             if branch in model and not isinstance(model[branch], bool):
                 raise ValueError(f"model.{branch} 必须是 bool")
+        if "detail_fusion_stages" in model:
+            stages = model["detail_fusion_stages"]
+            if isinstance(stages, (str, bytes)) or not isinstance(
+                stages, (list, tuple, set, frozenset)
+            ):
+                raise ValueError("model.detail_fusion_stages 必须是融合阶段名称序列")
+            valid_fusion_stages = {
+                "enc1", "enc2", "enc3", "latent", "dec3", "dec2", "dec1"
+            }
+            unknown = {str(stage).strip().lower() for stage in stages}.difference(
+                valid_fusion_stages
+            )
+            if unknown:
+                raise ValueError(
+                    "model.detail_fusion_stages 包含未知阶段: "
+                    + ", ".join(sorted(unknown))
+                )
+        if "detail_confidence_floor" in model:
+            floor = model["detail_confidence_floor"]
+            if (
+                isinstance(floor, bool)
+                or not isinstance(floor, (int, float))
+                or not 0.0 <= float(floor) < 1.0
+            ):
+                raise ValueError("model.detail_confidence_floor 必须位于 [0, 1)")
         declared_channels: dict[str, int] = {}
         for field in ("inp_channels", "out_channels", "ref_channels"):
             if field not in model:
@@ -555,14 +582,58 @@ def validate_config(config: dict[str, Any], *, require_data: bool = True) -> Non
         inp_channels = declared_channels.get("inp_channels")
         out_channels = declared_channels.get("out_channels")
         ref_channels = declared_channels.get("ref_channels")
-        if inp_channels is not None and out_channels is not None and out_channels != inp_channels:
-            raise ValueError(
-                "model.out_channels 必须等于 model.inp_channels；输出通道数跟随 LR"
-            )
-        if inp_channels is not None and ref_channels is not None and ref_channels > inp_channels:
-            raise ValueError(
-                "model.ref_channels 不能大于 model.inp_channels；LR 通道数必须 >= Ref 通道数"
-            )
+        # The historical RefSRWKV contract assumes RGB-like equal channel
+        # counts.  RDMRefSR deliberately separates query, reference and target
+        # channels so LR-HSI + HR-MSI and MS + PAN can use the same backbone.
+        model_name = str(model.get("name") or model.get("id") or "").strip().lower()
+        if model_name != "rdm_refsr":
+            if inp_channels is not None and out_channels is not None and out_channels != inp_channels:
+                raise ValueError(
+                    "model.out_channels 必须等于 model.inp_channels；输出通道数跟随 LR"
+                )
+            if inp_channels is not None and ref_channels is not None and ref_channels > inp_channels:
+                raise ValueError(
+                    "model.ref_channels 不能大于 model.inp_channels；LR 通道数必须 >= Ref 通道数"
+                )
+        else:
+            reference_kind = str(model.get("reference_kind", "temporal")).strip().lower()
+            if reference_kind not in {"pan", "pansharpening", "pan_guided", "temporal", "cross_temporal", "hrms", "hsi_msi", "msi_hsi", "hyperspectral_multispectral", "generic", "aligned"}:
+                raise ValueError(
+                    "model.reference_kind 必须是 pan、temporal、hsi_msi 或 generic"
+                )
+            target_channels = model.get("target_channels", out_channels or inp_channels)
+            if target_channels is not None and (
+                isinstance(target_channels, bool)
+                or not isinstance(target_channels, int)
+                or target_channels < 1
+            ):
+                raise ValueError("model.target_channels 必须是正整数")
+            if out_channels is not None and target_channels is not None and out_channels != target_channels:
+                raise ValueError("model.out_channels 必须与 model.target_channels 一致")
+            if "match_grid" in model and str(model["match_grid"]).strip().lower() not in {"lr", "coefficient"}:
+                raise ValueError("model.match_grid 必须是 lr 或 coefficient")
+            if "temporal_match_confidence_floor" in model:
+                floor = model["temporal_match_confidence_floor"]
+                if (
+                    isinstance(floor, bool)
+                    or not isinstance(floor, (int, float))
+                    or not 0.0 <= float(floor) < 1.0
+                ):
+                    raise ValueError(
+                        "model.temporal_match_confidence_floor 必须位于 [0, 1)"
+                    )
+            valid_rdm_stages = {"enc0", "enc1", "enc2", "latent", "dec2", "dec1", "dec0", "coeff"}
+            for schedule_name in ("mamba_stages", "reference_condition_stages", "detail_injection_stages"):
+                if schedule_name not in model:
+                    continue
+                schedule = model[schedule_name]
+                if isinstance(schedule, (str, bytes)) or not isinstance(schedule, (list, tuple, set, frozenset)):
+                    raise ValueError(f"model.{schedule_name} 必须是阶段名称序列")
+                unknown = {str(item).strip().lower() for item in schedule}.difference(valid_rdm_stages)
+                if unknown:
+                    raise ValueError(
+                        f"model.{schedule_name} 包含未知阶段: {', '.join(sorted(unknown))}"
+                    )
     if test and isinstance(test, Mapping):
         splits = test.get("split", test.get("splits", ["test"]))
         if isinstance(splits, str):

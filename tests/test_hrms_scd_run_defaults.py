@@ -24,7 +24,9 @@ RUN_CONFIGS = (
     "configs/runs/refsrwkv/hrms_scd_sr_x4.yaml",
     "configs/runs/refsrwkv/hrms_scd_trefsr_x4.yaml",
     "configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml",
+    "configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_v2_x4.yaml",
     "configs/runs/refsrwkv/pancollection_wv3_spectral_detail_x4.yaml",
+    "configs/runs/refsrwkv/pancollection_wv3_spectral_detail_v2_x4.yaml",
     "configs/runs/refsr/ttsr/hrms_scd_x4.yaml",
     "configs/runs/refsr/masa_sr/hrms_scd_x4.yaml",
     "configs/runs/refsr/datsr/hrms_scd_x4.yaml",
@@ -68,6 +70,8 @@ class HRMSSCDRunDefaultsTests(unittest.TestCase):
         expected = {
             "configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_x4.yaml": (3, 3, 3),
             "configs/runs/refsrwkv/pancollection_wv3_spectral_detail_x4.yaml": (8, 1, 8),
+            "configs/runs/refsrwkv/hrms_scd_trefsr_spectral_detail_v2_x4.yaml": (3, 3, 3),
+            "configs/runs/refsrwkv/pancollection_wv3_spectral_detail_v2_x4.yaml": (8, 1, 8),
         }
         for path, channels in expected.items():
             with self.subTest(path=path):
@@ -77,8 +81,11 @@ class HRMSSCDRunDefaultsTests(unittest.TestCase):
                     (model["inp_channels"], model["ref_channels"], model["out_channels"]),
                     channels,
                 )
-                self.assertEqual(model["fusion_mode"], "spectral_detail")
-                self.assertTrue(model["g_spec"])
+                self.assertIn(model["fusion_mode"], {"spectral_detail", "spectral_detail_v2"})
+                self.assertEqual(
+                    model["g_spec"],
+                    path != "configs/runs/refsrwkv/pancollection_wv3_spectral_detail_v2_x4.yaml",
+                )
                 self.assertTrue(model["g_detail"])
                 self.assertTrue(model["use_reference"])
                 self.assertEqual(config["data"]["reference_mode"], "paired")

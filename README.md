@@ -59,10 +59,19 @@ RefRWKV/
 
 ## 环境
 
-先按本机 CUDA 版本从 PyTorch 官网安装匹配的 `torch`/`torchvision`，再安装 SR 和 RefSRWKV 的核心依赖：
+先按本机 CUDA 版本从 PyTorch 官网安装匹配的 `torch`/`torchvision`，再在主 `rwkv7` 环境安装 SR、RefSRWKV 和 RDMRefSR 的依赖：
 
 ```bash
+conda activate rwkv7
 python -m pip install -r requirements.txt
+```
+
+RDMRefSR 的 CUDA 路径使用官方 `mamba_ssm.Mamba`（以及它的
+`causal-conv1d` 扩展），不是卷积近似；`requirements.txt` 已将它们固定在
+兼容的大版本范围内。可用下面的命令检查当前环境：
+
+```bash
+conda run -n rwkv7 python -c "from mamba_ssm import Mamba; import causal_conv1d; print('RDMRefSR Mamba backend: OK')"
 ```
 
 RefDiffRWKV、离线 LPIPS/DISTS/SAM 指标额外安装：
@@ -74,7 +83,7 @@ python -m pip install -r requirements-refdiff.txt
 Stage 4 还需要 `vision_aided_loss`，其上游安装命令写在 `requirements-refdiff.txt`。WKV CUDA 后端需要本机 CUDA toolkit/NVCC；模型导入和 `--help` 不会主动编译扩展。
 
 EDSR、RCAN、HAT、MambaIRv2、TTSR、MASA-SR、DATSR 的可训练 compatibility
-基线已包含在主环境；官方旧代码或编译依赖不要混装进 `rwkv7`。环境 YAML、风险
+基线已包含在主环境；RDMRefSR 的 Mamba 依赖也安装在 `rwkv7`。官方旧代码或编译依赖不要混装进 `rwkv7`。环境 YAML、风险
 和结果可比性边界见 [环境说明](environments/README.md) 与
 完整基线协议和模型说明见 [`models/README.md`](models/README.md)。
 
