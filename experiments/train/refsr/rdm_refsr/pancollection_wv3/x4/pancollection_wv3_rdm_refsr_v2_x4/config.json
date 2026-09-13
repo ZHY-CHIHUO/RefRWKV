@@ -1,0 +1,186 @@
+{
+  "data": {
+    "batch_size": 32,
+    "val_batch_size": 64,
+    "num_workers": 8,
+    "val_num_workers": 4,
+    "prefetch_factor": 4,
+    "persistent_workers": true,
+    "pin_memory": true,
+    "drop_last": true,
+    "max_samples_train": null,
+    "max_samples_val": null,
+    "max_samples_test": null,
+    "sample_seed": 42,
+    "augment": true,
+    "reference_mode": "paired",
+    "root": "/mnt/sdb/datasets/全色多光谱融合数据集/PanCollection/training_wv3",
+    "scale": 4,
+    "lr_native_scale": 4,
+    "lr_provenance": "sensor",
+    "lr_source": "stored",
+    "dataset_format": "pancollection_h5",
+    "dataset_kind": "pancollection_h5",
+    "channels": 8,
+    "normalization": 2047.0,
+    "train_lr_patch": 16,
+    "train_hr_patch": 64,
+    "patch_size": 64,
+    "lr_key": "lr",
+    "hr_key": "hr",
+    "ref_key": "ref"
+  },
+  "train": {
+    "accelerator": "auto",
+    "devices": 1,
+    "precision": "bf16-mixed",
+    "max_epochs": -1,
+    "max_steps": 100000,
+    "val_check_interval": 1.0,
+    "check_val_every_n_epoch": 1,
+    "accumulate_grad_batches": 1,
+    "log_every_n_steps": 50,
+    "num_sanity_val_steps": 0,
+    "grad_clip_norm": 1.0,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.0,
+    "adam_betas": [
+      0.9,
+      0.999
+    ],
+    "lr_scheduler": "plateau",
+    "lr_patience": 3,
+    "lr_factor": 0.5,
+    "lr_threshold": 0.0001,
+    "lr_min": 1e-06,
+    "use_ema": true,
+    "ema_decay": 0.999,
+    "save_top_k": 3,
+    "early_stopping_patience": null,
+    "auto_resume": true,
+    "seed": 42,
+    "stop_at_lr_min": true
+  },
+  "output": {
+    "root": "experiments",
+    "train_root": "experiments/train",
+    "test_root": "experiments/test",
+    "experiment_name": "pancollection_wv3_rdm_refsr_v2_x4",
+    "checkpoint_dir": "experiments/train/refsr/rdm_refsr/pancollection_wv3/x4/pancollection_wv3_rdm_refsr_v2_x4/checkpoints",
+    "log_dir": "experiments/train/refsr/rdm_refsr/pancollection_wv3/x4/pancollection_wv3_rdm_refsr_v2_x4/logs",
+    "test_dir": "experiments/test/refsr/rdm_refsr/pancollection_wv3/x4/pancollection_wv3_rdm_refsr_v2_x4"
+  },
+  "task": "refsr",
+  "loss": {
+    "name": "l1",
+    "eps": 0.001,
+    "sam_weight": 0.01,
+    "wavelet_weight": 0.15,
+    "consistency_weight": 0.05,
+    "sensor_weight": 0.1,
+    "change_weight": 0.05,
+    "ref_drop_prob": 0.1,
+    "ssim_weight": 0.0,
+    "fft_weight": 0.0
+  },
+  "model": {
+    "name": "rdm_refsr",
+    "family": "refsr",
+    "variant": "rdm_refsr_v2",
+    "implementation": "dual_grid_rwkv_mamba",
+    "inp_channels": 8,
+    "out_channels": 8,
+    "ref_channels": 1,
+    "target_channels": 8,
+    "dim": 48,
+    "depths": [
+      2,
+      2,
+      3,
+      4
+    ],
+    "decoder_depths": [
+      3,
+      2,
+      2
+    ],
+    "reference_kind": "pan",
+    "mamba_stages": [
+      "enc2",
+      "latent",
+      "dec2"
+    ],
+    "reference_condition_stages": [
+      "enc2",
+      "latent",
+      "dec1",
+      "coeff"
+    ],
+    "detail_injection_stages": [
+      "dec1",
+      "coeff"
+    ],
+    "mamba_d_state": 16,
+    "mamba_d_conv": 4,
+    "mamba_expand": 2,
+    "allow_cpu_mamba": true,
+    "shuffle_prob": 0.15,
+    "shuffle_block": 4,
+    "match_window": 5,
+    "match_dim": 16,
+    "match_grid": "coefficient",
+    "temporal_match_confidence_floor": 0.15,
+    "alignment": false,
+    "max_offset": 3.0,
+    "use_reference": true,
+    "clamp_output": true,
+    "sensor_response": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "dataset": {
+    "id": "pancollection_wv3",
+    "name": "PanCollection WorldView-3 reduced-resolution pansharpening",
+    "kind": "pancollection_h5",
+    "format": "pancollection_h5",
+    "root": "/mnt/sdb/datasets/全色多光谱融合数据集/PanCollection/training_wv3",
+    "default_scale": 4,
+    "lr": {
+      "native_scale": 4,
+      "provenance": "sensor",
+      "source": "stored"
+    },
+    "value_scale": 2047.0,
+    "source": {
+      "channels": 8,
+      "ref_channels": 1,
+      "normalization": 2047.0,
+      "layout": "NCHW"
+    },
+    "h5_keys": {
+      "hr": "gt",
+      "lr": "ms",
+      "ref": "pan"
+    },
+    "files": {
+      "train": "train_wv3.h5",
+      "val": "valid_wv3.h5",
+      "test": "reduced_examples/test_wv3_multiExm1.h5",
+      "test_easy": "reduced_examples/test_wv3_multiExm1.h5",
+      "test_hard": "reduced_examples/test_wv3_multiExm1.h5"
+    }
+  },
+  "run": {
+    "name": "pancollection_wv3_rdm_refsr_v2_x4",
+    "scale": 4,
+    "lr_patch": 16
+  },
+  "_config_path": "/mnt/sda/home/zhangheyi/projects/RefRWKV/experiments/train/refsr/rdm_refsr/pancollection_wv3/x4/pancollection_wv3_rdm_refsr_v2_x4/config.yaml"
+}
