@@ -32,6 +32,5 @@ bash scripts/shortcuts/test/fusion_mamba_pancollection_wv3.sh \
   /path/to/420.pth --batch-size 16 --no-save-images
 ```
 
-该适配器固定使用官方 64x64 HR patch（16x16 MS/LR），并将项目的 `[-1, 1]`
-张量转换为 FusionMamba 所需的 `[0, 1]` 范围。测试数据根目录仍由
+该适配器使用全图 `256x256` HR 输入，数据和模型都走 `[0, 1]` 范围。测试数据根目录仍由
 `configs/datasets/refsr/pancollection_wv3.yaml` 中的 PanCollection H5 配置决定。

@@ -738,10 +738,7 @@ class SD2RefGANSystem(LightningModule):
         if self.sr_model is None:
             return None
         with torch.amp.autocast(self.device.type, enabled=False):
-            sr_pixel = self.sr_model(lr.float(), ref.float())
-            sr_pixel = torch.nan_to_num(
-                sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0
-            ).clamp(-1.0, 1.0)
+            sr_pixel = self.generator._native_sr_pixel(lr, ref)
             return self.generator.encode_latent(sr_pixel.to(self.generator.latent_dtype))
 
     def _get_sr_latent_with_grad(self, lr, ref):
@@ -753,10 +750,7 @@ class SD2RefGANSystem(LightningModule):
         if self.sr_model is None:
             return None
         with torch.amp.autocast(self.device.type, enabled=False):
-            sr_pixel = self.sr_model(lr.float(), ref.float())
-            sr_pixel = torch.nan_to_num(
-                sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0
-            ).clamp(-1.0, 1.0)
+            sr_pixel = self.generator._native_sr_pixel(lr, ref)
             return self.generator.encode_latent_with_grad(
                 sr_pixel.to(self.generator.latent_dtype)
             )
@@ -1602,14 +1596,10 @@ class SD2RefGANSystem(LightningModule):
         with torch.no_grad():
             with torch.amp.autocast(self.device.type, enabled=False):
                 sr_prior = (
-                    self.sr_model(lr.float(), ref.float())
+                    self.generator._native_sr_pixel(lr, ref)
                     if self.sr_model is not None
                     else None
                 )
-                if sr_prior is not None:
-                    sr_prior = torch.nan_to_num(
-                        sr_prior, nan=0.0, posinf=1.0, neginf=-1.0
-                    ).clamp(-1.0, 1.0)
 
         images_to_concat = []
         for image_key in ("lq", "ref", "hq", "samples"):

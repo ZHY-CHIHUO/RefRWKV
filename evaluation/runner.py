@@ -198,13 +198,13 @@ def _reference_for_refsr_batch(
 
 
 def _image_tensor(value: torch.Tensor, *, value_range: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return metric-space ``[-1, 1]`` and PNG-space ``[0, 1]`` tensors."""
-    value = torch.nan_to_num(value.float(), nan=0.0, posinf=1.0, neginf=-1.0)
-    if value_range == "zero_one":
+    """Return metric-space and PNG-space tensors in ``[0, 1]``."""
+    value = torch.nan_to_num(value.float(), nan=0.0, posinf=1.0, neginf=0.0)
+    if value_range == "minus_one_one":
+        png = ((value.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+    else:
         png = value.clamp(0.0, 1.0)
-        return png * 2.0 - 1.0, png
-    metric = value.clamp(-1.0, 1.0)
-    return metric, ((metric + 1.0) * 0.5).clamp(0.0, 1.0)
+    return png, png
 
 
 def _normalize_sample_ids(value: Any, batch_size: int) -> list[str]:
@@ -300,7 +300,7 @@ def _build_refsr_model(
             channel_adaptation=channel_adaptation,
         )
         LOGGER.info("loaded direct RefSR checkpoint (%s): %s", model_name, report)
-        return model.to(device).eval(), "minus_one_one", None
+        return model.to(device).eval(), "zero_one", None
 
     # Share the builder with the training entry point so prior loading and
     # Stable-Diffusion construction use the same rules.
@@ -393,7 +393,7 @@ def run_inference(
         else:
             LOGGER.info("running parameter-free Bicubic baseline without a checkpoint")
         model = model.to(selected_device).eval()
-        value_range, generator = "minus_one_one", None
+        value_range, generator = "zero_one", None
     else:
         assert checkpoint_obj is not None
         loader = build_refsr_test_loader(config, split=split, batch_size=configured_batch_size)
@@ -541,7 +541,7 @@ def run_inference(
                 )
                 prediction_metric, prediction_png = _image_tensor(prediction_png, value_range="zero_one")
 
-            hr_metric, _ = _image_tensor(hr, value_range="minus_one_one")
+            hr_metric, _ = _image_tensor(hr, value_range="zero_one")
             if prediction_metric.shape != hr_metric.shape:
                 raise ValueError(
                     f"模型输出与 HR 尺寸不一致: {tuple(prediction_metric.shape)} vs {tuple(hr_metric.shape)}"
@@ -559,7 +559,7 @@ def run_inference(
                     prediction_metric,
                     hr_metric,
                     resolution_ratio=wuhan_ratio,
-                    value_range="minus_one_one",
+                    value_range="zero_one",
                 )
                 for key in wuhan_values:
                     if key in requested_wuhan_keys:

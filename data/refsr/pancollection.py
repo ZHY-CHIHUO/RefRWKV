@@ -24,7 +24,7 @@ class PanCollectionH5Dataset(Dataset):
     The H5 handle is opened lazily in each worker process, which avoids sharing
     an inherited file descriptor with a forked DataLoader worker.  Values are
     converted from PanCollection's DN/[0, 2047] representation to the
-    repository's ``[-1, 1]`` range.
+    repository's ``[0, 1]`` range.
     """
 
     _VALID_MODES = {"train", "val", "test", "test_easy", "test_hard"}
@@ -209,11 +209,13 @@ class PanCollectionH5Dataset(Dataset):
         if not np.isfinite(values).all():
             raise ValueError("PanCollection sample contains non-finite values")
         minimum, maximum = float(values.min()), float(values.max())
-        if minimum >= -1.0 and maximum <= 1.0 and value_scale <= 1.0:
-            normalized = values if minimum < 0.0 else values * 2.0 - 1.0
+        if minimum >= 0.0 and maximum <= 1.0 and value_scale <= 1.0:
+            normalized = values
+        elif minimum >= -1.0 and maximum <= 1.0 and value_scale <= 1.0:
+            normalized = (values + 1.0) * 0.5
         else:
-            normalized = values / value_scale * 2.0 - 1.0
-        return np.clip(normalized, -1.0, 1.0) if clip_range else normalized
+            normalized = values / value_scale
+        return np.clip(normalized, 0.0, 1.0) if clip_range else normalized
 
     @staticmethod
     def _spatial_transform(images: dict[str, np.ndarray], *, augment: bool) -> dict[str, np.ndarray]:

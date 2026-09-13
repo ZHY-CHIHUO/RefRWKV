@@ -1,7 +1,7 @@
 """Portable reference-SR comparison baselines.
 
 The native RefSR contract in this repository is intentionally narrow:
-``forward(lr, ref) -> sr``, where all tensors use RGB ``[-1, 1]`` values and
+``forward(lr, ref) -> sr``, where all tensors use RGB ``[0, 1]`` values and
 the reference/output resolution is ``lr * scale``.  TTSR, MASA-SR and DATSR
 were released with substantially different and, in DATSR's case, legacy CUDA
 dependency stacks.  The networks below keep the distinguishing *algorithmic
@@ -233,7 +233,7 @@ class _RefSRCompatibilityBase(nn.Module):
         if tuple(residual.shape[-2:]) != expected:
             residual = F.interpolate(residual, size=expected, mode="bilinear", align_corners=False)
         base = F.interpolate(lr, size=expected, mode="bicubic", align_corners=False)
-        return (base + residual).clamp(-1.0, 1.0)
+        return (base + residual).clamp(0.0, 1.0)
 
 
 class TTSRCompatibilityNet(_RefSRCompatibilityBase):

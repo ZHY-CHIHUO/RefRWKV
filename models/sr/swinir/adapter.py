@@ -1,4 +1,4 @@
-"""SwinIR adapter under the repository-wide ``[-1, 1]`` SISR contract."""
+"""SwinIR adapter under the repository-wide ``[0, 1]`` SISR contract."""
 
 from __future__ import annotations
 
@@ -36,9 +36,8 @@ class SwinIRWrapper(nn.Module):
         if lr.ndim != 4 or lr.shape[1] != 3:
             raise ValueError(f"SwinIR expects RGB NCHW input, got {tuple(lr.shape)}")
         height, width = lr.shape[-2:]
-        # SwinIR expects [0, 1] RGB and subtracts the official RGB mean internally.
-        # Project loaders, targets, and metrics use the [-1, 1] convention.
-        output = self.net((lr + 1.0) * 0.5) * 2.0 - 1.0
+        # SwinIR and the project loaders both use [0, 1] RGB.
+        output = self.net(lr.float().clamp(0.0, 1.0)).clamp(0.0, 1.0)
         expected = (height * self.scale, width * self.scale)
         if output.shape[-2:] != expected:
             raise RuntimeError(

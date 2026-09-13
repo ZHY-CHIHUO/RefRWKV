@@ -71,7 +71,7 @@ class PanCollectionDatasetTests(unittest.TestCase):
             "output": {},
         }
 
-    def test_maps_ms_pan_gt_and_normalizes_to_minus_one_one(self) -> None:
+    def test_maps_ms_pan_gt_and_normalizes_to_zero_one(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_file(root / "train.h5", count=1)
@@ -90,7 +90,8 @@ class PanCollectionDatasetTests(unittest.TestCase):
             self.assertEqual(sample["ref"].shape, (1, 8, 8))
             self.assertEqual(sample["hr"].shape, (8, 8, 8))
             self.assertAlmostEqual(float(sample["hr"].max()), 1.0)
-            self.assertTrue(float(sample["lr"].min()) > -0.01)
+            self.assertAlmostEqual(float(sample["lr"].mean()), 0.5, places=5)
+            self.assertGreaterEqual(float(sample["ref"].min()), 0.0)
 
     def test_loader_builds_train_and_validation_from_h5_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

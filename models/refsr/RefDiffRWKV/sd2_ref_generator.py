@@ -95,7 +95,7 @@ class SD2RefGenerator(LightningModule):
         lr_key: str = "lr",
         ref_key: str = "ref",
         hr_key: str = "hr",
-        normalize_input: bool = False,
+        normalize_input: bool = True,
         local_files_only: bool = True,
         sr_model: Optional[torch.nn.Module] = None,
         use_sr_latent_cond: bool = True,
@@ -690,13 +690,28 @@ class SD2RefGenerator(LightningModule):
     #  SR latent 条件生成
     # ═══════════════════════════════════════════════════════
 
+    def _native_sr_pixel(self, lr: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """Run the native SR prior in ``[0, 1]`` and return diffusion-range pixels."""
+        if self.sr_model is None:
+            raise RuntimeError("sr_model is required to compute an SR prior")
+        if self.normalize_input:
+            sr_lr = ((lr.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+            sr_ref = ((ref.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+        else:
+            sr_lr = lr.float().clamp(0.0, 1.0)
+            sr_ref = ref.float().clamp(0.0, 1.0)
+        sr_pixel = self.sr_model(sr_lr, sr_ref)
+        sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        if self.normalize_input:
+            return sr_pixel * 2.0 - 1.0
+        return sr_pixel
+
     def _compute_sr_prior(self, lr: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+
         """统一的 SR prior 计算入口：SR 模型前向 + 数值安全处理。"""
         with torch.amp.autocast(self.device.type, enabled=False):
-            # Run the SR prior on the active device in float32.
-            sr_pixel = self.sr_model(lr.float(), ref.float())
-        sr_pixel = torch.nan_to_num(sr_pixel, nan=0.0, posinf=1.0, neginf=-1.0)
-        return sr_pixel.clamp(-1.0, 1.0)
+            sr_pixel = self._native_sr_pixel(lr, ref)
+        return sr_pixel
 
     def _get_sr_latent_cond(
         self, lr: torch.Tensor, ref: torch.Tensor

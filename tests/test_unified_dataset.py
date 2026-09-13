@@ -156,11 +156,11 @@ class UnifiedDatasetTests(unittest.TestCase):
             self.assertEqual(multiband["hr"].shape, (4, 8, 8))
             self.assertEqual(multiband["ref"].shape, (1, 8, 8))
 
-    def test_signed_integer_raster_is_zero_centered(self) -> None:
+    def test_signed_integer_raster_maps_to_zero_one(self) -> None:
         values = np.array([[-32768, 0, 32767]], dtype=np.int16)
         normalized = SuperResolutionDataset._normalize_array(values[..., None])
         np.testing.assert_allclose(
-            normalized[..., 0], [[-1.0, 0.0, 0.9999695]], rtol=0, atol=1e-6
+            normalized[..., 0], [[0.0, 32768.0 / 65535.0, 1.0]], rtol=0, atol=1e-6
         )
 
 

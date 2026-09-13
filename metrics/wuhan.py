@@ -1,8 +1,8 @@
 """Metrics used by the Wuhan spatiotemporal-fusion benchmark.
 
 All calculations are performed in reflectance ``[0, 1]``.  The training
-pipeline stores tensors in ``[-1, 1]``; pass ``value_range='minus_one_one'``
-to convert them.  Functions return one value per image for batched tensors so
+pipeline stores tensors in ``[0, 1]``; pass ``value_range='minus_one_one'``
+only when converting leftover ``[-1, 1]`` tensors.  Functions return one value per image for batched tensors so
 callers can aggregate without weighting images by their number of pixels.
 """
 
@@ -49,7 +49,7 @@ def _as_nchw(value: torch.Tensor | np.ndarray) -> torch.Tensor:
     return tensor.float()
 
 
-def to_reflectance(value: torch.Tensor | np.ndarray, value_range: str = "minus_one_one") -> torch.Tensor:
+def to_reflectance(value: torch.Tensor | np.ndarray, value_range: str = "zero_one") -> torch.Tensor:
     """Convert an image/batch to NCHW reflectance in ``[0, 1]``."""
     tensor = _as_nchw(value)
     normalized = str(value_range).strip().lower()
@@ -65,7 +65,7 @@ def wuhan_metric_tensors(
     target: torch.Tensor | np.ndarray,
     *,
     resolution_ratio: float = 30.0 / 8.0,
-    value_range: str = "minus_one_one",
+    value_range: str = "zero_one",
     eps: float = 1.0e-12,
 ) -> dict[str, torch.Tensor]:
     """Return batched RMSE/UIQI/PSNR/SAM/ERGAS tensors.
@@ -85,7 +85,8 @@ def wuhan_metric_tensors(
     diff = pred - truth
     mse = diff.square().mean(dim=(1, 2, 3))
     rmse = mse.sqrt()
-    psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(float(eps)))
+    band_mse = diff.square().mean(dim=(2, 3))
+    psnr = (10.0 * torch.log10(1.0 / band_mse.clamp_min(float(eps)))).mean(dim=1)
 
     pred_mean = pred.mean(dim=(2, 3))
     truth_mean = truth.mean(dim=(2, 3))

@@ -155,7 +155,7 @@ class BaseTrainer(pl.LightningModule, ABC):
 
     @staticmethod
     def image_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-        prediction = prediction.clamp(-1.0, 1.0)
+        prediction = prediction.clamp(0.0, 1.0)
         return {
             "psnr": per_image_psnr(prediction, target).mean(),
             "ssim": gaussian_ssim(prediction, target).mean(),
@@ -173,7 +173,7 @@ class BaseTrainer(pl.LightningModule, ABC):
                 prediction,
                 target,
                 resolution_ratio=self.metric_resolution_ratio,
-                value_range="minus_one_one",
+                value_range="zero_one",
             )
             metrics.update(
                 {

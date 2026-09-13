@@ -12,20 +12,17 @@ from .u2net import U2Net
 
 
 class FusionMambaRefSR(U2Net):
-    """Official U2Net with the repository's ``[-1, 1]`` tensor contract.
+    """Official U2Net on the repository's ``[0, 1]`` tensor contract.
 
-    The upstream FusionMamba checkpoint is trained on ``[0, 1]`` tensors and
-    therefore the conversion lives at this boundary, leaving all parameter
-    names identical to the upstream model for direct checkpoint loading.
+    Parameter names stay identical to the upstream model so official
+    checkpoints such as ``420.pth`` load without key remapping.
     """
 
     def forward(self, lr: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         if lr.ndim != 4 or ref.ndim != 4:
             raise ValueError("FusionMamba expects NCHW LR/MS and PAN tensors")
-        ms01 = ((lr.float() + 1.0) * 0.5).clamp(0.0, 1.0)
-        pan01 = ((ref.float() + 1.0) * 0.5).clamp(0.0, 1.0)
-        out01 = super().forward(ms01, pan01)
-        return out01.clamp(0.0, 1.0) * 2.0 - 1.0
+        out01 = super().forward(lr.float().clamp(0.0, 1.0), ref.float().clamp(0.0, 1.0))
+        return out01.clamp(0.0, 1.0)
 
 
 _MODEL_FIELDS = {"dim", "pan_dim", "ms_dim", "input_h", "input_w", "scale"}

@@ -42,7 +42,7 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def gaussian_ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Per-image RGB SSIM for tensors in the [-1, 1] range."""
+    """Per-image SSIM for tensors in the ``[0, 1]`` range."""
     if pred.shape != target.shape or pred.ndim != 4:
         raise ValueError(f"SSIM 输入形状不一致: {pred.shape} vs {target.shape}")
     channels = pred.shape[1]
@@ -63,7 +63,7 @@ def gaussian_ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     var_p = (F.conv2d(pred_f.square(), window, padding=pad, groups=channels) - mu_p.square()).clamp_min(0)
     var_t = (F.conv2d(target_f.square(), window, padding=pad, groups=channels) - mu_t.square()).clamp_min(0)
     cov = F.conv2d(pred_f * target_f, window, padding=pad, groups=channels) - mu_p * mu_t
-    c1, c2 = (0.01 * 2.0) ** 2, (0.03 * 2.0) ** 2
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
     numerator = (2 * mu_p * mu_t + c1) * (2 * cov + c2)
     denominator = (mu_p.square() + mu_t.square() + c1) * (var_p + var_t + c2)
     score = numerator / denominator.clamp_min(1e-12)
@@ -71,8 +71,16 @@ def gaussian_ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def per_image_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    mse = (pred.float() - target.float()).square().mean(dim=(1, 2, 3))
-    return 10.0 * torch.log10(4.0 / mse.clamp_min(1e-10))
+    """Average per-band PSNR for tensors in the ``[0, 1]`` range.
+
+    Each spectral band is scored independently from its spatial MSE, then the
+    band scores are averaged.  This is the pansharpening/remote-sensing
+    protocol and is not equivalent to PSNR of the pooled multi-band MSE.
+    """
+    if pred.shape != target.shape or pred.ndim != 4:
+        raise ValueError(f"PSNR 输入形状不一致: {pred.shape} vs {target.shape}")
+    mse = (pred.float() - target.float()).square().mean(dim=(-2, -1))
+    return (10.0 * torch.log10(1.0 / mse.clamp_min(1e-10))).mean(dim=1)
 
 
 def adapt_reference_channels(reference: torch.Tensor, channels: int) -> torch.Tensor:

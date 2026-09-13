@@ -1677,7 +1677,7 @@ class RefSRWKV(nn.Module):
             )
         output = lr_hr + out_feat
         output = output[:, :, :target_hr_h, :target_hr_w]
-        return torch.clamp(output, min=-1.0, max=1.0)
+        return torch.clamp(output, min=0.0, max=1.0)
 
     def prepare_for_inference(self):
         self.eval()

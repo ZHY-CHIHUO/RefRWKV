@@ -286,9 +286,7 @@ class WuhanSTFDataset(Dataset):
 
     def _normalize(self, image: np.ndarray) -> np.ndarray:
         value = image.astype(np.float32, copy=False) / self.value_scale
-        if self.clip_range:
-            value = np.clip(value, 0.0, 1.0)
-        return value * 2.0 - 1.0
+        return np.clip(value, 0.0, 1.0) if self.clip_range else value
 
     def _to_tensor(self, image: np.ndarray) -> torch.Tensor:
         """Convert an HWC raw image to the repository's NCHW value range."""

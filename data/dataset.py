@@ -353,30 +353,28 @@ class SuperResolutionDataset(Dataset):
             normalized = values / float(np.iinfo(original_dtype).max)
         elif np.issubdtype(original_dtype, np.signedinteger):
             info = np.iinfo(original_dtype)
-            if info.min < 0:
-                normalized = values / float(max(abs(info.min), abs(info.max)))
-            else:  # pragma: no cover - all signed integer types have negatives
-                normalized = values / float(info.max)
-            return np.clip(normalized, -1.0, 1.0) if clip_range else normalized
+            span = float(info.max - info.min)
+            normalized = (values - float(info.min)) / span if span > 0.0 else values
         else:
             finite = values[np.isfinite(values)]
             if finite.size == 0:
                 raise ValueError("image array contains no finite values")
             minimum, maximum = float(finite.min()), float(finite.max())
-            if minimum >= -1.0 and maximum <= 1.0:
-                # Float rasters are allowed to be supplied already in either
-                # [0, 1] or the repository's [-1, 1] range.
-                normalized = values if minimum < 0.0 else values * 2.0 - 1.0
-                return np.clip(normalized, -1.0, 1.0) if clip_range else normalized
-            if minimum >= 0.0 and maximum <= 255.0:
-                scale = 255.0
+            if minimum >= 0.0 and maximum <= 1.0:
+                normalized = values
+            elif minimum >= -1.0 and maximum <= 1.0:
+                # Accept leftover rasters stored in the previous [-1, 1] contract.
+                normalized = (values + 1.0) * 0.5
+            elif minimum >= 0.0 and maximum <= 255.0:
+                normalized = values / 255.0
             elif minimum >= 0.0 and maximum <= 65535.0:
-                scale = 65535.0
+                normalized = values / 65535.0
             else:
                 scale = max(abs(minimum), abs(maximum), 1.0)
-            normalized = values / scale
-        normalized = normalized * 2.0 - 1.0
-        return np.clip(normalized, -1.0, 1.0) if clip_range else normalized
+                normalized = values / scale
+                if minimum < 0.0:
+                    normalized = (normalized + 1.0) * 0.5
+        return np.clip(normalized, 0.0, 1.0) if clip_range else normalized
 
     @classmethod
     def _load_image(
@@ -498,7 +496,7 @@ class SuperResolutionDataset(Dataset):
                 # for multispectral references without inventing RGB colours.
                 if random.random() < abs(strength):
                     result = np.roll(result, 1 if random.random() >= 0.5 else -1, axis=-1)
-        return np.clip(result, -1.0, 1.0) if self.clip_range else result
+        return np.clip(result, 0.0, 1.0) if self.clip_range else result
 
     def _random_crop(
         self,

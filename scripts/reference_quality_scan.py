@@ -181,7 +181,7 @@ def _scan_split(
                     tile_size=eval_tile_size,
                     overlap=eval_tile_overlap,
                 )
-                prediction_metric, _ = _image_tensor(prediction, value_range="minus_one_one")
+                prediction_metric, _ = _image_tensor(prediction, value_range="zero_one")
                 values = per_image_psnr(prediction_metric, hr).detach().cpu().tolist()
                 correlations = _pearson_per_image(reference, hr).detach().cpu().tolist()
                 per_alpha[alpha]["trefsr_psnr"].extend(float(value) for value in values)
@@ -242,7 +242,7 @@ def main() -> None:
         device,
         raw_weights=args.raw_weights,
     )
-    if value_range != "minus_one_one" or generator is not None:
+    if value_range != "zero_one" or generator is not None:
         raise ValueError("reference quality scan currently supports direct RefSR models only")
     sr_root = resolve_path(args.sr_run, prefer_cwd=True)
     output = resolve_path(args.output, prefer_cwd=True)

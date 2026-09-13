@@ -31,7 +31,7 @@ data/refsr/<dataset>/<split>/{HR,LR,Ref}/<same-name>.*
 
 `reference_mode: none` 用于 RefSRWKV 的纯 SR 路径：数据集只返回 `LR/HR`，模型不构造或注入 Ref；`reference_mode: lr_up` 是旧的 LR bicubic 自参考方式，`reference_mode: paired` 才读取磁盘 `Ref/`。测试和对比必须保持同一 split 的 `sample_id` 配对。
 
-常规 Dataset 会保留文件本身的通道数，不再统一转换为 RGB。`PNG/JPEG/BMP/TIFF` 和 NumPy `.npy` 均可作为 `HR`、`LR` 或 `Ref` 文件；灰度 PAN 返回 1 通道，多波段 TIFF/NPY 返回对应通道数。整数栅格默认按 dtype 满量程归一化到 `[-1, 1]`，传感器或浮点数据可在配置中设置 `data.value_scale`，必要时用 `data.clip_range: false` 保留范围外值。NPY 约定为 `HWC`，栅格读取器对常见 `C,H,W` TIFF 会自动转置。
+常规 Dataset 会保留文件本身的通道数，不再统一转换为 RGB。`PNG/JPEG/BMP/TIFF` 和 NumPy `.npy` 均可作为 `HR`、`LR` 或 `Ref` 文件；灰度 PAN 返回 1 通道，多波段 TIFF/NPY 返回对应通道数。整数栅格默认按 dtype 满量程归一化到 `[0, 1]`，传感器或浮点数据可在配置中设置 `data.value_scale`，必要时用 `data.clip_range: false` 保留范围外值。NPY 约定为 `HWC`，栅格读取器对常见 `C,H,W` TIFF 会自动转置。
 
 ## PanCollection H5
 

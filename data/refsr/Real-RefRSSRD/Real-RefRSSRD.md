@@ -77,7 +77,7 @@ train_ds = SuperResolutionDataset(
 )
 
 sample = train_ds[0]
-# lr: (3, 48, 48), hr/ref: (3, 480, 480), values in [-1, 1]
+# lr: (3, 48, 48), hr/ref: (3, 480, 480), values in [0, 1]
 ```
 
 验证和测试时应关闭随机增强：

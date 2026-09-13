@@ -5,7 +5,7 @@ particular paper implementation.  The classes in this module are compact,
 faithful *architecture families* for the classical baselines (EDSR, RCAN,
 HAT, and MambaIRv2).  They deliberately use only PyTorch so that a baseline
 can be trained in the repository's ``rwkv7`` environment.  The adapters expose
-the same ``[-1, 1]`` tensor contract as SwinIR.
+the same ``[0, 1]`` tensor contract as SwinIR.
 
 For exact paper numbers, use the official bridge environments documented in
 ``models/README.md`` and load the corresponding upstream checkpoint.
@@ -186,7 +186,7 @@ class _SRBase(nn.Module):
         )
         if residual.shape[-2:] != base.shape[-2:]:
             residual = F.interpolate(residual, size=base.shape[-2:], mode="bilinear", align_corners=False)
-        return (base + residual).clamp(-1.0, 1.0)
+        return (base + residual).clamp(0.0, 1.0)
 
     @staticmethod
     def _check_input(lr: torch.Tensor, channels: int = 3) -> None:
@@ -306,7 +306,7 @@ class BicubicSR(nn.Module):
             raise ValueError(f"Bicubic expects NCHW RGB input, got {getattr(lr, 'shape', None)}")
         return F.interpolate(
             lr, scale_factor=self.scale, mode="bicubic", align_corners=False, recompute_scale_factor=False
-        ).clamp(-1.0, 1.0)
+        ).clamp(0.0, 1.0)
 
 
 __all__ = [

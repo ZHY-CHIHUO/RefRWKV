@@ -133,8 +133,8 @@ def _synthetic_reference(
 ) -> tuple[torch.Tensor, list[dict[str, float | int]]]:
     """Build the strongest synthetic sensor reference and its provenance."""
     matrix = torch.tensor(SPECTRAL_RESPONSE, dtype=hr.dtype, device=hr.device)
-    hr01 = ((hr.float() + 1.0) * 0.5).clamp(0.0, 1.0)
-    degraded01 = ((degraded.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+    hr01 = hr.float().clamp(0.0, 1.0)
+    degraded01 = degraded.float().clamp(0.0, 1.0)
     spectral = torch.einsum("ij,bjhw->bihw", matrix, hr01)
     transformed: list[torch.Tensor] = []
     provenance: list[dict[str, float | int]] = []
@@ -162,7 +162,7 @@ def _synthetic_reference(
             }
         )
     sensor = torch.stack(transformed, dim=0).to(hr.dtype)
-    return sensor * 2.0 - 1.0, provenance
+    return sensor, provenance
 
 
 def _parse_p(values: list[str] | None) -> list[float]:
@@ -331,7 +331,7 @@ def main() -> None:
     model, value_range, generator = _build_refsr_model(
         config, checkpoint, device, raw_weights=args.raw_weights
     )
-    if value_range != "minus_one_one" or generator is not None:
+    if value_range != "zero_one" or generator is not None:
         raise ValueError("reference_sensitivity_aid.py supports direct RefSR models only")
 
     baseline_path = resolve_path(args.sr_metrics, prefer_cwd=True)
@@ -376,7 +376,7 @@ def main() -> None:
                 sample_ids,
                 seed=args.seed,
             )
-            hr_metric, _ = _image_tensor(hr, value_range="minus_one_one")
+            hr_metric, _ = _image_tensor(hr, value_range="zero_one")
             for reference_type, p in scan_specs:
                 if reference_type == "hr_direct":
                     reference = hr
@@ -387,13 +387,9 @@ def main() -> None:
                         # lr_up reference used by the standalone SR run.
                         reference = degraded
                     else:
-                        reference = (
-                            (1.0 - p) * ((degraded + 1.0) * 0.5)
-                            + p * ((sensor + 1.0) * 0.5)
-                        )
-                        reference = reference.clamp(0.0, 1.0) * 2.0 - 1.0
+                        reference = ((1.0 - p) * degraded + p * sensor).clamp(0.0, 1.0)
                 prediction = tiled_forward(model, lr, reference, scale=4)
-                prediction_metric, _ = _image_tensor(prediction, value_range="minus_one_one")
+                prediction_metric, _ = _image_tensor(prediction, value_range="zero_one")
                 psnr_values = per_image_psnr(prediction_metric, hr_metric).detach().cpu().tolist()
                 ssim_values = gaussian_ssim(prediction_metric, hr_metric).detach().cpu().tolist()
                 correlations = _pearson_per_image(reference, hr).detach().cpu().tolist()

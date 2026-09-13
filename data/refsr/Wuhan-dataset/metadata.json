@@ -7,7 +7,7 @@
   "tensor_scale": 1,
   "physical_resolution_m": {"lr": 30, "hr": 8},
   "physical_resolution_ratio": 3.75,
-  "normalization": {"raw_divisor": 11848.0, "range": "[0,1]", "model_range": "[-1,1]"},
+  "normalization": {"raw_divisor": 11848.0, "range": "[0,1]", "model_range": "[0,1]"},
   "splits": {
     "train": [
       "20151018_20171030",
