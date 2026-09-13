@@ -451,8 +451,9 @@ def run_inference(
         wuhan_metric_keys[name] for name in selected_metrics if name in wuhan_metric_keys
     }
     wuhan_ratio = float(data_meta.get("physical_resolution_ratio", 30.0 / 8.0))
-    eval_tile_size = data_meta.get("eval_tile_size") if wuhan_run else None
-    eval_tile_overlap = data_meta.get("eval_tile_overlap", 0) if wuhan_run else 0
+    tiled_model = wuhan_run or model_name == "fusion_mamba"
+    eval_tile_size = data_meta.get("eval_tile_size") if tiled_model else None
+    eval_tile_overlap = data_meta.get("eval_tile_overlap", 0) if tiled_model else 0
     if eval_tile_size is not None and (
         isinstance(eval_tile_size, bool) or not isinstance(eval_tile_size, int) or eval_tile_size < 1
     ):
