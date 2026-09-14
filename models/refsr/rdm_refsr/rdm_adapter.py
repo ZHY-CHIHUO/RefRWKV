@@ -13,7 +13,8 @@ from typing import Any
 import torch.nn as nn
 
 from .rdm_pan import RDMPan
-from .rdm_refsr import RDMMhf, RDMRefSR, RDMStf, normalize_reference_kind
+from .rdm_stf import RDMStf
+from .rdm_refsr import RDMMhf, RDMRefSR, normalize_reference_kind
 from ..registry import RefSRModelAdapter, register_adapter
 
 
@@ -130,10 +131,12 @@ class RDMStfAdapter(RefSRModelAdapter):
         result = super().describe(model_config, scale=scale)
         result.update(
             {
-                "implementation": "dual_grid_rwkv_mamba",
+                "implementation": "hr_dual_stream_rwkv_mamba_stf",
                 "reference_kind": "stf",
                 "family": "rdm",
                 "task": "spatio_temporal_fusion",
+                "inputs": "(c0, f0, c1)",
+                "call": "forward(lr=C1, ref=F0, c0=C0)",
                 "official_mamba_backend": "mamba_ssm.Mamba",
                 "wkv_backend": "kernels.wkv.RUN_CUDA",
             }

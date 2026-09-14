@@ -36,7 +36,8 @@ RDM 家族拆成三个独立模型，不要靠通道数去猜任务：
 - `rdm_pan`：全色融合（MS LR + PAN HR）。WV3 入口
   `configs/runs/rdm_refsr/pancollection_wv3_pan_x4.yaml`。FusionMamba 式
   HR 双流，残差加在 bicubic MS 上，无匹配/错误参考门控，L1 训练。
-- `rdm_stf`：时空融合（LR/Ref 谱段相同，分辨率和时相不同），如 HRMS、Wuhan。
+- `rdm_stf`：时空融合 `(C0, F0, C1)->F1`（LR/Ref 谱段相同，分辨率和时相不同）。Wuhan 是 4 波段 TIFF、`/11848 -> [0,1]`，需要 `return_quadruple` 把 `lr_t1` 作为 C0。
+- `stf_mamba`：官方 STFMamba 的 4 波段 Wuhan 适配，不是 LGC/DX 那套 6 波段 `[-1,1]` npy loader。
 - `rdm_mhf`：多光谱/高光谱融合（LR-HSI + HR-MSI）。
 
 旧名 `rdm_refsr` 仍可用，`temporal`/`hsi_msi` 会分别归一化成 `stf`/`mhf`。

@@ -14,8 +14,11 @@ tensor geometry as ``scale=1``; the physical 30/8 resolution ratio belongs
 to ERGAS, not to a pixel-shuffle upsampler.
 
 Each item exposes the usual direct-RefSR aliases (``lr``, ``ref``, ``hr``)
-for the ``L_t2, G_t1 -> G_t2`` prediction contract.  ``return_quadruple``
-can additionally retain all four temporal images for a future STF model.
+for the ``L_t2, G_t1 -> G_t2`` prediction contract.  STF models set
+``return_quadruple=true`` so the batch also carries ``lr_t1`` as ``C0``
+for ``(C0, F0, C1) -> F1``.  Values are ``uint16 / 11848`` clipped to
+``[0, 1]``; this is not the official STFMamba LGC/DX 6-band ``.npy``
+loader (``[-1, 1]``, ``len=12000``).
 TIFF arrays are cached by absolute path in each dataset process, and one crop
 and one spatial augmentation are shared by all four images.
 """

@@ -1,0 +1,36 @@
+# Shared Wuhan STF data contract: 4-band, [0, 1], aligned 1000x1000 grid.
+base:
+  - refsr_paired.yaml
+
+data:
+  reference_mode: paired
+  patch_size: 128
+  val_patch_size: 128
+  test_patch_size: null
+  batch_size: 4
+  val_batch_size: 2
+  num_workers: 4
+  val_num_workers: 2
+  persistent_workers: false
+  pin_memory: true
+  drop_last: true
+  augment: true
+  lr_source: stored
+  lr_provenance: sensor
+  lr_native_scale: 1
+  value_scale: 11848.0
+  physical_resolution_ratio: 3.75
+  target_time: t2
+  reference_time: t1
+  return_quadruple: true
+  c0_key: lr_t1
+  use_c0: true
+  cache: true
+  eval_tile_size: 128
+  eval_tile_overlap: 16
+
+test:
+  splits: [test]
+  metrics: [psnr, ssim, rmse, uiqi, psnr_wuhan, sam_deg, ergas]
+  save_images: false
+  batch_size: 1

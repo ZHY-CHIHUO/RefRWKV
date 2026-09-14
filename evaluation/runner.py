@@ -451,7 +451,7 @@ def run_inference(
         wuhan_metric_keys[name] for name in selected_metrics if name in wuhan_metric_keys
     }
     wuhan_ratio = float(data_meta.get("physical_resolution_ratio", 30.0 / 8.0))
-    tiled_model = wuhan_run or model_name == "fusion_mamba"
+    tiled_model = wuhan_run or model_name in {"fusion_mamba", "stf_mamba", "rdm_stf"}
     eval_tile_size = data_meta.get("eval_tile_size") if tiled_model else None
     eval_tile_overlap = data_meta.get("eval_tile_overlap", 0) if tiled_model else 0
     if eval_tile_size is not None and (
@@ -508,15 +508,37 @@ def run_inference(
                     if model_config.get("ref_channels") is not None
                     else None,
                 )
-                prediction = tiled_forward(
-                    model,
-                    lr,
-                    ref,
-                    scale=scale,
-                    tile_size=eval_tile_size,
-                    overlap=eval_tile_overlap,
-                    input_scales=(1, scale),
+                c0_key = str(data_meta.get("c0_key", "lr_t1"))
+                c0 = batch.get(c0_key) if model_name in {"stf_mamba", "rdm_stf"} else None
+                require_c0 = model_name == "stf_mamba" or (
+                    model_name == "rdm_stf"
+                    and bool(data_meta.get("use_c0", data_meta.get("return_quadruple", False)))
                 )
+                if require_c0 and c0 is None:
+                    raise KeyError(
+                        f"{model_name} requires batch[{c0_key!r}]; set data.return_quadruple=true"
+                    )
+                if c0 is not None:
+                    prediction = tiled_forward(
+                        model,
+                        lr,
+                        ref,
+                        c0,
+                        scale=scale,
+                        tile_size=eval_tile_size,
+                        overlap=eval_tile_overlap,
+                        input_scales=(1, scale, 1),
+                    )
+                else:
+                    prediction = tiled_forward(
+                        model,
+                        lr,
+                        ref,
+                        scale=scale,
+                        tile_size=eval_tile_size,
+                        overlap=eval_tile_overlap,
+                        input_scales=(1, scale),
+                    )
                 prediction_metric, prediction_png = _image_tensor(prediction, value_range=value_range)
             else:
                 ref = _reference_for_refsr_batch(

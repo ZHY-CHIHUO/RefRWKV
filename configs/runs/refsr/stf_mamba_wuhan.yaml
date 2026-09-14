@@ -1,0 +1,49 @@
+# STFMamba on Wuhan, 4-band [0, 1] quadruple (C0, F0, C1) -> F1.
+# Optimizer follows the official repo: Adam 5e-4, cosine 200 epoch, patch 128.
+base:
+  - ../../common/stf_wuhan.yaml
+  - ../../models/refsr/stf_mamba.yaml
+
+dataset:
+  config: ../../datasets/refsr/wuhan.yaml
+
+task: refsr
+
+run:
+  name: stf_mamba_wuhan
+  scale: 1
+
+data:
+  batch_size: 2
+  val_batch_size: 1
+
+model:
+  inp_channels: 4
+  out_channels: 4
+  ref_channels: 4
+  in_chans: 4
+
+train:
+  precision: "32"
+  max_epochs: 200
+  max_steps: -1
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
+  accumulate_grad_batches: 1
+  learning_rate: 0.0005
+  weight_decay: 0.0
+  adam_betas: [0.9, 0.999]
+  lr_scheduler: cosine
+  lr_min: 0.00001
+  grad_clip_norm: 1.0
+  use_ema: false
+  save_top_k: 3
+  early_stopping_patience: null
+  seed: 2021
+  num_sanity_val_steps: 0
+
+loss:
+  name: charbonnier
+  eps: 0.001
+  ssim_weight: 1.0
+  fft_weight: 0.0

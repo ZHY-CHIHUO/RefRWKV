@@ -1,32 +1,18 @@
-# RDM-STF: same-band spatio-temporal fusion (HRMS, Wuhan).
-# LR and Ref share spectral bands but differ in GSD and acquisition date.
+# RDM-STF: same-band (C0, F0, C1) -> F1 on the rdm_pan dual-stream skeleton.
+# Wuhan is 4-band scale=1; HRMS overrides channels and scale.
 model:
   name: rdm_stf
   family: rdm
   variant: rdm_stf
-  implementation: dual_grid_rwkv_mamba
-  inp_channels: 3
-  out_channels: 3
-  ref_channels: 3
-  target_channels: 3
-  dim: 48
-  depths: [2, 2, 3, 4]
-  decoder_depths: [3, 2, 2]
+  implementation: hr_dual_stream_rwkv_mamba_stf
+  inp_channels: 4
+  out_channels: 4
+  ref_channels: 4
+  dim: 32
   reference_kind: stf
-  mamba_stages: [enc2, latent, dec2]
-  reference_condition_stages: [enc2, latent, dec1, coeff]
-  detail_injection_stages: [dec1, coeff]
-  mamba_d_state: 16
+  mamba_d_state: 8
   mamba_d_conv: 4
-  mamba_expand: 2
+  mamba_expand: 1
   allow_cpu_mamba: true
-  shuffle_prob: 0.15
-  shuffle_block: 4
-  match_window: 5
-  match_dim: 16
-  match_grid: coefficient
-  temporal_match_confidence_floor: 0.15
-  alignment: true
-  max_offset: 3.0
   use_reference: true
   clamp_output: true

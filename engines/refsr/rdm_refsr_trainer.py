@@ -84,7 +84,7 @@ class RDMRefSRTrainer(BaseTrainer):
 
         model = build_refsr_model(config["model"], scale=int(data["scale"]))
         if not isinstance(model, RDMRefSR):
-            raise TypeError("model.name must resolve to rdm_stf, rdm_mhf, or rdm_refsr")
+            raise TypeError("model.name must resolve to rdm_mhf or rdm_refsr")
         return cls(model, config)
 
     def _unpack(self, batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:

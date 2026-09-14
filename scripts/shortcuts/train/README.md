@@ -17,6 +17,8 @@
 | `fusion_mamba_pancollection_wv3.sh` | FusionMamba WV3 全色融合训练，batch 32，官方 64x64 crop / L1 / Adam / StepLR / 500 epoch。 |
 | `fusion_mamba_pancollection_wv3_official.sh` | 同上，保留官方命名入口。 |
 | `rdm_refsr_pancollection_wv3.sh` | RDM-PAN WV3 全色融合训练，batch 32，训练协议与 FusionMamba 对齐。 |
+| `stf_mamba_wuhan.sh` | 官方 STFMamba 的 4 波段 Wuhan 四元组训练，`(C0,F0,C1)->F1`，`[0,1]`。 |
+| `rdm_stf_wuhan.sh` | RDM-STF Wuhan 四元组训练，输入契约与 STFMamba 相同。 |
 
 ## 用法
 
@@ -26,6 +28,10 @@ bash scripts/shortcuts/train/fusion_mamba_pancollection_wv3.sh
 
 # RDM-PAN WV3
 bash scripts/shortcuts/train/rdm_refsr_pancollection_wv3.sh
+
+# STFMamba / RDM-STF Wuhan
+bash scripts/shortcuts/train/stf_mamba_wuhan.sh
+bash scripts/shortcuts/train/rdm_stf_wuhan.sh
 
 # 只打印最终命令
 bash scripts/shortcuts/train/rdm_refsr_pancollection_wv3.sh --print

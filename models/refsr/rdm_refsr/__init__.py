@@ -1,13 +1,13 @@
 """RDMRefSR implementation and registry adapters."""
 
 from .rdm_pan import RDMPan
+from .rdm_stf import RDMStf
 from .rdm_refsr import (
     FourDirectionMamba,
     HaarDWT2D,
     HaarIDWT2D,
     RDMMhf,
     RDMRefSR,
-    RDMStf,
     RMSNorm2d,
     SharedDirectionalRWKV,
     TrueMambaScan,

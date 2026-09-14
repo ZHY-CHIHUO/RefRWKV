@@ -60,6 +60,7 @@ def _load_builtins() -> None:
     from . import baseline_adapters, refsrwkv  # noqa: F401
     from .rdm_refsr import rdm_adapter  # noqa: F401
     from .fusion_mamba import adapter as fusion_mamba_adapter  # noqa: F401
+    from .stf_mamba import adapter as stf_mamba_adapter  # noqa: F401
 
     _BUILTINS_LOADED = True
 

@@ -109,7 +109,12 @@ class BaseTrainer(pl.LightningModule, ABC):
             return self(*inputs)
         scale = int(self.config.get("data", {}).get("scale", 1))
         task = str(self.config.get("task", "")).strip().lower()
-        input_scales = (1, scale) if task == "refsr" and len(inputs) == 2 else None
+        if task == "refsr" and len(inputs) == 2:
+            input_scales = (1, scale)
+        elif task == "refsr" and len(inputs) == 3:
+            input_scales = (1, scale, 1)
+        else:
+            input_scales = None
         return tiled_forward(
             self,
             *inputs,

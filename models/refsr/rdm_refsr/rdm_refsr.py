@@ -1823,22 +1823,8 @@ class HaarIDWT2D(nn.Module):
         return haar_idwt2d(low, detail, output_size)
 
 
-# RDMPan lives in rdm_pan.py.  It is a FusionMamba-style dual-stream
-# pansharpening network, not a gated dual-grid RefSR specialist.
-
-
-class RDMStf(RDMRefSR):
-    """Same-band spatio-temporal fusion specialist (HRMS, Wuhan)."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        kind = kwargs.get("reference_kind")
-        if kind is not None and normalize_reference_kind(kind) != "stf":
-            raise ValueError(
-                "RDMStf is the spatio-temporal model; use rdm_pan or rdm_mhf"
-            )
-        kwargs.setdefault("alignment", True)
-        kwargs["reference_kind"] = "stf"
-        super().__init__(**kwargs)
+# RDMPan lives in rdm_pan.py.  RDMStf lives in rdm_stf.py.  Both are
+# dedicated dual-stream networks, not gated dual-grid RefSR specialists.
 
 
 class RDMMhf(RDMRefSR):
@@ -1863,7 +1849,6 @@ __all__ = [
     "QShift",
     "RDMMhf",
     "RDMRefSR",
-    "RDMStf",
     "RMSNorm2d",
     "ReliabilityField",
     "SharedDirectionalRWKV",

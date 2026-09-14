@@ -20,7 +20,6 @@ from models.refsr.rdm_refsr.rdm_pan import RDMPan  # noqa: E402
 from models.refsr.rdm_refsr.rdm_refsr import (  # noqa: E402
     RDMMhf,
     RDMRefSR,
-    RDMStf,
     SharedDirectionalRWKV,
     TrueMambaScan,
     _reference_biwkv,
@@ -28,6 +27,7 @@ from models.refsr.rdm_refsr.rdm_refsr import (  # noqa: E402
     haar_idwt2d,
     normalize_reference_kind,
 )
+from models.refsr.rdm_refsr.rdm_stf import RDMStf  # noqa: E402
 from runtime.config import load_config, validate_config  # noqa: E402
 from runtime.tiling import tiled_forward  # noqa: E402
 
@@ -224,6 +224,7 @@ class RDMRefSRTests(unittest.TestCase):
         self.assertIn("rdm_pan", list_models())
         self.assertIn("rdm_stf", list_models())
         self.assertIn("rdm_mhf", list_models())
+        self.assertIn("stf_mamba", list_models())
         config = load_config("configs/runs/rdm_refsr/hrms_scd_x4.yaml", prefer_existing=False)
         validate_config(config, require_data=False)
         compact = copy.deepcopy(config["model"])
@@ -365,6 +366,25 @@ class RDMRefSRTests(unittest.TestCase):
         self.assertEqual(RDMMhf(inp_channels=8, ref_channels=4, out_channels=8, dim=16, depths=(1,1,1,1), decoder_depths=(1,1,1), mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, match_window=3, match_dim=4, shuffle_prob=0.0).reference_kind, "mhf")
         with self.assertRaises(ValueError):
             RDMPan(reference_kind="stf")
+
+    def test_stf_uses_c0_and_has_no_matcher(self) -> None:
+        torch.manual_seed(0)
+        model = RDMStf(inp_channels=4, ref_channels=4, out_channels=4, dim=16, scale=1, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1)
+        self.assertFalse(hasattr(model, "reliability"))
+        self.assertFalse(hasattr(model, "detail_matcher"))
+        lr = torch.rand(1, 4, 8, 8)
+        ref = torch.rand(1, 4, 8, 8)
+        c0 = torch.rand(1, 4, 8, 8)
+        two = model(lr, ref)
+        three = model(lr, ref, c0)
+        self.assertEqual(tuple(two.shape), (1, 4, 8, 8))
+        self.assertEqual(tuple(three.shape), (1, 4, 8, 8))
+        self.assertTrue(torch.isfinite(two).all())
+        self.assertTrue(torch.isfinite(three).all())
+        self.assertGreater(float((two - three).detach().abs().mean()), 0.0)
+        three.square().mean().backward()
+        self.assertGreater(float(model.raise_fine[0].weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.raise_coarse[0].weight.grad.abs().sum()), 0.0)
 
     def test_pan_has_no_reliability_gate_unlike_stf(self) -> None:
         temporal = _compact_model()

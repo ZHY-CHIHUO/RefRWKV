@@ -18,7 +18,7 @@ SR 模型通常提供 `forward(lr)`；direct RefSR 模型提供 `forward(lr, ref
 - `models/refsr/refsrwkv/`：参考图超分 RWKV，支持 `paired` 真实 Ref 和 `lr_up` 自参考两种数据模式。
 - `models/refsr/rdm_refsr/`：RDM 家族三个独立模型。`rdm_pan` 是 FusionMamba
   思路的 MS+PAN 双流全色融合（HR 网格、上采样 MS 残差，无匹配/可靠性门控）；
-  `rdm_stf` 做同谱段时空融合；`rdm_mhf` 做 MS/HS 融合。STF/MHF 仍用 Haar 高频
+  `rdm_stf` 做同谱段时空融合 `(C0,F0,C1)->F1`；`rdm_mhf` 做 MS/HS 融合。MHF 仍用 Haar 高频
   + 可靠性门控 + Bi-WKV，并在指定 stage 使用官方 `mamba_ssm.Mamba`。
 - `models/refsr/baselines.py`、`baseline_adapters.py`：TTSR、MASA-SR、DATSR 的统一 direct RefSR 适配。
 - `models/refsr/RefDiffRWKV/`：扩散生成器、SR prior、参考适配器、判别器和采样器。
@@ -66,7 +66,7 @@ RDM 不根据通道数猜任务，而是三个独立模型：
 
 ```text
 rdm_pan : LR/MS + HR PAN -> HR/MS；HR 双流融合，残差加在 bicubic(MS) 上
-rdm_stf : LR 目标时相 + HR 参考时相 -> HR 目标时相；变化图抑制参考注入
+rdm_stf : (C0, F0, C1) -> F1；无 C0 时退化为 F0+C1。`stf_mamba` 是 4 波段官方 STFMamba 基线
 rdm_mhf : LR HSI + HR MSI -> HR HSI；response_matrix 做 MSI->HSI 光谱提升
 ```
 

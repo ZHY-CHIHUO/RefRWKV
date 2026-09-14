@@ -2,9 +2,10 @@
 
 from .refsrwkv_trainer import RefSRWKVTrainer
 from .rdm_refsr_trainer import RDMRefSRTrainer
+from .stf_mamba_trainer import STFMambaTrainer
 from .trainer import RefSRTrainer
 
-__all__ = ["RDMRefSRTrainer", "RefSRTrainer", "RefSRWKVTrainer"]
+__all__ = ["RDMRefSRTrainer", "RefSRTrainer", "RefSRWKVTrainer", "STFMambaTrainer"]
 
 
 def __getattr__(name):

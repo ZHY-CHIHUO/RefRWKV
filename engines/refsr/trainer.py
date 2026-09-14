@@ -15,12 +15,16 @@ from runtime.common import gaussian_ssim
 from runtime.config import normalize_reference_mode, validate_refsr_reference_contract
 
 
+STF_THREE_INPUT_MODELS = frozenset({"stf_mamba", "rdm_stf"})
+
+
 class RefSRTrainer(BaseTrainer):
     """Train a direct RefSR model with the repository-wide paired contract.
 
     Unlike ``RefSRWKVTrainer``, this class has no architecture-specific loss
-    terms or type check.  It is used by TTSR, MASA-SR and DATSR and can also
-    serve future direct RefSR models that implement ``forward(lr, ref)``.
+    terms or type check.  Two-input models stay ``forward(lr, ref)``.  STF
+    models additionally consume ``c0`` (``batch[data.c0_key]``, default
+    ``lr_t1``) when the loader returns a temporal quadruple.
     """
 
     def __init__(self, model: nn.Module, config: Mapping[str, Any]) -> None:
@@ -57,6 +61,10 @@ class RefSRTrainer(BaseTrainer):
             raise ValueError("loss.ssim_weight and loss.fft_weight must be non-negative")
         if not 0.0 <= self.ref_drop_prob <= 1.0:
             raise ValueError("loss.ref_drop_prob must be in [0, 1]")
+        model_name = str(config.get("model", {}).get("name", "")).strip().lower()
+        self.c0_key = str(data.get("c0_key", "lr_t1"))
+        self.use_c0 = bool(data.get("use_c0", data.get("return_quadruple", False))) or model_name == "stf_mamba"
+        self.require_c0 = model_name in STF_THREE_INPUT_MODELS and self.use_c0
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "RefSRTrainer":
@@ -109,6 +117,27 @@ class RefSRTrainer(BaseTrainer):
             value = value + self.fft_weight * (pred_fft - target_fft).abs().mean()
         return value
 
+    def _c0(self, batch: Any) -> torch.Tensor | None:
+        if not self.use_c0:
+            return None
+        if not isinstance(batch, Mapping):
+            raise TypeError("RefSR batches must be mappings")
+        value = batch.get(self.c0_key)
+        if value is None and self.require_c0:
+            raise KeyError(
+                f"STF batch must contain {self.c0_key!r}; set data.return_quadruple=true"
+            )
+        if value is not None and not torch.is_tensor(value):
+            raise TypeError(f"batch[{self.c0_key!r}] must be a tensor")
+        return value
+
+    def _forward_model(
+        self, lr: torch.Tensor, ref: torch.Tensor, c0: torch.Tensor | None
+    ) -> torch.Tensor:
+        if c0 is not None or self.require_c0:
+            return self(lr, ref, c0)
+        return self(lr, ref)
+
     def _apply_reference_dropout(self, ref: torch.Tensor, lr: torch.Tensor) -> torch.Tensor:
         if self.ref_drop_prob <= 0.0 or not self.training:
             return ref
@@ -118,12 +147,17 @@ class RefSRTrainer(BaseTrainer):
 
     def _train_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         lr, hr, ref = self._unpack(batch)
-        reference = self._reference(lr, hr, ref)
-        return self._loss(self(lr, self._apply_reference_dropout(reference, lr)), hr)
+        reference = self._apply_reference_dropout(self._reference(lr, hr, ref), lr)
+        return self._loss(self._forward_model(lr, reference, self._c0(batch)), hr)
 
     def _eval_step(self, batch: Any, batch_idx: int, *, stage: str) -> dict[str, torch.Tensor]:
         lr, hr, ref = self._unpack(batch)
-        prediction = self.predict_for_eval(lr, self._reference(lr, hr, ref))
+        reference = self._reference(lr, hr, ref)
+        c0 = self._c0(batch)
+        if c0 is not None or self.require_c0:
+            prediction = self.predict_for_eval(lr, reference, c0)
+        else:
+            prediction = self.predict_for_eval(lr, reference)
         return {"loss": self._loss(prediction, hr), **self.benchmark_image_metrics(prediction, hr)}
 
 

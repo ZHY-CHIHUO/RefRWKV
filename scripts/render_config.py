@@ -34,12 +34,12 @@ def _train_entry(config: dict) -> str:
         return "refdiffrwkv.py"
     if str(config.get("task", "sr")).strip().lower() == "sr":
         return "sr.py"
-    if model_name in {"rdm_refsr", "rdm_pan", "rdm_stf", "rdm_mhf"}:
+    if model_name in {"rdm_refsr", "rdm_mhf"}:
         return "rdm_refsr.py"
     # Direct RefSR baselines share the ordinary paired-reference trainer.
     # RefSRWKV keeps its specialised entry point because it has additional
     # fusion/loss controls that are not part of the baseline adapter.
-    if model_name in {"ttsr", "masa_sr", "datsr"}:
+    if model_name in {"ttsr", "masa_sr", "datsr", "fusion_mamba", "stf_mamba", "rdm_pan", "rdm_stf"}:
         return "refsr.py"
     return "refsrwkv.py"
 

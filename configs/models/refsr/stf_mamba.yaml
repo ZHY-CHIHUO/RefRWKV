@@ -1,0 +1,11 @@
+# Official STFMamba, 4-band Wuhan table (not the 6-band LGC/DX npy loader).
+model:
+  name: stf_mamba
+  family: stf
+  variant: official_stfmamba
+  implementation: official_stfmamba
+  inp_channels: 4
+  out_channels: 4
+  ref_channels: 4
+  in_chans: 4
+  use_reference: true
