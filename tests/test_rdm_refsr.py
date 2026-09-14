@@ -171,6 +171,45 @@ class RDMRefSRTests(unittest.TestCase):
         expected = torch.stack(expected).unsqueeze(0)
         self.assertTrue(torch.allclose(actual, expected, atol=2.0e-6, rtol=2.0e-6))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the Bi-WKV kernel test")
+    def test_cuda_biwkv_is_finite(self) -> None:
+        from kernels.wkv import RUN_CUDA
+
+        torch.manual_seed(7)
+        for length in (16, 32, 33, 64, 65, 96):
+            with self.subTest(length=length):
+                key = torch.randn(2, length, 16, device="cuda", requires_grad=True)
+                value = torch.randn(2, length, 16, device="cuda", requires_grad=True)
+                decay = (torch.rand(16, device="cuda") * 0.2 + 0.05).requires_grad_(True)
+                first = (torch.randn(16, device="cuda") * 0.1).requires_grad_(True)
+                output = RUN_CUDA(decay, first, key, value)
+                output.square().mean().backward()
+                self.assertEqual(tuple(output.shape), (2, length, 16))
+                self.assertTrue(torch.isfinite(output).all(), msg=f"T={length} output")
+                self.assertTrue(torch.isfinite(key.grad).all(), msg=f"T={length} gk")
+                self.assertTrue(torch.isfinite(value.grad).all(), msg=f"T={length} gv")
+                self.assertTrue(torch.isfinite(decay.grad).all(), msg=f"T={length} gw")
+                self.assertTrue(torch.isfinite(first.grad).all(), msg=f"T={length} gu")
+                if length <= 32:
+                    reference = _reference_biwkv(
+                        decay.detach().cpu(),
+                        first.detach().cpu(),
+                        key.detach().cpu(),
+                        value.detach().cpu(),
+                    )
+                    # Official 32-way kernel matches the exclusive formula at t=0;
+                    # later tokens keep the original segmented reduction, not the
+                    # Python recurrence.
+                    self.assertTrue(
+                        torch.allclose(
+                            output.detach().cpu()[:, 0],
+                            reference[:, 0],
+                            atol=2.0e-4,
+                            rtol=2.0e-4,
+                        ),
+                        msg=f"T={length} token0",
+                    )
+
     def test_initial_prediction_is_bicubic_plus_small_residual(self) -> None:
         torch.manual_seed(3)
         model = _compact_model()

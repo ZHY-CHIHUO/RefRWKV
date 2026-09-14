@@ -1,19 +1,18 @@
 /******************************************************************************
  * Copyright (c) 2025 Shanghai AI Lab.
- * Bi-WKV forward/backward CUDA 算子：双向空间注意力（公式见下方注释）。
- * 段并行扫描：第一阶段段内双向扫描，第二阶段段间聚合，第三阶段输出。
+ * Original Vision-RWKV bidirectional segmented Bi-WKV (TOKEN_SPLIT=32).
+ * https://github.com/OpenGVLab/Vision-RWKV
+ *
+ * Each warp owns one (B, C) sequence and splits T across 32 lanes:
+ *   _T = ceil(T / 32) tokens per lane, then shuffle/smem inter-segment reduce.
+ * This is the official chunked CUDA path; do not replace it with a serial scan.
+ *
+ * Project adapters only:
+ *   - CHANNEL_LEN=16 so C=16 models/tests can launch (upstream uses 32)
+ *   - skip k[_t*C] when a lane is empty (T not a multiple of 32)
+ *   - k.scalar_type() and cudaGetLastError checks
  ******************************************************************************/
 
-/*
- * Bi-WKV bidirectional spatial attention (Vision-RWKV, arXiv:2403.02308v3 Sec 3.2).
- *   wkv_t = (past + future + exp(u+k_t)*v_t) / (past_den + future_den + exp(u+k_t))
- *   past   (a/b): a = exp(-w)*a + exp(k_i)*v_i            (forward, i<t)
- *   future (c/d): c = exp(+w)*c - exp(k_{i+1}+w)*v_{i+1}  (backward, i>t)
- *
- * Convention: uses raw token distance |t-i| (paper's /T is absorbed into learnable
- * w because this project has fixed resolution); adjacent-token -1 offset is implicit
- * (exp(0)=1). To match the paper exactly, replace w*distance with w*distance/T.
- */
 #include <torch/extension.h>
 #include <cuda.h>
 #include <THC/THCAtomics.cuh>
@@ -38,7 +37,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
     scalar_t* __restrict__ const _y
     ) {
     const int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    const int channel_id = threadIdx.y;   // Channel index used for shared-memory rows.
+    // const int channel_id = threadIdx.y;
     const int token_id = threadIdx.x;
     const int _b = idx / C;
     const int _c = idx % C;
@@ -53,15 +52,6 @@ __global__ void bi_wkv_cuda_forward_kernel(
     const scalar_t *__restrict__ const v = _v + _offset;
     scalar_t *__restrict__ const y = _y + _offset;
 
-    // shared memory（替代 __shfl_sync）
-    __shared__ scalar_t Sa[TOKEN_SPLIT][CHANNEL_LEN];
-    __shared__ scalar_t Sb[TOKEN_SPLIT][CHANNEL_LEN];
-    __shared__ scalar_t Sc[TOKEN_SPLIT][CHANNEL_LEN];
-    __shared__ scalar_t Sd[TOKEN_SPLIT][CHANNEL_LEN];
-    __shared__ scalar_t So1[TOKEN_SPLIT][CHANNEL_LEN];
-    __shared__ scalar_t So2[TOKEN_SPLIT][CHANNEL_LEN];
-
-    // ── 第一阶段：段内双向扫描 ──
     scalar_t a = 0, b = 0, c = 0, d = 0;
     scalar_t o1 = MIN_VALUE, o2 = MIN_VALUE;
     for (int i = _t; i < (_t + _tokenLength); i++){
@@ -83,44 +73,28 @@ __global__ void bi_wkv_cuda_forward_kernel(
         o2 = no;
     }
 
-    // 写入 shared memory
-    __syncthreads();
-    Sa[token_id][channel_id] = a;
-    Sb[token_id][channel_id] = b;
-    Sc[token_id][channel_id] = c;
-    Sd[token_id][channel_id] = d;
-    So1[token_id][channel_id] = o1;
-    So2[token_id][channel_id] = o2;
-    __syncthreads();
-
-    // ── 第二阶段：从 shared memory 聚合各段状态 ──
     scalar_t a2 = 0, b2 = 0, c2 = 0, d2 = 0;
     scalar_t o3 = MIN_VALUE, o4 = MIN_VALUE;
-
-    // 反向段聚合
     for (int i = 0; i < token_id; i++) {
         const int exp_w = (token_id - i - 1) * _T;
-        scalar_t no = max(So2[i][channel_id] - w * exp_w, o4);
-        a2 = a2 * exp(o4 - no) + Sa[i][channel_id] * exp(So2[i][channel_id] - w * exp_w - no);
-        b2 = b2 * exp(o4 - no) + Sb[i][channel_id] * exp(So2[i][channel_id] - w * exp_w - no);
+        scalar_t no = max(__shfl_sync(0Xffffffff, o2, i) - w * exp_w, o4);
+        a2 = a2 * exp(o4 - no) + __shfl_sync(0Xffffffff, a, i) * exp(__shfl_sync(0Xffffffff, o2, i) - w * exp_w - no);
+        b2 = b2 * exp(o4 - no) + __shfl_sync(0Xffffffff, b, i) * exp(__shfl_sync(0Xffffffff, o2, i) - w * exp_w - no);
         o4 = no;
     }
     a = a2;
     b = b2;
     o2 = o4;
 
-    // 正向段聚合
     for (int i = token_id; i < TOKEN_SPLIT; i++){
         const int exp_w = (i - token_id) * _T;
-        scalar_t no = max(So1[i][channel_id] - w * exp_w, o3);
-        c2 = c2 * exp(o3 - no) + Sc[i][channel_id] * exp(So1[i][channel_id] - w * exp_w - no);
-        d2 = d2 * exp(o3 - no) + Sd[i][channel_id] * exp(So1[i][channel_id] - w * exp_w - no);
+        scalar_t no = max(__shfl_sync(0Xffffffff, o1, i) - w * exp_w, o3);
+        c2 = c2 * exp(o3 - no) + __shfl_sync(0Xffffffff, c, i) * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
+        d2 = d2 * exp(o3 - no) + __shfl_sync(0Xffffffff, d, i) * exp(__shfl_sync(0Xffffffff, o1, i) - w * exp_w - no);
         o3 = no;
     }
 
-    // ── 第三阶段：最终输出 ──
     o1 = o3;
-    // 空 segment（T 非 32 整数倍时的尾部）不读取 k/v，避免越界
     if (_tokenLength > 0) {
         c = c2 - exp(k[_t * C] - o3) * v[_t * C];
         d = d2 - exp(k[_t * C] - o3);
@@ -134,7 +108,7 @@ __global__ void bi_wkv_cuda_forward_kernel(
         scalar_t e3 = exp(u + k[ii] - no);
         y[ii] = (c * e1 + a * e2 + e3 * v[ii])/(d * e1 + b * e2 + e3 + EPS);
         // update a, b, c, d
-        const int ii2 = ((i + 1) < T ? (i + 1) : (T - 1)) * C;
+        const int ii2 = ((i + 1) % T) * C;
         no = max(o2 - w, k[ii]);
         e2 = exp(o2 - w - no);
         e3 = exp(k[ii] - no);
@@ -150,10 +124,6 @@ __global__ void bi_wkv_cuda_forward_kernel(
     }
 }
 
-
-// ═══════════════════════════════════════════════════════════════
-// Backward kernel：使用 shared memory 保存段状态并计算梯度
-// ═══════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
 __global__ void bi_wkv_cuda_backward_kernel(
@@ -195,6 +165,7 @@ __global__ void bi_wkv_cuda_backward_kernel(
     scalar_t *__restrict__ const gk = _gk + _offset;
     scalar_t *__restrict__ const gv = _gv + _offset;
 
+    // MaxOp<float> max;
     // for saving smem, del Sc, Sd, Sdcdw, Sdddw, So1
     __shared__ scalar_t Sa[TOKEN_SPLIT][CHANNEL_LEN], Sb[TOKEN_SPLIT][CHANNEL_LEN];
     __shared__ scalar_t Sdadw[TOKEN_SPLIT][CHANNEL_LEN], Sdbdw[TOKEN_SPLIT][CHANNEL_LEN];
@@ -271,7 +242,6 @@ __global__ void bi_wkv_cuda_backward_kernel(
              * exp(So2[i][channel_id] - w * exp_w - no);
         o1 = no;
     }
-    // 空 segment（T 非 32 整数倍时的尾部）不读取 k/v，避免越界
     if (_tokenLength > 0) {
         c -= exp(k[_t * C] - o1) * v[_t * C];
         d -= exp(k[_t * C] - o1);
@@ -292,21 +262,21 @@ __global__ void bi_wkv_cuda_backward_kernel(
         y[ii] = num * iden;
         z[ii] = iden;
         zexp[ii] = -no;
-        gw += gy[ii] * (dadw - dbdw * (num * iden)) * iden * e2;
-        gw += gy[ii] * (dcdw - dddw * (num * iden)) * iden * e1;
-        gu += gy[ii] * (v[ii] - (num * iden)) * e3 * iden;
-        gk[ii] = gy[ii] * iden * (v[ii] - (num * iden)) * e3;
+        gw += gy[ii] * (dadw - dbdw * (num * iden /*y[ii]*/)) * iden * e2;
+        gw += gy[ii] * (dcdw - dddw * (num * iden /*y[ii]*/)) * iden * e1;
+        gu += gy[ii] * (v[ii] - (num * iden /*y[ii]*/)) * e3 * iden;
+        gk[ii] = gy[ii] * iden * (v[ii] - (num * iden /*y[ii]*/)) * e3;
         gv[ii] = gy[ii] * iden * e3;
         // cal gc & gd for gk & gv
         scalar_t gno = max(- w + go1, -no);
         e1 = exp(- w + go1 - gno);
         e3 = gy[ii] * iden  * exp(- no - gno);
-        gc = e1 * gc + e3 * (num * iden);
+        gc = e1 * gc + e3 * (num * iden /*y[ii]*/);
         gd = e1 * gd + e3;
         go1 = gno;
 
         // update a, b, c, d
-        const int ii2 = ((i + 1) < T ? (i + 1) : (T - 1)) * C;
+        const int ii2 = ((i + 1) % T) * C;
         no = max(o2 - w, k[ii]);
         e2 = exp(o2 - w - no);
         e3 = exp(k[ii] - no);
@@ -420,7 +390,7 @@ torch::Tensor bi_wkv_cuda_forward(
             y.data_ptr<scalar_t>());
     }));
     cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "bi_wkv forward kernel launch failed");
+    TORCH_CHECK(err == cudaSuccess, "bi_wkv forward kernel launch failed: ", cudaGetErrorString(err));
     return y;
 }
 
@@ -466,6 +436,6 @@ std::vector<torch::Tensor> bi_wkv_cuda_backward(
             zexp.data_ptr<scalar_t>());
     }));
     cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "bi_wkv backward kernel launch failed");
+    TORCH_CHECK(err == cudaSuccess, "bi_wkv backward kernel launch failed: ", cudaGetErrorString(err));
     return {gw, gu, gk, gv};
 }

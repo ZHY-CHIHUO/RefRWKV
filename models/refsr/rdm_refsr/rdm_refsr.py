@@ -50,12 +50,8 @@ _REF_MODE_ALIASES = {
 }
 _CANONICAL_REFERENCE_KINDS = ("pan", "stf", "mhf", "generic")
 
-# The bundled segmented Bi-WKV kernel uses 32 token segments.  Its current
-# tail aggregation is exact for one segment but can accumulate an error when
-# several segments are present.  Longer strips use the mathematically
-# identical differentiable recurrence below until a multi-segment kernel is
-# available; this is still O(T), unlike a quadratic attention fallback.
-_BIWKV_KERNEL_MAX_TOKENS = 32
+# GPU uses the original Vision-RWKV 32-way bidirectional kernel for any T.
+# CPU tests keep the exclusive recurrence in ``_reference_biwkv``.
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -396,7 +392,7 @@ class SharedDirectionalRWKV(nn.Module):
                 dtype=k.dtype
             )
             input_dtype = k.dtype
-            if k.is_cuda and int(k.shape[1]) <= _BIWKV_KERNEL_MAX_TOKENS:
+            if k.is_cuda:
                 y = RUN_CUDA(decay, first, k.contiguous(), v.contiguous())
             else:
                 y = _reference_biwkv(decay, first, k, v)

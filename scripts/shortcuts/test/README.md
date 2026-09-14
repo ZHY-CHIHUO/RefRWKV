@@ -34,3 +34,12 @@ bash scripts/shortcuts/test/fusion_mamba_pancollection_wv3.sh \
 
 该适配器使用全图 `256x256` HR 输入，数据和模型都走 `[0, 1]` 范围。测试数据根目录仍由
 `configs/datasets/refsr/pancollection_wv3.yaml` 中的 PanCollection H5 配置决定。
+
+## `bi_wkv_cuda.sh`
+
+本机检查原版双向 Bi-WKV CUDA 能否编译、前反向是否有限：
+
+```bash
+bash scripts/shortcuts/test/bi_wkv_cuda.sh
+bash scripts/shortcuts/test/bi_wkv_cuda.sh --unittest
+```
