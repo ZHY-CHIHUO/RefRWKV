@@ -55,8 +55,21 @@ class FusionMamba(nn.Module):
         self.spe_cross_mamba = CrossMambaBlock(dim, H, W)
         self.out_proj = nn.Linear(dim, dim)
 
+    def _bind_spatial(self, height, width):
+        for module in (
+            *self.spa_mamba_layers,
+            *self.spe_mamba_layers,
+            self.spa_cross_mamba,
+            self.spe_cross_mamba,
+        ):
+            module.block.input_h = height
+            module.block.input_w = width
+
     def forward(self, pan, ms):
         b, c, h, w = pan.shape
+        if tuple(ms.shape[-2:]) != (h, w):
+            raise ValueError(f"PAN/MS spatial mismatch: pan={tuple(pan.shape)} ms={tuple(ms.shape)}")
+        self._bind_spatial(h, w)
         pan = rearrange(pan, 'b c h w -> b (h w) c', h=h, w=w)
         ms = rearrange(ms, 'b c h w -> b (h w) c', h=h, w=w)
         for spa_layer, spe_layer in zip(self.spa_mamba_layers, self.spe_mamba_layers):
