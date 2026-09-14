@@ -16,10 +16,10 @@ SR 模型通常提供 `forward(lr)`；direct RefSR 模型提供 `forward(lr, ref
 - `models/sr/swinir/`：项目现有 SwinIR 网络和 adapter。
 - `models/sr/baselines.py`、`baseline_adapters.py`：轻量单图对比模型和 registry 适配。
 - `models/refsr/refsrwkv/`：参考图超分 RWKV，支持 `paired` 真实 Ref 和 `lr_up` 自参考两种数据模式。
-- `models/refsr/rdm_refsr/`：RDM 双网格家族，三个独立模型。`rdm_pan` 做
-  MS+PAN 全色融合（FusionMamba 量级宽度），`rdm_stf` 做同谱段时空融合，
-  `rdm_mhf` 做 MS/HS 融合。主干仍是 Haar 高频 + 可靠性门控 + Bi-WKV，并在
-  指定 stage 使用官方 `mamba_ssm.Mamba`。
+- `models/refsr/rdm_refsr/`：RDM 家族三个独立模型。`rdm_pan` 是 FusionMamba
+  思路的 MS+PAN 双流全色融合（HR 网格、上采样 MS 残差，无匹配/可靠性门控）；
+  `rdm_stf` 做同谱段时空融合；`rdm_mhf` 做 MS/HS 融合。STF/MHF 仍用 Haar 高频
+  + 可靠性门控 + Bi-WKV，并在指定 stage 使用官方 `mamba_ssm.Mamba`。
 - `models/refsr/baselines.py`、`baseline_adapters.py`：TTSR、MASA-SR、DATSR 的统一 direct RefSR 适配。
 - `models/refsr/RefDiffRWKV/`：扩散生成器、SR prior、参考适配器、判别器和采样器。
 
@@ -65,11 +65,11 @@ Python 构造函数中的 `fusion_mode` 默认为 `legacy`，与已有 checkpoin
 RDM 不根据通道数猜任务，而是三个独立模型：
 
 ```text
-rdm_pan : LR/MS + HR PAN -> HR/MS；传感器响应投影空间高频，无时相对齐
+rdm_pan : LR/MS + HR PAN -> HR/MS；HR 双流融合，残差加在 bicubic(MS) 上
 rdm_stf : LR 目标时相 + HR 参考时相 -> HR 目标时相；变化图抑制参考注入
 rdm_mhf : LR HSI + HR MSI -> HR HSI；response_matrix 做 MSI->HSI 光谱提升
 ```
 
-PAN 版有自己的宽度和初始化（`configs/models/refsr/rdm_pan.yaml`，约 1.3M），
-不要把 STF 的 23M U-Net 拿去和 FusionMamba 比。STF/MHF 目前仍用较宽主干，
-后续再各自瘦身。
+PAN 版不再复用 STF 的匹配/可靠性骨架。网络按 FusionMamba 的 U2 双流来做，
+参数量仍压在同一量级（`configs/models/refsr/rdm_pan.yaml`）。STF/MHF 目前
+仍用较宽双网格主干，后续再各自瘦身。

@@ -860,7 +860,8 @@ class RDMRefSR(nn.Module):
     ``ref_channels``.  This supports LR-HSI + HR-MSI as well as PAN and
     cross-temporal RGB without assuming a channel ordering relationship.
     ``channel_multipliers`` keeps the four-stage U-Net but can cap the
-    bottleneck at FusionMamba-like widths for a dedicated PAN recipe.
+    bottleneck width.  Pansharpening is implemented by ``RDMPan``, not this
+    gated dual-grid model.
     """
 
     def __init__(
@@ -977,6 +978,12 @@ class RDMRefSR(nn.Module):
             str(name).strip().lower() for name in detail_injection_stages
         )
         kind = normalize_reference_kind(reference_kind)
+        if kind == "pan":
+            raise ValueError(
+                "RDMRefSR no longer implements pansharpening; use RDMPan "
+                "(model.name=rdm_pan). Matcher/reliability gating is only for "
+                "STF/MHF, where the reference can be wrong."
+            )
         if alignment is None:
             alignment = kind in {"stf", "mhf"}
         if not isinstance(alignment, bool):
@@ -1255,30 +1262,26 @@ class RDMRefSR(nn.Module):
         return Stage(blocks)
 
     def _init_reference_residuals(self) -> None:
-        """Restore reference residuals after the generic convolution init.
+        """Restore conservative STF/MHF residuals after generic conv init.
 
         ``apply(_init_weights)`` zeroes every conv bias, including the
-        reliability head.  PAN is co-registered, so it starts with a usable
-        residual; temporal/HSI-MSI stay close to bicubic until the matcher
-        and reliability field have evidence.
+        reliability head.  Temporal/HSI-MSI stay close to bicubic until the
+        matcher and reliability field have evidence.  Pansharpening lives in
+        ``RDMPan`` and does not use this gated residual path.
         """
-        pan = self.reference_kind == "pan"
-        nn.init.constant_(self.reliability.net[-1].bias, 0.0 if pan else -1.0)
+        nn.init.constant_(self.reliability.net[-1].bias, -1.0)
         nn.init.constant_(self.reliability.change_net[-1].bias, -1.0)
-        query_std = 1.0e-3 if pan else 1.0e-4
         for module in (self.synthesis.low_delta, self.synthesis.detail_delta):
-            nn.init.normal_(module.weight, std=query_std)
+            nn.init.normal_(module.weight, std=1.0e-4)
             nn.init.zeros_(module.bias)
-        nn.init.normal_(
-            self.synthesis.reference_detail.weight, std=2.0e-2 if pan else 5.0e-3
-        )
-        nn.init.constant_(self.synthesis.band_gate.bias, 0.0 if pan else -0.5)
-        nn.init.constant_(self.synthesis.response_gate.bias, -0.5 if pan else -1.0)
-        nn.init.constant_(self.synthesis.reference_scale, 0.35 if pan else 0.10)
-        nn.init.constant_(self.synthesis.response_detail_scale, 0.08 if pan else 0.03)
+        nn.init.normal_(self.synthesis.reference_detail.weight, std=5.0e-3)
+        nn.init.constant_(self.synthesis.band_gate.bias, -0.5)
+        nn.init.constant_(self.synthesis.response_gate.bias, -1.0)
+        nn.init.constant_(self.synthesis.reference_scale, 0.10)
+        nn.init.constant_(self.synthesis.response_detail_scale, 0.03)
         for injector in (self.inject_dec1, self.inject_coeff):
-            nn.init.normal_(injector.detail.weight, std=2.0e-2 if pan else 1.0e-3)
-            nn.init.constant_(injector.alpha, 0.25 if pan else 0.05)
+            nn.init.normal_(injector.detail.weight, std=1.0e-3)
+            nn.init.constant_(injector.alpha, 0.05)
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -1824,23 +1827,8 @@ class HaarIDWT2D(nn.Module):
         return haar_idwt2d(low, detail, output_size)
 
 
-class RDMPan(RDMRefSR):
-    """MS LR + PAN HR pansharpening specialist.
-
-    Capacity and training contract follow FusionMamba: dim=32, 32-64-64-128
-    stages, no temporal alignment, and a usable reference residual at init.
-    """
-
-    def __init__(self, **kwargs: Any) -> None:
-        kind = kwargs.get("reference_kind")
-        if kind is not None and normalize_reference_kind(kind) != "pan":
-            raise ValueError(
-                "RDMPan is the pansharpening model; use rdm_stf or rdm_mhf"
-            )
-        for key, value in _PAN_DEFAULTS.items():
-            kwargs.setdefault(key, value)
-        kwargs["reference_kind"] = "pan"
-        super().__init__(**kwargs)
+# RDMPan lives in rdm_pan.py.  It is a FusionMamba-style dual-stream
+# pansharpening network, not a gated dual-grid RefSR specialist.
 
 
 class RDMStf(RDMRefSR):
@@ -1871,23 +1859,6 @@ class RDMMhf(RDMRefSR):
         super().__init__(**kwargs)
 
 
-_PAN_DEFAULTS = {
-    "dim": 32,
-    "depths": (1, 1, 1, 1),
-    "decoder_depths": (1, 1, 1),
-    "channel_multipliers": (1, 2, 2, 4),
-    "mamba_stages": ("enc2", "latent"),
-    "reference_condition_stages": ("enc1", "enc2", "latent", "dec1", "coeff"),
-    "detail_injection_stages": ("dec1", "coeff"),
-    "mamba_d_state": 8,
-    "mamba_d_conv": 4,
-    "mamba_expand": 1,
-    "high_order": False,
-    "shuffle_prob": 0.0,
-    "alignment": False,
-}
-
-
 __all__ = [
     "FourDirectionMamba",
     "HaarDWT2D",
@@ -1895,9 +1866,9 @@ __all__ = [
     "HybridStateBlock",
     "QShift",
     "RDMMhf",
-    "RDMPan",
     "RDMRefSR",
     "RDMStf",
+    "RMSNorm2d",
     "ReliabilityField",
     "SharedDirectionalRWKV",
     "TrueMambaScan",

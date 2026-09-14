@@ -12,7 +12,8 @@ from typing import Any
 
 import torch.nn as nn
 
-from .rdm_refsr import RDMMhf, RDMPan, RDMRefSR, RDMStf, normalize_reference_kind
+from .rdm_pan import RDMPan
+from .rdm_refsr import RDMMhf, RDMRefSR, RDMStf, normalize_reference_kind
 from ..registry import RefSRModelAdapter, register_adapter
 
 
@@ -67,6 +68,11 @@ class RDMRefSRAdapter(RefSRModelAdapter):
         kwargs = _filtered_kwargs(model_config, scale=scale)
         if "reference_kind" in kwargs:
             kwargs["reference_kind"] = normalize_reference_kind(kwargs["reference_kind"])
+        if kwargs.get("reference_kind") == "pan":
+            raise ValueError(
+                "model.name=rdm_refsr no longer supports pansharpening; "
+                "use model.name=rdm_pan (configs/models/refsr/rdm_pan.yaml)"
+            )
         return RDMRefSR(**kwargs)
 
     def describe(self, model_config: Mapping[str, Any], *, scale: int) -> dict[str, Any]:
@@ -99,7 +105,7 @@ class RDMPanAdapter(RefSRModelAdapter):
         result = super().describe(model_config, scale=scale)
         result.update(
             {
-                "implementation": "dual_grid_rwkv_mamba",
+                "implementation": "hr_dual_stream_rwkv_mamba",
                 "reference_kind": "pan",
                 "family": "rdm",
                 "task": "pansharpening",

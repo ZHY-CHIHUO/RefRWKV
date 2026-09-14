@@ -1,6 +1,7 @@
-# Full-width RDMRefSR v2 on reduced-resolution WV3 (~23M).
-# Dedicated PAN model is rdm_pan:
+# Deprecated full-width RDMRefSR v2 on WV3.
+# Pansharpening now uses the dedicated dual-stream model:
 # configs/runs/rdm_refsr/pancollection_wv3_pan_x4.yaml.
+# This file will error if run: rdm_refsr no longer implements PAN.
 base:
   - ../../common/rdm_refsr.yaml
   - ../../models/refsr/rdm_refsr.yaml

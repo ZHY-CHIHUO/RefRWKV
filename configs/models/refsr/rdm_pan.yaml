@@ -1,33 +1,20 @@
-# RDM-PAN: MS LR + co-registered PAN HR pansharpening specialist.
-# dim=32 with 32-64-64-128 stages is ~1.29M vs FusionMamba 0.74M (~1.8x).
-# Do not reuse this width for STF/MHF; those tasks keep the wider U-Net.
+# RDM-PAN: dedicated MS LR + PAN HR pansharpening network.
+# FusionMamba-style dual stream on the HR grid, residual on bicubic MS.
+# No matcher, reliability, or change gating.
 model:
   name: rdm_pan
   family: rdm
   variant: rdm_pan
-  implementation: dual_grid_rwkv_mamba
+  implementation: hr_dual_stream_rwkv_mamba
   inp_channels: 8
   out_channels: 8
   ref_channels: 1
   target_channels: 8
   dim: 32
-  depths: [1, 1, 1, 1]
-  decoder_depths: [1, 1, 1]
-  channel_multipliers: [1, 2, 2, 4]
   reference_kind: pan
-  mamba_stages: [enc2, latent]
-  reference_condition_stages: [enc1, enc2, latent, dec1, coeff]
-  detail_injection_stages: [dec1, coeff]
   mamba_d_state: 8
   mamba_d_conv: 4
   mamba_expand: 1
-  high_order: false
   allow_cpu_mamba: true
-  shuffle_prob: 0.0
-  shuffle_block: 4
-  match_window: 5
-  match_dim: 16
-  match_grid: coefficient
-  alignment: false
   use_reference: true
   clamp_output: true

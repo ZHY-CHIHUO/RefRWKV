@@ -25,11 +25,6 @@ data:
   val_batch_size: 32
   max_samples_val: null
 
-model:
-  # Neutral broad PAN prior; replace with calibrated WV3 band response when
-  # available.  The logits remain learnable during training.
-  sensor_response: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-
 test:
   splits: [test]
   metrics: [psnr, ssim]

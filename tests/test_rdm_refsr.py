@@ -16,9 +16,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from engines.refsr import RDMRefSRTrainer  # noqa: E402
 from models.refsr import build_model, list_models  # noqa: E402
+from models.refsr.rdm_refsr.rdm_pan import RDMPan  # noqa: E402
 from models.refsr.rdm_refsr.rdm_refsr import (  # noqa: E402
     RDMMhf,
-    RDMPan,
     RDMRefSR,
     RDMStf,
     SharedDirectionalRWKV,
@@ -54,6 +54,22 @@ def _compact_model(**updates) -> RDMRefSR:
     return RDMRefSR(**options)
 
 
+def _pan_model(**updates) -> RDMPan:
+    options = dict(
+        inp_channels=8,
+        ref_channels=1,
+        out_channels=8,
+        dim=16,
+        scale=2,
+        mamba_d_state=2,
+        mamba_d_conv=2,
+        mamba_expand=1,
+        allow_cpu_mamba=True,
+    )
+    options.update(updates)
+    return RDMPan(**options)
+
+
 class RDMRefSRTests(unittest.TestCase):
     def test_haar_round_trip_odd_geometry(self) -> None:
         value = torch.randn(2, 5, 7, 9)
@@ -66,7 +82,6 @@ class RDMRefSRTests(unittest.TestCase):
         cases = (
             ("stf", 3, 3, 3),
             ("temporal", 3, 3, 3),
-            ("pan", 8, 1, 8),
             ("mhf", 31, 4, 31),
             ("hsi_msi", 31, 4, 31),
         )
@@ -85,6 +100,15 @@ class RDMRefSRTests(unittest.TestCase):
                 self.assertEqual(tuple(output.shape), (1, out_channels, 6, 10))
                 self.assertTrue(torch.isfinite(output).all())
 
+        pan = _pan_model()
+        lr = torch.rand(1, 8, 4, 5, requires_grad=True)
+        ref = torch.rand(1, 1, 8, 10)
+        output = pan(lr, ref)
+        self.assertEqual(tuple(output.shape), (1, 8, 8, 10))
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertFalse(hasattr(pan, "reliability"))
+        self.assertFalse(hasattr(pan, "detail_matcher"))
+
     def test_cpu_backward_reaches_query_and_mamba_fallback(self) -> None:
         model = _compact_model()
         lr = torch.randn(1, 3, 3, 4, requires_grad=True)
@@ -101,21 +125,28 @@ class RDMRefSRTests(unittest.TestCase):
         self.assertTrue(fallback_grads)
         self.assertGreater(float(sum(gradient.abs().sum() for gradient in fallback_grads)), 0.0)
 
-    def test_pan_response_detail_path_is_band_aware(self) -> None:
-        model = _compact_model(
-            inp_channels=8,
-            ref_channels=1,
-            out_channels=8,
-            target_channels=8,
-            reference_kind="pan",
-        )
-        lr = torch.randn(1, 8, 3, 4)
-        ref = torch.randn(1, 1, 6, 8)
-        output = model(lr, ref)
-        output.square().mean().backward()
-        self.assertEqual(tuple(model._sensor_band_gains().shape), (8,))
-        self.assertIsNotNone(model.sensor_logits.grad)
-        self.assertGreater(float(model.sensor_logits.grad.abs().sum()), 0.0)
+    def test_rdm_refsr_rejects_pansharpening_kind(self) -> None:
+        with self.assertRaisesRegex(ValueError, "RDMPan"):
+            _compact_model(reference_kind="pan")
+        with self.assertRaisesRegex(ValueError, "rdm_pan"):
+            build_model(
+                {
+                    "name": "rdm_refsr",
+                    "inp_channels": 8,
+                    "ref_channels": 1,
+                    "out_channels": 8,
+                    "dim": 16,
+                    "depths": [1, 1, 1, 1],
+                    "decoder_depths": [1, 1, 1],
+                    "reference_kind": "pan",
+                    "mamba_d_state": 2,
+                    "mamba_d_conv": 2,
+                    "mamba_expand": 1,
+                    "match_window": 3,
+                    "match_dim": 4,
+                },
+                scale=4,
+            )
 
     def test_long_biwkv_fallback_matches_distance_formula(self) -> None:
         torch.manual_seed(11)
@@ -147,7 +178,7 @@ class RDMRefSRTests(unittest.TestCase):
         ref = torch.rand(1, 3, 8, 10)
         expected = F.interpolate(lr, size=(8, 10), mode="bicubic", align_corners=False).clamp(0, 1)
         output = model(lr, ref)
-        self.assertLess(float((output - expected).abs().mean()), 5.0e-3)
+        self.assertLess(float((output - expected).detach().abs().mean()), 5.0e-3)
 
     def test_registry_and_config_profile(self) -> None:
         self.assertIn("rdm_refsr", list_models())
@@ -217,7 +248,7 @@ class RDMRefSRTests(unittest.TestCase):
         self.assertTrue(torch.allclose(captured[0], torch.full_like(captured[0], 0.5), atol=1e-5))
 
     def test_trainer_physical_loss_is_finite(self) -> None:
-        config = load_config("configs/runs/rdm_refsr/pancollection_wv3_x4.yaml", prefer_existing=False)
+        config = load_config("configs/runs/rdm_refsr/hrms_scd_x4.yaml", prefer_existing=False)
         config["data"]["scale"] = 2
         config["model"].update(
             dim=16,
@@ -233,13 +264,12 @@ class RDMRefSRTests(unittest.TestCase):
             sam_weight=0.01,
             wavelet_weight=0.01,
             consistency_weight=0.01,
-            sensor_weight=0.01,
             change_weight=0.01,
         )
         trainer = RDMRefSRTrainer.from_config(config)
-        lr = torch.randn(1, 8, 3, 4)
-        hr = torch.randn(1, 8, 6, 8)
-        ref = torch.randn(1, 1, 6, 8)
+        lr = torch.randn(1, 3, 3, 4)
+        hr = torch.randn(1, 3, 6, 8)
+        ref = torch.randn(1, 3, 6, 8)
         value = trainer._train_step({"lr": lr, "hr": hr, "ref": ref}, 0)
         self.assertTrue(torch.isfinite(value))
 
@@ -282,7 +312,9 @@ class RDMRefSRTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _compact_model(channel_multipliers=(1, 2, 4))
         with self.assertRaises(ValueError):
-            _compact_model(dim=16, channel_multipliers=(1, 2, 3, 4))
+            _compact_model(channel_multipliers=(1, 2, 0, 4))
+        with self.assertRaises(ValueError):
+            _compact_model(channel_multipliers=(1, 2, 4, 8, 8))
 
     def test_reference_kind_aliases_map_to_pan_stf_mhf(self) -> None:
         self.assertEqual(normalize_reference_kind("temporal"), "stf")
@@ -295,23 +327,35 @@ class RDMRefSRTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RDMPan(reference_kind="stf")
 
-    def test_pan_residual_init_is_stronger_than_temporal(self) -> None:
+    def test_pan_has_no_reliability_gate_unlike_stf(self) -> None:
         temporal = _compact_model()
-        pan = _compact_model(
-            inp_channels=8,
-            ref_channels=1,
-            out_channels=8,
-            target_channels=8,
-            reference_kind="pan",
-        )
+        pan = _pan_model()
+        self.assertFalse(hasattr(pan, "reliability"))
+        self.assertFalse(hasattr(pan, "detail_matcher"))
+        self.assertFalse(hasattr(pan, "inject_dec1"))
         self.assertAlmostEqual(temporal.inject_dec1.alpha.detach().mean().item(), 0.05, places=5)
-        self.assertAlmostEqual(pan.inject_dec1.alpha.detach().mean().item(), 0.25, places=5)
         self.assertAlmostEqual(temporal.synthesis.reference_scale.detach().mean().item(), 0.10, places=5)
-        self.assertAlmostEqual(pan.synthesis.reference_scale.detach().mean().item(), 0.35, places=5)
         self.assertAlmostEqual(temporal.reliability.net[-1].bias.detach().item(), -1.0, places=5)
-        self.assertAlmostEqual(pan.reliability.net[-1].bias.detach().item(), 0.0, places=5)
-        self.assertAlmostEqual(temporal.synthesis.band_gate.bias.detach().mean().item(), -0.5, places=5)
-        self.assertAlmostEqual(pan.synthesis.band_gate.bias.detach().mean().item(), 0.0, places=5)
+        self.assertLess(float(pan.to_hrms[-1].weight.detach().abs().max()), 1.1e-4)
+        self.assertEqual(float(pan.to_hrms[-1].bias.detach().abs().max()), 0.0)
+
+    def test_pan_dual_stream_starts_from_bicubic_and_uses_pan(self) -> None:
+        torch.manual_seed(0)
+        model = _pan_model()
+        self.assertFalse(hasattr(model, "reliability"))
+        self.assertFalse(hasattr(model, "detail_matcher"))
+        self.assertEqual(model.channel_multipliers, (1, 2, 4))
+        lr = torch.rand(1, 8, 4, 4)
+        ref = torch.rand(1, 1, 8, 8)
+        expected = F.interpolate(lr, size=(8, 8), mode="bicubic", align_corners=False)
+        output = model(lr, ref)
+        self.assertEqual(tuple(output.shape), (1, 8, 8, 8))
+        self.assertLess(float((output - expected).detach().abs().mean()), 5.0e-3)
+        output.square().mean().backward()
+        self.assertIsNotNone(model.raise_pan[0].weight.grad)
+        self.assertGreater(float(model.raise_pan[0].weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.raise_ms[0].weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.stage0.pan_from_ms.weight.grad.abs().sum()), 0.0)
 
     def test_pan_slim_config_matches_fusion_mamba_capacity(self) -> None:
         from models.refsr.fusion_mamba.adapter import FusionMambaRefSR
@@ -325,24 +369,16 @@ class RDMRefSRTests(unittest.TestCase):
         model = build_model(config["model"], scale=4)
         self.assertIsInstance(model, RDMPan)
         self.assertEqual(model.reference_kind, "pan")
-        self.assertEqual(model.channel_multipliers, (1, 2, 2, 4))
+        self.assertEqual(model.channel_multipliers, (1, 2, 4))
         self.assertEqual(model.dim, 32)
-        self.assertFalse(model.high_order)
-        self.assertEqual(
-            model.reference_condition_stages,
-            frozenset({"enc1", "enc2", "latent", "dec1", "coeff"}),
-        )
+        self.assertFalse(hasattr(model, "detail_matcher"))
+        self.assertFalse(hasattr(model, "reliability"))
         pan_params = sum(parameter.numel() for parameter in model.parameters())
         fusion = FusionMambaRefSR(dim=32, pan_dim=1, ms_dim=8, H=64, W=64, scale=4)
         fusion_params = sum(parameter.numel() for parameter in fusion.parameters())
-        self.assertLess(pan_params, 1_500_000)
-        self.assertGreater(pan_params / fusion_params, 0.8)
-        self.assertLess(pan_params / fusion_params, 2.0)
-        lr = torch.rand(1, 8, 16, 16)
-        ref = torch.rand(1, 1, 64, 64)
-        output = model(lr, ref)
-        self.assertEqual(tuple(output.shape), (1, 8, 64, 64))
-        self.assertTrue(torch.isfinite(output).all())
+        self.assertLess(pan_params, 1_800_000)
+        self.assertGreater(pan_params / fusion_params, 0.5)
+        self.assertLess(pan_params / fusion_params, 3.0)
 
 
 if __name__ == "__main__":

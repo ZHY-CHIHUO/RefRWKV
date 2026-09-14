@@ -34,8 +34,8 @@ run 名称，不会复用旧 legacy 实验目录。
 RDM 家族拆成三个独立模型，不要靠通道数去猜任务：
 
 - `rdm_pan`：全色融合（MS LR + PAN HR）。WV3 入口
-  `configs/runs/rdm_refsr/pancollection_wv3_pan_x4.yaml`，约 1.3M，对齐
-  FusionMamba 的 0.74M，L1 训练，PAN 残差初始化更开。
+  `configs/runs/rdm_refsr/pancollection_wv3_pan_x4.yaml`。FusionMamba 式
+  HR 双流，残差加在 bicubic MS 上，无匹配/错误参考门控，L1 训练。
 - `rdm_stf`：时空融合（LR/Ref 谱段相同，分辨率和时相不同），如 HRMS、Wuhan。
 - `rdm_mhf`：多光谱/高光谱融合（LR-HSI + HR-MSI）。
 

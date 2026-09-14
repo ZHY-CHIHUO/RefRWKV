@@ -79,7 +79,7 @@ def run(
         yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
     train_loader, val_loader = build_refsr_loaders(config)
     model_name = str(config.get("model", {}).get("name", "")).strip().lower()
-    trainer_cls = RDMRefSRTrainer if model_name in {"rdm_refsr", "rdm_pan", "rdm_stf", "rdm_mhf"} else RefSRTrainer
+    trainer_cls = RDMRefSRTrainer if model_name in {"rdm_refsr", "rdm_stf", "rdm_mhf"} else RefSRTrainer
     module = trainer_cls.from_config(config)
     if load_weights:
         report = load_model_weights(
