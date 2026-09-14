@@ -1,0 +1,165 @@
+data:
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 8
+  val_num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: false
+  pin_memory: true
+  drop_last: true
+  max_samples_train: null
+  max_samples_val: null
+  max_samples_test: null
+  sample_seed: 42
+  augment: true
+  reference_mode: paired
+  augment_ref: false
+  ref_aug_strengths:
+  - 0.12
+  - 0.12
+  - 0.12
+  - 0.03
+  ref_aug_probs:
+  - 0.5
+  - 0.5
+  - 0.5
+  - 0.5
+  ref_gray_prob: 0.2
+  patch_size: 128
+  val_patch_size: 128
+  test_patch_size: null
+  lr_source: stored
+  lr_provenance: sensor
+  lr_native_scale: 1
+  value_scale: 11848.0
+  physical_resolution_ratio: 3.75
+  target_time: t2
+  reference_time: t1
+  return_quadruple: true
+  c0_key: lr_t1
+  use_c0: true
+  cache: true
+  eval_tile_size: 128
+  eval_tile_overlap: 16
+  root: data/refsr/Wuhan-dataset
+  scale: 1
+  dataset_format: tiff_temporal_pairs
+  dataset_kind: wuhan_stf_tiff
+  channels: 4
+  normalization: value / 11848 -> [0, 1]
+  lr_key: lr
+  hr_key: hr
+  ref_key: ref
+train:
+  accelerator: auto
+  devices: 1
+  precision: '32'
+  max_epochs: 1000
+  max_steps: -1
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  num_sanity_val_steps: 0
+  grad_clip_norm: 1.0
+  learning_rate: 0.0005
+  weight_decay: 0.0
+  adam_betas:
+  - 0.9
+  - 0.999
+  lr_scheduler: cosine
+  lr_patience: 3
+  lr_factor: 0.5
+  lr_threshold: 1.0e-05
+  lr_min: 1.0e-05
+  use_ema: false
+  ema_decay: 0.999
+  save_top_k: 3
+  early_stopping_patience: null
+  auto_resume: true
+  seed: 2021
+  optimizer: adam
+  lr_interval: epoch
+  lr_t_max: 200
+output:
+  root: experiments
+  train_root: experiments/train
+  test_root: experiments/test
+  experiment_name: rdm_stf_wuhan
+  checkpoint_dir: experiments/train/refsr/rdm_stf/wuhan/x1/rdm_stf_wuhan/checkpoints
+  log_dir: experiments/train/refsr/rdm_stf/wuhan/x1/rdm_stf_wuhan/logs
+  test_dir: experiments/test/refsr/rdm_stf/wuhan/x1/rdm_stf_wuhan
+task: refsr
+loss:
+  name: charbonnier
+  eps: 0.001
+  ssim_weight: 1.0
+  fft_weight: 0.0
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - ssim
+  - rmse
+  - uiqi
+  - psnr_wuhan
+  - sam_deg
+  - ergas
+  save_images: false
+  batch_size: 1
+model:
+  name: rdm_stf
+  family: rdm
+  variant: rdm_stf
+  implementation: hr_dual_stream_rwkv_mamba_stf
+  inp_channels: 4
+  out_channels: 4
+  ref_channels: 4
+  dim: 32
+  reference_kind: stf
+  mamba_d_state: 8
+  mamba_d_conv: 4
+  mamba_expand: 1
+  allow_cpu_mamba: true
+  shuffle_prob: 0.15
+  shuffle_block: 4
+  spectral_drop_bands: 1
+  use_reference: true
+  clamp_output: true
+dataset:
+  id: wuhan
+  name: Wuhan GF/Landsat spatiotemporal-fusion dataset
+  kind: wuhan_stf_tiff
+  format: tiff_temporal_pairs
+  root: data/refsr/Wuhan-dataset
+  default_scale: 1
+  lr:
+    source: stored
+    provenance: sensor
+    native_scale: 1
+    physical_resolution_m: 30
+  hr:
+    physical_resolution_m: 8
+  physical_resolution_ratio: 3.75
+  source:
+    image_size:
+    - 1000
+    - 1000
+    channels: 4
+    lr_sensor: Landsat
+    hr_sensor: Gaofen
+    dtype: uint16
+    normalization: value / 11848 -> [0, 1]
+  prepared:
+    temporal_pairs:
+      train: 8
+      val: 2
+      test: 5
+    patch_size: 128
+    tensor_scale: 1
+  reference_policy: G_t1 is the aligned physical reference for L_t2 -> G_t2
+run:
+  name: rdm_stf_wuhan
+  scale: 1
+_config_path: /mnt/sda/home/zhangheyi/projects/RefRWKV/experiments/train/refsr/rdm_stf/wuhan/x1/rdm_stf_wuhan/config.yaml
