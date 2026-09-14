@@ -16,5 +16,6 @@ model:
   mamba_d_conv: 4
   mamba_expand: 1
   allow_cpu_mamba: true
+  shuffle_prob: 0.0    # PAN edges are registered; do not shuffle RWKV
   use_reference: true
   clamp_output: true

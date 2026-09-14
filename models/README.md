@@ -66,10 +66,13 @@ RDM 不根据通道数猜任务，而是三个独立模型：
 
 ```text
 rdm_pan : LR/MS + HR PAN -> HR/MS；HR 双流融合，残差加在 bicubic(MS) 上
-rdm_stf : (C0, F0, C1) -> F1；无 C0 时退化为 F0+C1。`stf_mamba` 是 4 波段官方 STFMamba 基线
+rdm_stf : (C0, F0, C1) -> F1，C0 可缺省为 (F0, C1)->F1（F0 只进 RWKV，不泄漏进 Mamba）。`stf_mamba` 是 4 波段官方 STFMamba 基线
 rdm_mhf : LR HSI + HR MSI -> HR HSI；response_matrix 做 MSI->HSI 光谱提升
 ```
 
 PAN 版不再复用 STF 的匹配/可靠性骨架。网络按 FusionMamba 的 U2 双流来做，
-参数量仍压在同一量级（`configs/models/refsr/rdm_pan.yaml`）。STF/MHF 目前
-仍用较宽双网格主干，后续再各自瘦身。
+参数量仍压在同一量级（`configs/models/refsr/rdm_pan.yaml`）。PAN 的 RWKV
+`shuffle_prob=0`，不加光谱置零。STF 与 PAN 共用 `DualStreamFusion` 骨架，但 STF 的单元叫 `StfFusion`：
+F0→Mamba 被 ChangeGate 可靠性门控，C1→F0 永不门控。训练期对 RWKV
+做 block shuffle（`0.15`），对 C1/C0 粗流随机置零同一组波段（默认 1 个），
+推理关闭。残差 skip 仍是完整 C1，F0 不进 Mamba。

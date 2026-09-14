@@ -30,8 +30,7 @@ _IGNORED_KEYS = {
     "reference_condition_stages",
     "detail_injection_stages",
     "high_order",
-    "shuffle_prob",
-    "shuffle_block",
+    "spectral_drop_bands",
     "match_window",
     "match_dim",
     "match_grid",
@@ -78,13 +77,12 @@ class SpectralGate(nn.Module):
         return self.mlp(self.pool(lrms))
 
 
-class PanMsFusion(nn.Module):
-    """FusionMamba-style dual-stream unit on the HR grid.
+class DualStreamFusion(nn.Module):
+    """Shared RWKV+Mamba dual-stream unit.
 
-    PAN is scanned with RWKV (spatial), MS with Mamba (spectral).  A second
-    shared-weight scan is the CrossMamba analogue: each stream is conditioned
-    on a 1x1 projection of the other, with no reliability/match gate.  The
-    cross projections start at 0 so init is two independent self-scans.
+    Stream A (``pan`` / fine / spatial) is RWKV; stream B (``ms`` / coarse /
+    spectral) is Mamba.  Cross projections start at 0.  If ``reliability`` is
+    given, only A→B is gated; B→A is never gated.  PAN never passes it.
     """
 
     def __init__(
@@ -96,6 +94,8 @@ class PanMsFusion(nn.Module):
         mamba_d_state: int = 8,
         mamba_d_conv: int = 4,
         mamba_expand: int = 1,
+        shuffle_prob: float = 0.0,
+        shuffle_block: int = 4,
     ) -> None:
         super().__init__()
         self.final = bool(final)
@@ -103,7 +103,9 @@ class PanMsFusion(nn.Module):
         self.norm_ms = RMSNorm2d(dim)
         self.norm_pan_cross = RMSNorm2d(dim)
         self.norm_ms_cross = RMSNorm2d(dim)
-        self.pan_scan = SharedDirectionalRWKV(dim, shuffle_prob=0.0, high_order=False)
+        self.pan_scan = SharedDirectionalRWKV(
+            dim, shuffle_prob=float(shuffle_prob), shuffle_block=int(shuffle_block), high_order=False
+        )
         self.ms_scan = FourDirectionMamba(
             dim,
             d_state=mamba_d_state,
@@ -118,16 +120,35 @@ class PanMsFusion(nn.Module):
         nn.init.zeros_(self.ms_from_pan.weight)
 
     def forward(
-        self, pan: torch.Tensor, ms: torch.Tensor
+        self,
+        pan: torch.Tensor,
+        ms: torch.Tensor,
+        reliability: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         pan = pan + self.pan_scan(self.norm_pan(pan))
         ms = ms + self.ms_scan(self.norm_ms(ms))
         spa = pan + self.pan_scan(self.norm_pan_cross(pan + self.pan_from_ms(ms)))
-        spe = ms + self.ms_scan(self.norm_ms_cross(ms + self.ms_from_pan(pan)))
+        injected = pan
+        if reliability is not None:
+            if reliability.ndim != 4 or reliability.shape[0] != pan.shape[0]:
+                raise ValueError(
+                    f"reliability must be NCHW with batch {pan.shape[0]}, got {tuple(reliability.shape)}"
+                )
+            if tuple(reliability.shape[-2:]) != tuple(pan.shape[-2:]):
+                reliability = F.interpolate(reliability, size=tuple(pan.shape[-2:]), mode="area")
+            injected = pan * reliability.to(dtype=pan.dtype)
+        spe = ms + self.ms_scan(self.norm_ms_cross(ms + self.ms_from_pan(injected)))
         fused = self.out_proj((spa + spe) * 0.5)
         if self.final:
             return fused
         return (spa + fused) * 0.5, (spe + fused) * 0.5
+
+
+class PanMsFusion(DualStreamFusion):
+    """Pansharpening unit: same weights, no reliability argument."""
+
+    def forward(self, pan: torch.Tensor, ms: torch.Tensor):  # type: ignore[override]
+        return super().forward(pan, ms, reliability=None)
 
 
 class Downsample(nn.Module):
@@ -184,6 +205,8 @@ class RDMPan(nn.Module):
         clamp_output: bool = True,
         use_reference: bool = True,
         reference_kind: str | None = None,
+        shuffle_prob: float = 0.0,
+        shuffle_block: int = 4,
         **unused: Any,
     ) -> None:
         super().__init__()
@@ -213,6 +236,8 @@ class RDMPan(nn.Module):
         if dim < 16 or dim % 16:
             raise ValueError("dim must be a multiple of 16 and >= 16 for the WKV kernel")
         scale = _positive_int(scale, "scale")
+        if not 0.0 <= float(shuffle_prob) <= 1.0:
+            raise ValueError("shuffle_prob must be in [0, 1]")
         dim0 = dim
         dim1 = dim * 2
         dim2 = dim * 4
@@ -244,6 +269,8 @@ class RDMPan(nn.Module):
             mamba_d_state=_positive_int(mamba_d_state, "mamba_d_state"),
             mamba_d_conv=_positive_int(mamba_d_conv, "mamba_d_conv"),
             mamba_expand=_positive_int(mamba_expand, "mamba_expand"),
+            shuffle_prob=float(shuffle_prob),
+            shuffle_block=_positive_int(shuffle_block, "shuffle_block"),
         )
         self.stage0 = PanMsFusion(dim0, **mamba_kwargs)
         self.down_pan0 = Downsample(dim0, dim1)

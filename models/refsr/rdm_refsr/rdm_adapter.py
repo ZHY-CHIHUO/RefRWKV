@@ -39,6 +39,7 @@ _MODEL_FIELDS = {
     "allow_cpu_mamba",
     "shuffle_prob",
     "shuffle_block",
+    "spectral_drop_bands",
     "match_window",
     "match_dim",
     "match_grid",
@@ -135,8 +136,8 @@ class RDMStfAdapter(RefSRModelAdapter):
                 "reference_kind": "stf",
                 "family": "rdm",
                 "task": "spatio_temporal_fusion",
-                "inputs": "(c0, f0, c1)",
-                "call": "forward(lr=C1, ref=F0, c0=C0)",
+                "inputs": "(c0?, f0, c1)",
+                "call": "forward(lr=C1, ref=F0, c0=C0|None)",
                 "official_mamba_backend": "mamba_ssm.Mamba",
                 "wkv_backend": "kernels.wkv.RUN_CUDA",
             }

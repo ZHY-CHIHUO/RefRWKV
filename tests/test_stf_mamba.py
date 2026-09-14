@@ -28,6 +28,21 @@ class STFMambaAdapterTests(unittest.TestCase):
             self.assertEqual(int(config["model"]["inp_channels"]), 4)
             self.assertEqual(int(config["model"].get("in_chans", 4)), 4)
             self.assertAlmostEqual(float(config["data"]["value_scale"]), 11848.0)
+            self.assertEqual(int(config["train"]["max_epochs"]), 200)
+            self.assertAlmostEqual(float(config["train"]["learning_rate"]), 5e-4)
+            self.assertEqual(config["train"]["optimizer"], "adam")
+            self.assertEqual(config["train"]["lr_scheduler"], "cosine")
+            self.assertEqual(config["train"]["lr_interval"], "epoch")
+            self.assertEqual(int(config["train"]["lr_t_max"]), 200)
+            self.assertAlmostEqual(float(config["train"]["lr_min"]), 1e-5)
+            self.assertEqual(int(config["train"]["seed"]), 2021)
+            self.assertEqual(config["loss"]["name"], "charbonnier")
+            self.assertAlmostEqual(float(config["loss"]["eps"]), 1e-3)
+            self.assertAlmostEqual(float(config["loss"]["ssim_weight"]), 1.0)
+            if config["model"]["name"] == "rdm_stf":
+                self.assertEqual(int(config["data"]["batch_size"]), 10)
+            else:
+                self.assertEqual(int(config["data"]["batch_size"]), 2)
 
     def test_cross_attention_accepts_four_bands_and_non_128(self) -> None:
         module = Cross_MultiAttention(in_channels=4, emb_dim=16, num_heads=4, block_size=16)
@@ -68,6 +83,36 @@ class STFMambaAdapterTests(unittest.TestCase):
         self.assertEqual(tuple(prediction.shape), (1, 4, 8, 8))
         with self.assertRaises(KeyError):
             trainer._c0({"lr": batch["lr"], "hr": batch["hr"], "ref": batch["ref"]})
+
+    def test_wuhan_optimizer_matches_official_stfmamba(self) -> None:
+        import torch.nn as nn
+
+        from engines.refsr.trainer import RefSRTrainer
+
+        config = load_config("configs/runs/rdm_refsr/wuhan_x1.yaml", prefer_existing=False)
+        validate_config(config, require_data=False)
+
+        class DummySTF(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Conv2d(4, 4, 1)
+
+            def forward(self, lr, ref, c0=None, return_aux=False):
+                output = self.proj(lr)
+                if return_aux:
+                    return output, {}
+                return output
+
+        module = RefSRTrainer(DummySTF(), config)
+        optimizers, schedulers = module.configure_optimizers()
+        optimizer = optimizers[0]
+        scheduler_cfg = schedulers[0]
+        self.assertIsInstance(optimizer, torch.optim.Adam)
+        self.assertNotIsInstance(optimizer, torch.optim.AdamW)
+        self.assertAlmostEqual(optimizer.defaults["lr"], 5e-4)
+        self.assertEqual(scheduler_cfg["interval"], "epoch")
+        self.assertEqual(int(scheduler_cfg["scheduler"].T_max), 200)
+        self.assertAlmostEqual(float(scheduler_cfg["scheduler"].eta_min), 1e-5)
 
     @unittest.skipUnless(torch.cuda.is_available(), "STFMamba VSS scan needs CUDA")
     def test_four_band_quadruple_forward(self) -> None:

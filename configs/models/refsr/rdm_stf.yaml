@@ -1,5 +1,5 @@
-# RDM-STF: same-band (C0, F0, C1) -> F1 on the rdm_pan dual-stream skeleton.
-# Wuhan is 4-band scale=1; HRMS overrides channels and scale.
+# RDM-STF: same-band STF on the rdm_pan dual-stream skeleton.
+# Wuhan 3-input (C0,F0,C1)->F1; HRMS 2-input (F0,C1)->F1. C0 is optional.
 model:
   name: rdm_stf
   family: rdm
@@ -14,5 +14,8 @@ model:
   mamba_d_conv: 4
   mamba_expand: 1
   allow_cpu_mamba: true
+  shuffle_prob: 0.15   # RWKV block shuffle, train only
+  shuffle_block: 4
+  spectral_drop_bands: 1  # zero k coarse bands, train only; C0/C1 share the mask
   use_reference: true
   clamp_output: true

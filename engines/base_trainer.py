@@ -277,13 +277,19 @@ class BaseTrainer(pl.LightningModule, ABC):
             raise ValueError(
                 "model has no trainable parameters; use the evaluation entry point for a reference-only baseline such as Bicubic"
             )
-        optimizer = torch.optim.AdamW(
-            parameters,
+        train = self.config["train"]
+        optimizer_name = str(train.get("optimizer", "adamw")).strip().lower()
+        optimizer_kwargs = dict(
             lr=self.learning_rate,
             betas=self.betas,
             weight_decay=self.weight_decay,
         )
-        train = self.config["train"]
+        if optimizer_name == "adam":
+            optimizer = torch.optim.Adam(parameters, **optimizer_kwargs)
+        elif optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(parameters, **optimizer_kwargs)
+        else:
+            raise ValueError("train.optimizer must be adam or adamw")
         scheduler_name = str(train.get("lr_scheduler", "plateau")).lower()
         if scheduler_name == "plateau":
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -314,11 +320,24 @@ class BaseTrainer(pl.LightningModule, ABC):
             return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}]
         if scheduler_name != "cosine":
             raise ValueError("train.lr_scheduler must be plateau, step, or cosine")
-        max_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0) or train.get("max_steps", 100000))
+        # Official STFMamba steps CosineAnnealingLR once per epoch with T_max=200.
+        # Other runs keep the historical per-step cosine over estimated batches.
+        interval = str(train.get("lr_interval", "step")).strip().lower()
+        if interval not in {"step", "epoch"}:
+            raise ValueError("train.lr_interval must be step or epoch")
+        if interval == "epoch":
+            t_max = int(train.get("lr_t_max", train.get("max_epochs", 0) or 0))
+            if t_max < 1:
+                raise ValueError("cosine epoch scheduler needs train.lr_t_max or positive max_epochs")
+        else:
+            t_max = int(
+                getattr(self.trainer, "estimated_stepping_batches", 0)
+                or train.get("max_steps", 100000)
+            )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, max_steps), eta_min=float(train.get("lr_min", 1.0e-7))
+            optimizer, T_max=max(1, t_max), eta_min=float(train.get("lr_min", 1.0e-7))
         )
-        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+        return [optimizer], [{"scheduler": scheduler, "interval": interval}]
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         value = self.config["train"].get("grad_clip_norm", 1.0)

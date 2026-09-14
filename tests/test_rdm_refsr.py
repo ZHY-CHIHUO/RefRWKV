@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from engines.refsr import RDMRefSRTrainer  # noqa: E402
 from models.refsr import build_model, list_models  # noqa: E402
-from models.refsr.rdm_refsr.rdm_pan import RDMPan  # noqa: E402
+from models.refsr.rdm_refsr.rdm_pan import DualStreamFusion, PanMsFusion, RDMPan  # noqa: E402
 from models.refsr.rdm_refsr.rdm_refsr import (  # noqa: E402
     RDMMhf,
     RDMRefSR,
@@ -27,7 +27,7 @@ from models.refsr.rdm_refsr.rdm_refsr import (  # noqa: E402
     haar_idwt2d,
     normalize_reference_kind,
 )
-from models.refsr.rdm_refsr.rdm_stf import RDMStf  # noqa: E402
+from models.refsr.rdm_refsr.rdm_stf import RDMStf, StfFusion  # noqa: E402
 from runtime.config import load_config, validate_config  # noqa: E402
 from runtime.tiling import tiled_forward  # noqa: E402
 
@@ -369,9 +369,10 @@ class RDMRefSRTests(unittest.TestCase):
 
     def test_stf_uses_c0_and_has_no_matcher(self) -> None:
         torch.manual_seed(0)
-        model = RDMStf(inp_channels=4, ref_channels=4, out_channels=4, dim=16, scale=1, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1)
+        model = RDMStf(inp_channels=4, ref_channels=4, out_channels=4, dim=16, scale=1, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, shuffle_prob=0.0, spectral_drop_bands=0)
         self.assertFalse(hasattr(model, "reliability"))
         self.assertFalse(hasattr(model, "detail_matcher"))
+        self.assertFalse(hasattr(model, "raise_coarse"))
         lr = torch.rand(1, 4, 8, 8)
         ref = torch.rand(1, 4, 8, 8)
         c0 = torch.rand(1, 4, 8, 8)
@@ -381,10 +382,81 @@ class RDMRefSRTests(unittest.TestCase):
         self.assertEqual(tuple(three.shape), (1, 4, 8, 8))
         self.assertTrue(torch.isfinite(two).all())
         self.assertTrue(torch.isfinite(three).all())
-        self.assertGreater(float((two - three).detach().abs().mean()), 0.0)
-        three.square().mean().backward()
+        self.assertFalse(bool(model(lr, ref, return_aux=True)[1]["used_c0"]))
+        self.assertTrue(bool(model(lr, ref, c0, return_aux=True)[1]["used_c0"]))
+        with torch.no_grad():
+            model.raise_c0[0].weight.normal_(0.0, 0.05)
+            model.raise_c0[0].bias.normal_(0.0, 0.05)
+        self.assertGreater(float((model(lr, ref) - model(lr, ref, c0)).detach().abs().mean()), 0.0)
+        two.square().mean().backward()
         self.assertGreater(float(model.raise_fine[0].weight.grad.abs().sum()), 0.0)
-        self.assertGreater(float(model.raise_coarse[0].weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.raise_c1[0].weight.grad.abs().sum()), 0.0)
+        self.assertIsNone(model.raise_c0[0].weight.grad)
+        model.zero_grad()
+        three = model(lr, ref, c0)
+        three.square().mean().backward()
+        self.assertGreater(float(model.raise_c0[0].weight.grad.abs().sum()), 0.0)
+
+    def test_stf_two_input_does_not_feed_f0_into_mamba_stem(self) -> None:
+        torch.manual_seed(1)
+        model = RDMStf(inp_channels=4, ref_channels=4, out_channels=4, dim=16, scale=1, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, shuffle_prob=0.0, spectral_drop_bands=0)
+        lr = torch.rand(1, 4, 8, 8)
+        ref = torch.rand(1, 4, 8, 8)
+        with torch.no_grad():
+            left = model(lr, ref)
+            right = model(lr, ref + 0.25)
+        self.assertGreater(float((left - right).abs().mean()), 0.0)
+        model.train()
+        ones = torch.ones(8, 4, 2, 2)
+        dropped = RDMStf(inp_channels=4, ref_channels=4, out_channels=4, dim=16, scale=1, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, shuffle_prob=0.0, spectral_drop_bands=1)
+        dropped.train()
+        masked = dropped._drop_spectrum(ones)
+        self.assertEqual(int((masked[0, :, 0, 0] == 0).sum().item()), 1)
+        self.assertEqual(int((masked[0, :, 0, 0] == 1).sum().item()), 3)
+        dropped.eval()
+        self.assertEqual(float((dropped._drop_spectrum(ones) - ones).abs().max()), 0.0)
+
+    def test_stf_regularizers_and_pan_keeps_shuffle_off(self) -> None:
+        stf = RDMStf(inp_channels=4, ref_channels=4, out_channels=4, dim=16, scale=1, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1)
+        pan = RDMPan(inp_channels=8, ref_channels=1, out_channels=8, dim=16, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1)
+        self.assertAlmostEqual(stf.stage0.pan_scan.shuffle_prob, 0.15)
+        self.assertEqual(stf.spectral_drop_bands, 1)
+        self.assertEqual(pan.stage0.pan_scan.shuffle_prob, 0.0)
+        stf.train()
+        ones = torch.ones(2, 4, 2, 2)
+        mask = stf._spectral_keep_mask(ones)
+        self.assertIsNotNone(mask)
+        dropped_c1 = stf._drop_spectrum(ones, mask)
+        dropped_c0 = stf._drop_spectrum(ones * 2, mask)
+        self.assertTrue(torch.equal(dropped_c1[0, :, 0, 0] == 0, dropped_c0[0, :, 0, 0] == 0))
+        self.assertEqual(int((dropped_c1[0, :, 0, 0] == 0).sum().item()), 1)
+        stf.eval()
+        self.assertIsNone(stf._spectral_keep_mask(ones))
+
+    def test_stf_fusion_gates_fine_to_coarse_only(self) -> None:
+        torch.manual_seed(0)
+        fusion = StfFusion(
+            16, final=True, allow_cpu_mamba=True, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, shuffle_prob=0.0
+        )
+        self.assertIsInstance(fusion, DualStreamFusion)
+        self.assertIsInstance(RDMStf(dim=16, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1, shuffle_prob=0.0).stage0, StfFusion)
+        self.assertIsInstance(RDMPan(inp_channels=8, ref_channels=1, out_channels=8, dim=16, mamba_d_state=2, mamba_d_conv=2, mamba_expand=1).stage0, PanMsFusion)
+        fine = torch.randn(1, 16, 8, 8)
+        coarse = torch.randn(1, 16, 8, 8)
+        open_map = torch.ones(1, 1, 8, 8)
+        shut_map = torch.zeros(1, 1, 8, 8)
+        with torch.no_grad():
+            fusion.ms_from_pan.weight.normal_(0.0, 0.2)
+            fusion.pan_from_ms.weight.zero_()
+            left = fusion(fine, coarse, open_map)
+            right = fusion(fine, coarse, shut_map)
+        self.assertGreater(float((left - right).abs().mean()), 0.0)
+        with torch.no_grad():
+            fusion.ms_from_pan.weight.zero_()
+            fusion.pan_from_ms.weight.normal_(0.0, 0.2)
+            left = fusion(fine, coarse, open_map)
+            right = fusion(fine, coarse, shut_map)
+        self.assertLess(float((left - right).abs().max()), 1.0e-6)
 
     def test_pan_has_no_reliability_gate_unlike_stf(self) -> None:
         temporal = _compact_model()
