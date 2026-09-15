@@ -30,7 +30,6 @@ _IGNORED_KEYS = {
     "reference_condition_stages",
     "detail_injection_stages",
     "high_order",
-    "spectral_drop_bands",
     "match_window",
     "match_dim",
     "match_grid",
@@ -60,21 +59,32 @@ def _align(value: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
 
 
 class SpectralGate(nn.Module):
-    """Channel-wise gate from LR MS, analogue of FusionMamba SpeAttention."""
+    """Channel-wise gate from LR MS, analogue of FusionMamba SpeAttention.
 
-    def __init__(self, ms_channels: int, hidden: int) -> None:
+    An optional fused-feature branch starts at zero, so init is still a
+    global 0.5 scale; later training can make the gate spatial.
+    """
+
+    def __init__(self, ms_channels: int, hidden: int, spatial_dim: int | None = None) -> None:
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp = nn.Sequential(
+        self.logit = nn.Sequential(
             nn.Conv2d(ms_channels, hidden, 1),
             nn.GELU(),
             nn.Conv2d(hidden, ms_channels, 1),
-            nn.Sigmoid(),
         )
-        nn.init.zeros_(self.mlp[-2].bias)
+        nn.init.zeros_(self.logit[-1].bias)
+        self.spatial = None
+        if spatial_dim is not None:
+            self.spatial = nn.Conv2d(int(spatial_dim), ms_channels, 1, bias=True)
+            nn.init.zeros_(self.spatial.weight)
+            nn.init.zeros_(self.spatial.bias)
 
-    def forward(self, lrms: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.pool(lrms))
+    def forward(self, lrms: torch.Tensor, fused: torch.Tensor | None = None) -> torch.Tensor:
+        logit = self.logit(self.pool(lrms))
+        if self.spatial is not None and fused is not None:
+            logit = logit + self.spatial(fused)
+        return torch.sigmoid(logit)
 
 
 class DualStreamFusion(nn.Module):
@@ -138,17 +148,39 @@ class DualStreamFusion(nn.Module):
                 reliability = F.interpolate(reliability, size=tuple(pan.shape[-2:]), mode="area")
             injected = pan * reliability.to(dtype=pan.dtype)
         spe = ms + self.ms_scan(self.norm_ms_cross(ms + self.ms_from_pan(injected)))
-        fused = self.out_proj((spa + spe) * 0.5)
+        fused = self._fuse(spa, spe)
         if self.final:
             return fused
         return (spa + fused) * 0.5, (spe + fused) * 0.5
 
+    def _fuse(self, spa: torch.Tensor, spe: torch.Tensor) -> torch.Tensor:
+        return self.out_proj((spa + spe) * 0.5)
+
 
 class PanMsFusion(DualStreamFusion):
-    """Pansharpening unit: same weights, no reliability argument."""
+    """Pansharpening unit: same weights, no reliability argument.
+
+    ``adaptive_final`` replaces the last 50/50 average with a spatial softmax
+    mix of the PAN and MS streams.  Zero-init logits keep the 50/50 start.
+    """
+
+    def __init__(self, dim: int, *, adaptive_final: bool = False, **kwargs: Any) -> None:
+        super().__init__(dim, **kwargs)
+        self.adaptive_final = bool(adaptive_final) and bool(self.final)
+        if self.adaptive_final:
+            self.mix_logit = nn.Conv2d(dim * 2, 2, 1, bias=True)
+            nn.init.zeros_(self.mix_logit.weight)
+            nn.init.zeros_(self.mix_logit.bias)
 
     def forward(self, pan: torch.Tensor, ms: torch.Tensor):  # type: ignore[override]
         return super().forward(pan, ms, reliability=None)
+
+    def _fuse(self, spa: torch.Tensor, spe: torch.Tensor) -> torch.Tensor:
+        if not self.adaptive_final:
+            return super()._fuse(spa, spe)
+        weight = torch.softmax(self.mix_logit(torch.cat((spa, spe), dim=1)), dim=1)
+        mixed = spa * weight[:, :1] + spe * weight[:, 1:2]
+        return self.out_proj(mixed)
 
 
 class Downsample(nn.Module):
@@ -186,7 +218,9 @@ class RDMPan(nn.Module):
 
     FusionMamba-style U2 body on the HR grid:
 
-    ``out = to_hrms(fuse(PAN, MS_up)) * SpeGate(MS) + bicubic(MS)``
+    ``out = to_hrms(mix(PAN, MS_up)) * SpeGate(MS, fused) + bicubic(MS)``
+
+    The last mix is a spatial softmax of the two streams; it starts at 50/50.
 
     PAN is a first-class stream, never a reliability-gated reference residual.
     """
@@ -207,6 +241,7 @@ class RDMPan(nn.Module):
         reference_kind: str | None = None,
         shuffle_prob: float = 0.0,
         shuffle_block: int = 4,
+        spectral_drop_bands: int = 0,
         **unused: Any,
     ) -> None:
         super().__init__()
@@ -238,6 +273,8 @@ class RDMPan(nn.Module):
         scale = _positive_int(scale, "scale")
         if not 0.0 <= float(shuffle_prob) <= 1.0:
             raise ValueError("shuffle_prob must be in [0, 1]")
+        if isinstance(spectral_drop_bands, bool) or not isinstance(spectral_drop_bands, int) or spectral_drop_bands < 0:
+            raise ValueError("spectral_drop_bands must be a non-negative integer")
         dim0 = dim
         dim1 = dim * 2
         dim2 = dim * 4
@@ -253,6 +290,7 @@ class RDMPan(nn.Module):
         self.reference_kind = "pan"
         self.use_reference = True
         self.clamp_output = bool(clamp_output)
+        self.spectral_drop_bands = int(spectral_drop_bands)
         self.channel_multipliers = (1, 2, 4)
         self.high_order = False
 
@@ -284,8 +322,8 @@ class RDMPan(nn.Module):
         self.stage3 = PanMsFusion(dim1, **mamba_kwargs)
         self.up_pan3 = Upsample(dim1, dim0)
         self.up_ms3 = Upsample(dim1, dim0)
-        self.stage4 = PanMsFusion(dim0, final=True, **mamba_kwargs)
-        self.spe_gate = SpectralGate(inp_channels, dim0)
+        self.stage4 = PanMsFusion(dim0, final=True, adaptive_final=True, **mamba_kwargs)
+        self.spe_gate = SpectralGate(inp_channels, dim0, spatial_dim=dim0)
         self.to_hrms = nn.Sequential(
             nn.Conv2d(dim0, dim0, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -293,6 +331,19 @@ class RDMPan(nn.Module):
         )
         nn.init.uniform_(self.to_hrms[-1].weight, -1.0e-4, 1.0e-4)
         nn.init.zeros_(self.to_hrms[-1].bias)
+
+    def _drop_spectrum(self, value: torch.Tensor) -> torch.Tensor:
+        channels = int(value.shape[1])
+        if not self.training or self.spectral_drop_bands <= 0 or channels < 2:
+            return value
+        count = min(int(self.spectral_drop_bands), max(1, channels // 4), channels - 1)
+        if count < 1:
+            return value
+        scores = torch.rand(value.shape[0], channels, device=value.device)
+        _, index = scores.topk(count, dim=1, largest=False)
+        mask = torch.ones(value.shape[0], channels, device=value.device, dtype=value.dtype)
+        mask.scatter_(1, index, 0.0)
+        return value * mask.view(value.shape[0], channels, 1, 1)
 
     def forward(
         self,
@@ -318,8 +369,14 @@ class RDMPan(nn.Module):
             )
 
         skip = F.interpolate(lr, size=output_size, mode="bicubic", align_corners=False)
-        pan = self.raise_pan(ref)
-        ms = self.raise_ms(skip)
+        # PAN carries structure, not radiometry.  On reduced-res this still
+        # sharpens GT; on full-res it stops PAN brightness leaking as white
+        # specks / shifted blobs.
+        pan_low = F.interpolate(ref, size=lr.shape[-2:], mode="area")
+        pan_low = F.interpolate(pan_low, size=output_size, mode="bicubic", align_corners=False)
+        pan = self.raise_pan(ref - pan_low)
+        ms_in = self._drop_spectrum(skip)
+        ms = self.raise_ms(ms_in)
 
         pan, ms = self.stage0(pan, ms)
         pan_skip0, ms_skip0 = pan, ms
@@ -336,7 +393,7 @@ class RDMPan(nn.Module):
         pan, ms = self.up_pan3(pan, pan_skip0), self.up_ms3(ms, ms_skip0)
 
         fused = self.stage4(pan, ms)
-        output = skip + self.to_hrms(fused) * self.spe_gate(lr)
+        output = skip + self.to_hrms(fused) * self.spe_gate(lr, fused)
         if self.clamp_output:
             output = output.clamp(0.0, 1.0)
         if return_aux:

@@ -1,6 +1,5 @@
 # RDM-PAN: dedicated MS LR + PAN HR pansharpening network.
 # FusionMamba-style dual stream on the HR grid, residual on bicubic MS.
-# No matcher, reliability, or change gating.
 model:
   name: rdm_pan
   family: rdm
@@ -16,6 +15,8 @@ model:
   mamba_d_conv: 4
   mamba_expand: 1
   allow_cpu_mamba: true
-  shuffle_prob: 0.0    # PAN edges are registered; do not shuffle RWKV
+  shuffle_prob: 0.05    # Light spatial block shuffle for RWKV directional robustness
+  shuffle_block: 4
+  spectral_drop_bands: 1 # Randomly zero 1 MS band during train to enforce spectral robustness
   use_reference: true
   clamp_output: true

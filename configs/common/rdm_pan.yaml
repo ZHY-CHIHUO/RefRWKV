@@ -1,24 +1,26 @@
 # FusionMamba-aligned optimizer/loss for the dedicated PAN RDM.
-# L1 only, no temporal aux losses, official WV3 crop protocol.
-# Checkpoints: keep every 20 epochs forever (20.ckpt ... 500.ckpt), like 420.pth.
-# Val logs PSNR/Q2n/SAM/ERGAS for later ranking; they do not change the L1 loss
-# and do not delete periodic files.
+# L1 primary loss with light consistency & pan-structure regularization.
+# Checkpoints:
+# - every 20 epochs forever (20.ckpt ... 800.ckpt)
+# - plus best_q2n / best_psnr / best_sam / best_ergas / best_overall
+# Val metrics are for ranking only; the training loss stays L1 + aux.
+# best_overall uses pan_score = PSNR/40 + Q2n - SAM/5 - ERGAS/4 (higher better).
 base:
   - refsr.yaml
 
 data:
   reference_mode: paired
-  augment: false
+  augment: true
   augment_ref: false
-  batch_size: 32
-  val_batch_size: 32
+  batch_size: 64
+  val_batch_size: 64
   num_workers: 8
   val_num_workers: 4
   pin_memory: true
 
 train:
   precision: "32"
-  max_epochs: 500
+  max_epochs: 800
   max_steps: -1
   val_check_interval: 1.0
   check_val_every_n_epoch: 10
@@ -27,12 +29,18 @@ train:
   weight_decay: 0.0
   adam_betas: [0.9, 0.999]
   lr_scheduler: step
-  lr_step_size: 200
+  lr_step_size: 300
   lr_gamma: 0.5
   grad_clip_norm: 1.0
   use_ema: false
   ckpt_every_n_epochs: 20
   log_pan_metrics: true
+  checkpoint_monitors:
+    - {monitor: val/pan_score, mode: max, filename: best_overall, save_top_k: 1}
+    - {monitor: val/q2n, mode: max, filename: best_q2n, save_top_k: 1}
+    - {monitor: val/psnr, mode: max, filename: best_psnr, save_top_k: 1}
+    - {monitor: val/sam_deg, mode: min, filename: best_sam, save_top_k: 1}
+    - {monitor: val/ergas, mode: min, filename: best_ergas, save_top_k: 1}
   early_stopping_patience: null
   seed: 1
 
@@ -42,7 +50,10 @@ loss:
   fft_weight: 0.0
   sam_weight: 0.0
   wavelet_weight: 0.0
-  consistency_weight: 0.0
+  # Wald / Dλ: downsample(pred) must stay the LR MS. Stops FR white specks.
+  consistency_weight: 0.1
+  # Ds-like: high-pass of MS intensity should align with PAN, not copy brightness.
+  pan_struct_weight: 0.02
   sensor_weight: 0.0
   change_weight: 0.0
   ref_drop_prob: 0.0

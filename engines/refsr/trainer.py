@@ -56,9 +56,13 @@ class RefSRTrainer(BaseTrainer):
             raise ValueError("loss.eps must be positive")
         self.ssim_weight = float(loss.get("ssim_weight", 0.0))
         self.fft_weight = float(loss.get("fft_weight", 0.0))
+        self.consistency_weight = float(loss.get("consistency_weight", 0.0))
+        self.pan_struct_weight = float(loss.get("pan_struct_weight", 0.0))
         self.ref_drop_prob = float(loss.get("ref_drop_prob", 0.0))
         if self.ssim_weight < 0.0 or self.fft_weight < 0.0:
             raise ValueError("loss.ssim_weight and loss.fft_weight must be non-negative")
+        if self.consistency_weight < 0.0 or self.pan_struct_weight < 0.0:
+            raise ValueError("loss.consistency_weight and loss.pan_struct_weight must be non-negative")
         if not 0.0 <= self.ref_drop_prob <= 1.0:
             raise ValueError("loss.ref_drop_prob must be in [0, 1]")
         model_name = str(config.get("model", {}).get("name", "")).strip().lower()
@@ -99,7 +103,19 @@ class RefSRTrainer(BaseTrainer):
             )
         return ref
 
-    def _loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _highpass(value: torch.Tensor) -> torch.Tensor:
+        kernel = value.new_tensor(((0.0, -1.0, 0.0), (-1.0, 4.0, -1.0), (0.0, -1.0, 0.0)))
+        kernel = kernel.view(1, 1, 3, 3).repeat(value.shape[1], 1, 1, 1)
+        return F.conv2d(value, kernel, padding=1, groups=value.shape[1])
+
+    def _loss(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        lr: torch.Tensor | None = None,
+        ref: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if prediction.shape != target.shape:
             raise ValueError(f"RefSR output/HR geometry mismatch: {tuple(prediction.shape)} vs {tuple(target.shape)}")
         residual = prediction - target
@@ -115,6 +131,19 @@ class RefSRTrainer(BaseTrainer):
             pred_fft = torch.fft.rfft2(prediction.float(), norm="ortho")
             target_fft = torch.fft.rfft2(target.float(), norm="ortho")
             value = value + self.fft_weight * (pred_fft - target_fft).abs().mean()
+        if self.consistency_weight and lr is not None:
+            down = F.interpolate(prediction, size=lr.shape[-2:], mode="area")
+            value = value + self.consistency_weight * (down - lr).abs().mean()
+        if self.pan_struct_weight and ref is not None:
+            pred_hp = self._highpass(prediction.mean(1, keepdim=True))
+            pan_hp = self._highpass(ref.mean(1, keepdim=True))
+            pred_flat = pred_hp.flatten(2)
+            pan_flat = pan_hp.flatten(2)
+            cosine = (pred_flat * pan_flat).sum(dim=-1) / (
+                pred_flat.norm(dim=-1) * pan_flat.norm(dim=-1) + 1.0e-6
+            )
+            cosine = cosine.clamp(-1.0 + 1.0e-4, 1.0 - 1.0e-4)
+            value = value + self.pan_struct_weight * (1.0 - cosine).mean()
         return value
 
     def _c0(self, batch: Any) -> torch.Tensor | None:
@@ -148,7 +177,8 @@ class RefSRTrainer(BaseTrainer):
     def _train_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         lr, hr, ref = self._unpack(batch)
         reference = self._apply_reference_dropout(self._reference(lr, hr, ref), lr)
-        return self._loss(self._forward_model(lr, reference, self._c0(batch)), hr)
+        prediction = self._forward_model(lr, reference, self._c0(batch))
+        return self._loss(prediction, hr, lr=lr, ref=reference)
 
     def _eval_step(self, batch: Any, batch_idx: int, *, stage: str) -> dict[str, torch.Tensor]:
         lr, hr, ref = self._unpack(batch)
@@ -158,7 +188,7 @@ class RefSRTrainer(BaseTrainer):
             prediction = self.predict_for_eval(lr, reference, c0)
         else:
             prediction = self.predict_for_eval(lr, reference)
-        return {"loss": self._loss(prediction, hr), **self.benchmark_image_metrics(prediction, hr)}
+        return {"loss": self._loss(prediction, hr, lr=lr, ref=reference), **self.benchmark_image_metrics(prediction, hr)}
 
 
 __all__ = ["RefSRTrainer"]

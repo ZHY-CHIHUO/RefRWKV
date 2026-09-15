@@ -25,6 +25,19 @@ from runtime.tiling import tiled_forward
 PAN_METRIC_MODELS = frozenset({"rdm_pan", "fusion_mamba"})
 
 
+def pansharpening_score(
+    psnr: torch.Tensor, q2n: torch.Tensor, sam_deg: torch.Tensor, ergas: torch.Tensor
+) -> torch.Tensor:
+    """Higher-is-better RR composite for checkpoint selection.
+
+    Each term is O(1) around typical WorldView-3 numbers (PSNR~40, Q2n~0.9,
+    SAM~3, ERGAS~2).  This is only a ranking signal; it does not enter the loss.
+    """
+    psnr = psnr.clamp(max=80.0)
+    return psnr / 40.0 + q2n - sam_deg / 5.0 - ergas / 4.0
+
+
+
 class BaseTrainer(pl.LightningModule, ABC):
     """Reusable training lifecycle shared by SR and RefSR engines."""
 
@@ -212,12 +225,14 @@ class BaseTrainer(pl.LightningModule, ABC):
                 target,
                 ratio=self.metric_scale,
             )
-            metrics.update(
-                {
-                    key: values[key].to(device=prediction.device, dtype=torch.float32).mean()
-                    for key in ("psnr", "q2n", "sam_deg", "ergas")
-                }
+            pan = {
+                key: values[key].to(device=prediction.device, dtype=torch.float32).mean()
+                for key in ("psnr", "q2n", "sam_deg", "ergas")
+            }
+            pan["pan_score"] = pansharpening_score(
+                pan["psnr"], pan["q2n"], pan["sam_deg"], pan["ergas"]
             )
+            metrics.update(pan)
         return metrics
 
     def on_train_start(self) -> None:

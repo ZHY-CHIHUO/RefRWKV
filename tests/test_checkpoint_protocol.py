@@ -54,6 +54,17 @@ class CheckpointProtocolTests(unittest.TestCase):
         self.assertTrue(config["train"]["log_pan_metrics"])
         self.assertEqual(int(config["train"]["check_val_every_n_epoch"]), 10)
         self.assertIsNone(config["train"].get("early_stopping_patience"))
+        monitors = config["train"]["checkpoint_monitors"]
+        self.assertEqual(
+            [(item["monitor"], item["mode"]) for item in monitors],
+            [
+                ("val/pan_score", "max"),
+                ("val/q2n", "max"),
+                ("val/psnr", "max"),
+                ("val/sam_deg", "min"),
+                ("val/ergas", "min"),
+            ],
+        )
 
     def test_official_fusion_mamba_yaml_keeps_periodic_ckpts(self) -> None:
         config = load_config(
@@ -81,6 +92,28 @@ class CheckpointProtocolTests(unittest.TestCase):
         ]
         self.assertEqual(monitored, [])
         self.assertTrue(any(getattr(item, "save_last", False) for item in callbacks))
+
+    def test_metric_monitors_do_not_replace_periodic_ckpts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            callbacks = build_checkpoint_callbacks(
+                {
+                    "ckpt_every_n_epochs": 20,
+                    "checkpoint_monitors": [
+                        {"monitor": "val/q2n", "mode": "max", "filename": "best_q2n"},
+                        {"monitor": "val/ergas", "mode": "min", "filename": "best_ergas"},
+                    ],
+                },
+                tmp,
+            )
+        self.assertEqual(sum(isinstance(item, IntervalEpochCheckpoint) for item in callbacks), 1)
+        names = {
+            getattr(item, "monitor", None): getattr(item, "mode", None)
+            for item in callbacks
+            if getattr(item, "monitor", None)
+        }
+        self.assertEqual(names["val/q2n"], "max")
+        self.assertEqual(names["val/ergas"], "min")
+        self.assertNotIn("val/loss", names)
 
     def test_legacy_top_k_still_watches_val_loss(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,6 +147,9 @@ class CheckpointProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(float(metrics["sam_deg"]), 0.0, places=4)
         self.assertAlmostEqual(float(metrics["ergas"]), 0.0, places=5)
         self.assertTrue(torch.isfinite(metrics["psnr"]))
+        self.assertIn("pan_score", metrics)
+        self.assertTrue(torch.isfinite(metrics["pan_score"]))
+        self.assertGreater(float(metrics["pan_score"]), 1.5)
 
 
 if __name__ == "__main__":

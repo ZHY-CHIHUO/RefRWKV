@@ -1,5 +1,11 @@
-# Dedicated PAN RDM on reduced-resolution WV3.
-# 8-band MS LR + 1-band PAN HR -> 8-band HR, capacity matched to FusionMamba.
+# Dedicated PAN RDM v2 on reduced-resolution WV3.
+# Includes:
+# - High-pass PAN input (removes DC bias)
+# - Adaptive final dual-stream softmax mix
+# - Spatial-conditioned SpectralGate
+# - Light spatial (shuffle_prob=0.05) & spectral drop (1 band) regularization
+# - Consistency loss (0.1) & pan structure loss (0.02)
+# - BS=64, max_epochs=800, augment=true
 base:
   - ../../common/rdm_pan.yaml
   - ../../models/refsr/rdm_pan.yaml
@@ -9,7 +15,7 @@ dataset:
 
 task: refsr
 run:
-  name: pancollection_wv3_rdm_pan_x4
+  name: pancollection_wv3_rdm_pan_v2_x4
   scale: 4
   lr_patch: 16
 

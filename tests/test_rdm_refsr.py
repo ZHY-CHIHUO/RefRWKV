@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -487,6 +488,34 @@ class RDMRefSRTests(unittest.TestCase):
         self.assertGreater(float(model.raise_pan[0].weight.grad.abs().sum()), 0.0)
         self.assertGreater(float(model.raise_ms[0].weight.grad.abs().sum()), 0.0)
         self.assertGreater(float(model.stage0.pan_from_ms.weight.grad.abs().sum()), 0.0)
+
+    def test_pan_final_mix_starts_equal_and_gate_is_half(self) -> None:
+        model = _pan_model()
+        self.assertTrue(model.stage4.adaptive_final)
+        self.assertEqual(float(model.stage4.mix_logit.weight.detach().abs().sum()), 0.0)
+        self.assertEqual(float(model.spe_gate.spatial.weight.detach().abs().sum()), 0.0)
+        spa = torch.randn(1, model.dim, 4, 4)
+        spe = torch.randn(1, model.dim, 4, 4)
+        fused = torch.randn(1, model.dim, 4, 4)
+        lr = torch.rand(1, 8, 2, 2)
+        with torch.no_grad():
+            mixed = model.stage4._fuse(spa, spe)
+            baseline = model.stage4.out_proj((spa + spe) * 0.5)
+            gate_a = model.spe_gate(lr, fused)
+            gate_b = model.spe_gate(lr, fused + 1.0)
+        self.assertLess(float((mixed - baseline).abs().max()), 1.0e-5)
+        self.assertLess(float((gate_a - gate_b).abs().max()), 1.0e-6)
+
+    def test_pan_stream_ignores_pan_dc(self) -> None:
+        torch.manual_seed(0)
+        model = _pan_model()
+        nn.init.normal_(model.to_hrms[-1].weight, 0.0, 0.02)
+        lr = torch.rand(1, 8, 4, 4)
+        ref = torch.rand(1, 1, 8, 8).clamp(0.2, 0.8)
+        with torch.no_grad():
+            left = model(lr, ref)
+            right = model(lr, (ref + 0.15).clamp(0.0, 1.0))
+        self.assertLess(float((left - right).abs().max()), 1.0e-5)
 
     def test_pan_slim_config_matches_fusion_mamba_capacity(self) -> None:
         from models.refsr.fusion_mamba.adapter import FusionMambaRefSR
