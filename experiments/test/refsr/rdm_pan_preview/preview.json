@@ -1,0 +1,13 @@
+{
+  "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/last.ckpt",
+  "tile_size": 16,
+  "overlaps": [
+    8,
+    0
+  ],
+  "splits": [
+    "test",
+    "test_hard"
+  ],
+  "note": "PNG is clean RGB, no grid overlay. *_grad.png is a grayscale gradient; seams look like bright straight lines."
+}

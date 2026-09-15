@@ -1,0 +1,182 @@
+[
+  {
+    "model": "fusion_mamba",
+    "infer": "official",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/fusion_mamba/pancollection_wv3/x4/fusion_mamba_pancollection_wv3_official/checkpoints/420.ckpt",
+    "split": "test",
+    "lr_shape": [
+      1,
+      8,
+      64,
+      64
+    ],
+    "ref_shape": [
+      1,
+      1,
+      256,
+      256
+    ],
+    "tile_size": null,
+    "overlap": 0,
+    "tiles": 1,
+    "params": 735401,
+    "flops": 19621024768.0,
+    "protocol": "official full image",
+    "n": 18,
+    "ms_mean": 52.32083384195963,
+    "ms_min": 50.16502380371094,
+    "ms_max": 55.159488677978516,
+    "images_per_s": 19.112845239061002,
+    "peak_mem_mb": 346.419921875
+  },
+  {
+    "model": "fusion_mamba",
+    "infer": "tile16_ov8",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/fusion_mamba/pancollection_wv3/x4/fusion_mamba_pancollection_wv3_official/checkpoints/420.ckpt",
+    "split": "test",
+    "lr_shape": [
+      1,
+      8,
+      64,
+      64
+    ],
+    "ref_shape": [
+      1,
+      1,
+      256,
+      256
+    ],
+    "tile_size": 16,
+    "overlap": 8,
+    "tiles": 49,
+    "params": 735401,
+    "flops": 60092634112.0,
+    "protocol": "same tile as RDM-PAN: LR 16 / overlap 8 (PAN 64)",
+    "n": 18,
+    "ms_mean": 2399.396538628472,
+    "ms_min": 2350.405517578125,
+    "ms_max": 2447.752197265625,
+    "images_per_s": 0.4167714606155153,
+    "peak_mem_mb": 35.974609375
+  },
+  {
+    "model": "fusion_mamba",
+    "infer": "official",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/fusion_mamba/pancollection_wv3/x4/fusion_mamba_pancollection_wv3_official/checkpoints/420.ckpt",
+    "split": "test_hard",
+    "lr_shape": [
+      1,
+      8,
+      64,
+      64
+    ],
+    "ref_shape": [
+      1,
+      1,
+      256,
+      256
+    ],
+    "tile_size": 64,
+    "overlap": 0,
+    "tiles": 1,
+    "params": 735401,
+    "flops": 19621024768.0,
+    "protocol": "official cut_size=256 PAN (LR tile=64, overlap=0)",
+    "n": 18,
+    "ms_mean": 52.98432519700792,
+    "ms_min": 50.37651062011719,
+    "ms_max": 56.742881774902344,
+    "images_per_s": 18.873506386686437,
+    "peak_mem_mb": 346.419921875
+  },
+  {
+    "model": "fusion_mamba",
+    "infer": "tile16_ov8",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/fusion_mamba/pancollection_wv3/x4/fusion_mamba_pancollection_wv3_official/checkpoints/420.ckpt",
+    "split": "test_hard",
+    "lr_shape": [
+      1,
+      8,
+      64,
+      64
+    ],
+    "ref_shape": [
+      1,
+      1,
+      256,
+      256
+    ],
+    "tile_size": 16,
+    "overlap": 8,
+    "tiles": 49,
+    "params": 735401,
+    "flops": 60092634112.0,
+    "protocol": "same tile as RDM-PAN: LR 16 / overlap 8 (PAN 64)",
+    "n": 18,
+    "ms_mean": 2480.5060221354165,
+    "ms_min": 2355.5478515625,
+    "ms_max": 2663.59716796875,
+    "images_per_s": 0.4031435485647887,
+    "peak_mem_mb": 35.974609375
+  },
+  {
+    "model": "rdm_pan",
+    "infer": "tile16_ov8",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/last.ckpt",
+    "split": "test",
+    "lr_shape": [
+      1,
+      8,
+      64,
+      64
+    ],
+    "ref_shape": [
+      1,
+      1,
+      256,
+      256
+    ],
+    "tile_size": 16,
+    "overlap": 8,
+    "tiles": 49,
+    "params": 625174,
+    "flops": 103955088384.0,
+    "protocol": "RDM-PAN tiled LR 16 / overlap 8 (PAN 64)",
+    "n": 18,
+    "ms_mean": 2064.2273830837676,
+    "ms_min": 2008.0218505859375,
+    "ms_max": 2155.68701171875,
+    "images_per_s": 0.4844427548025698,
+    "peak_mem_mb": 24.509765625
+  },
+  {
+    "model": "rdm_pan",
+    "infer": "tile16_ov8",
+    "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/last.ckpt",
+    "split": "test_hard",
+    "lr_shape": [
+      1,
+      8,
+      64,
+      64
+    ],
+    "ref_shape": [
+      1,
+      1,
+      256,
+      256
+    ],
+    "tile_size": 16,
+    "overlap": 8,
+    "tiles": 49,
+    "params": 625174,
+    "flops": 103955088384.0,
+    "protocol": "RDM-PAN tiled LR 16 / overlap 8 (PAN 64)",
+    "n": 18,
+    "ms_mean": 2036.9456448025173,
+    "ms_min": 2003.73681640625,
+    "ms_max": 2064.34130859375,
+    "images_per_s": 0.4909311166704944,
+    "peak_mem_mb": 24.509765625
+  }
+]

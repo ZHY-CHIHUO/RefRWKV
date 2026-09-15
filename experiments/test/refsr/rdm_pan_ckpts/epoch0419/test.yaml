@@ -11,8 +11,8 @@ test:
   device: null
   batch_size: null
   steps: null
-  output: experiments/test/refsr/rdm_pan_last_ov8
-checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/last.ckpt
+  output: experiments/test/refsr/rdm_pan_ckpts/epoch0419
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/epoch=0419-step=127260.ckpt
 source_config: configs/test/test.yaml
 split: test
 overrides:

@@ -39,8 +39,8 @@
   "eval_tile_size": 16,
   "eval_tile_overlap": 8,
   "save_images": false,
-  "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/last.ckpt",
-  "test_config": "/home/zhy/PROJECT/RefRWKV/experiments/test/refsr/rdm_pan_last_ov8/test_hard.yaml",
+  "checkpoint": "/home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/epoch=0439-step=133320.ckpt",
+  "test_config": "/home/zhy/PROJECT/RefRWKV/experiments/test/refsr/rdm_pan_ckpts/epoch0439/test_hard.yaml",
   "d_lambda": {
     "mean": 0.02493063506889518,
     "std": 0.006391102784185845,

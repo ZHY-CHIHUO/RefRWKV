@@ -55,7 +55,8 @@ train:
   lr_gamma: 0.5
   grad_clip_norm: null
   use_ema: false
-  save_top_k: 3
+  ckpt_every_n_epochs: 20
+  log_pan_metrics: true
   early_stopping_patience: null
   seed: 1
 

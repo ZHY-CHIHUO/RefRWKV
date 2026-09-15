@@ -514,7 +514,12 @@ class TrueMambaScan(nn.Module):
 
 
 class FourDirectionMamba(nn.Module):
-    """Shared-parameter horizontal/vertical bidirectional selective scan."""
+    """Shared-parameter 4-direction scan (row L/R, column U/D).
+
+    Geometry matches FusionMamba's FDMamba / ``bimamba_type='v6'``, but the
+    SSM weights are shared across directions.  FusionMamba v6 keeps a separate
+    conv/x_proj/dt_proj/A/D for each of the four scans.
+    """
 
     def __init__(self, channels: int, **kwargs: Any) -> None:
         super().__init__()

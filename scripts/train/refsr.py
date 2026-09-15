@@ -12,7 +12,7 @@ from typing import Any
 import pytorch_lightning as pl
 import torch
 import yaml
-from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -23,7 +23,7 @@ from data.loaders import build_refsr_loaders
 from engines.refsr import RDMRefSRTrainer, RefSRTrainer
 from runtime.checkpoint import load_checkpoint, load_model_weights
 from runtime.config import load_config, validate_config
-from runtime.callbacks import StopOnLearningRate
+from runtime.callbacks import StopOnLearningRate, build_checkpoint_callbacks
 from runtime.experiments import layout_from_config, save_config_snapshot
 
 logger = logging.getLogger("train.refsr")
@@ -41,15 +41,7 @@ def _accelerator(train: dict[str, Any]) -> str:
 def _callbacks(config: dict[str, Any], checkpoint_dir: Path) -> list[Any]:
     train = config["train"]
     callbacks: list[Any] = [
-        ModelCheckpoint(
-            dirpath=str(checkpoint_dir),
-            filename="epoch={epoch:04d}-step={step:06d}",
-            auto_insert_metric_name=False,
-            monitor="val/loss",
-            mode="min",
-            save_top_k=int(train.get("save_top_k", 3)),
-            save_last=True,
-        ),
+        *build_checkpoint_callbacks(train, checkpoint_dir),
         LearningRateMonitor(logging_interval="step"),
     ]
     if train.get("stop_at_lr_min", False):

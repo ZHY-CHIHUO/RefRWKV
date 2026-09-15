@@ -22,6 +22,9 @@ from runtime.common import EMA, gaussian_ssim, per_image_psnr
 from runtime.tiling import tiled_forward
 
 
+PAN_METRIC_MODELS = frozenset({"rdm_pan", "fusion_mamba"})
+
+
 class BaseTrainer(pl.LightningModule, ABC):
     """Reusable training lifecycle shared by SR and RefSR engines."""
 
@@ -78,6 +81,21 @@ class BaseTrainer(pl.LightningModule, ABC):
             or "wuhan_stf_tiff" in dataset_markers
         )
         self.metric_resolution_ratio = float(data.get("physical_resolution_ratio", 30.0 / 8.0))
+        model_cfg = self.config.get("model", {})
+        model_name = (
+            str(model_cfg.get("name", "")).strip().lower()
+            if isinstance(model_cfg, Mapping)
+            else ""
+        )
+        default_pan_metrics = model_name in PAN_METRIC_MODELS
+        self.log_pan_metrics = bool(train.get("log_pan_metrics", default_pan_metrics))
+        raw_scale = data.get("scale", 4)
+        if raw_scale is None:
+            self.metric_scale = 4.0
+        elif isinstance(raw_scale, bool) or not isinstance(raw_scale, (int, float)) or float(raw_scale) <= 0:
+            raise ValueError("data.scale must be a positive number")
+        else:
+            self.metric_scale = float(raw_scale)
         raw_tile_size = data.get("eval_tile_size")
         raw_tile_overlap = data.get("eval_tile_overlap", 0)
         if raw_tile_size is None:
@@ -169,7 +187,7 @@ class BaseTrainer(pl.LightningModule, ABC):
     def benchmark_image_metrics(
         self, prediction: torch.Tensor, target: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        """Return standard metrics plus Wuhan's six-band-quality metrics."""
+        """Return PSNR/SSIM, plus Wuhan or pansharpening paper metrics when enabled."""
         metrics = self.image_metrics(prediction, target)
         if self.is_wuhan:
             from metrics.wuhan import wuhan_metric_tensors
@@ -184,6 +202,20 @@ class BaseTrainer(pl.LightningModule, ABC):
                 {
                     key: values[key].mean()
                     for key in ("rmse", "uiqi", "psnr", "sam_rad", "sam_deg", "ergas")
+                }
+            )
+        elif self.log_pan_metrics:
+            from metrics.pansharpening import reduced_resolution_tensors
+
+            values = reduced_resolution_tensors(
+                prediction,
+                target,
+                ratio=self.metric_scale,
+            )
+            metrics.update(
+                {
+                    key: values[key].to(device=prediction.device, dtype=torch.float32).mean()
+                    for key in ("psnr", "q2n", "sam_deg", "ergas")
                 }
             )
         return metrics

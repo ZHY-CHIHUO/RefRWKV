@@ -1,0 +1,20 @@
+test:
+  splits:
+  - test_hard
+  metrics:
+  - d_lambda
+  - d_s
+  - qnr
+  save_images: false
+  device: null
+  batch_size: null
+  steps: null
+  output: experiments/test/refsr/rdm_pan_ckpts/epoch0409
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_x4/checkpoints/epoch=0409-step=124230.ckpt
+source_config: configs/test/test.yaml
+split: test_hard
+overrides:
+- data.eval_tile_size=16
+- data.eval_tile_overlap=8
+- dataset.files.test_hard=full_examples/test_wv3_OrigScale_multiExm1.h5
+- data.files.test_hard=full_examples/test_wv3_OrigScale_multiExm1.h5

@@ -1,5 +1,8 @@
 # FusionMamba-aligned optimizer/loss for the dedicated PAN RDM.
 # L1 only, no temporal aux losses, official WV3 crop protocol.
+# Checkpoints: keep every 20 epochs forever (20.ckpt ... 500.ckpt), like 420.pth.
+# Val logs PSNR/Q2n/SAM/ERGAS for later ranking; they do not change the L1 loss
+# and do not delete periodic files.
 base:
   - refsr.yaml
 
@@ -28,7 +31,8 @@ train:
   lr_gamma: 0.5
   grad_clip_norm: 1.0
   use_ema: false
-  save_top_k: 3
+  ckpt_every_n_epochs: 20
+  log_pan_metrics: true
   early_stopping_patience: null
   seed: 1
 
