@@ -25,5 +25,6 @@ dataset:
   prepared:
     temporal_pairs: {train: 8, val: 2, test: 5}
     patch_size: 128
+    train_patches: 12000
     tensor_scale: 1
   reference_policy: G_t1 is the aligned physical reference for L_t2 -> G_t2

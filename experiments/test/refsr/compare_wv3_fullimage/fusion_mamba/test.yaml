@@ -1,0 +1,19 @@
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - q2n
+  - sam
+  - ergas
+  save_images: false
+  device: null
+  batch_size: 1
+  steps: null
+  output: experiments/test/refsr/compare_wv3_fullimage/fusion_mamba
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/fusion_mamba/pancollection_wv3/x4/fusion_mamba_pancollection_wv3_official/checkpoints/last.ckpt
+source_config: configs/test/test.yaml
+split: test
+overrides:
+- data.eval_tile_size=1024
+- data.eval_tile_overlap=0

@@ -22,4 +22,4 @@ dataset:
     val: valid_wv3.h5
     test: reduced_examples/test_wv3_multiExm1.h5
     test_easy: reduced_examples/test_wv3_multiExm1.h5
-    test_hard: reduced_examples/test_wv3_multiExm1.h5
+    test_hard: full_examples/test_wv3_OrigScale_multiExm1.h5

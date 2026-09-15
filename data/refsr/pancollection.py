@@ -105,6 +105,8 @@ class PanCollectionH5Dataset(Dataset):
         self.return_sample_id = bool(return_sample_id)
         self._h5 = None
         self._h5_pid: int | None = None
+        self.has_gt = True
+        self.h5_lms_key = "lms"
 
         shapes = self._inspect_file()
         self._shapes = shapes
@@ -154,6 +156,13 @@ class PanCollectionH5Dataset(Dataset):
             raise RuntimeError("PanCollection H5 loading requires h5py") from exc
         with h5py.File(self.file_path, "r") as handle:
             shapes = {key: tuple(int(dim) for dim in handle[key].shape) for key in handle.keys()}
+        self.has_gt = self.h5_hr_key in shapes
+        if not self.has_gt:
+            if "lms" not in shapes:
+                raise KeyError(
+                    f"PanCollection H5 is missing {self.h5_hr_key!r} and has no lms placeholder"
+                )
+            self.h5_hr_key = "lms"
         required = (self.h5_lr_key, self.h5_ref_key, self.h5_hr_key)
         missing = [key for key in required if key not in shapes]
         if missing:
@@ -242,6 +251,10 @@ class PanCollectionH5Dataset(Dataset):
             "ref": self._normalize(handle[self.h5_ref_key][source_index], self.value_scale, self.clip_range),
             "hr": self._normalize(handle[self.h5_hr_key][source_index], self.value_scale, self.clip_range),
         }
+        if self.h5_lms_key in handle:
+            images["lms"] = self._normalize(
+                handle[self.h5_lms_key][source_index], self.value_scale, self.clip_range
+            )
         if self.patch_size is not None:
             _, lr_height, lr_width = images["lr"].shape
             if lr_height < self.lr_patch_size or lr_width < self.lr_patch_size:
@@ -256,12 +269,17 @@ class PanCollectionH5Dataset(Dataset):
             y_hr, x_hr = y * self.scale, x * self.scale
             images["ref"] = images["ref"][:, y_hr : y_hr + self.patch_size, x_hr : x_hr + self.patch_size]
             images["hr"] = images["hr"][:, y_hr : y_hr + self.patch_size, x_hr : x_hr + self.patch_size]
+            if "lms" in images:
+                images["lms"] = images["lms"][:, y_hr : y_hr + self.patch_size, x_hr : x_hr + self.patch_size]
         images = self._spatial_transform(images, augment=self.augment)
-        result: dict[str, torch.Tensor | str] = {
+        result: dict[str, torch.Tensor | str | bool] = {
             self.lr_key: torch.from_numpy(np.ascontiguousarray(images["lr"])),
             self.ref_key: torch.from_numpy(np.ascontiguousarray(images["ref"])),
             self.hr_key: torch.from_numpy(np.ascontiguousarray(images["hr"])),
+            "has_gt": bool(self.has_gt),
         }
+        if "lms" in images:
+            result["lms"] = torch.from_numpy(np.ascontiguousarray(images["lms"]))
         if self.return_sample_id:
             result["sample_id"] = self.filenames[index]
         return result

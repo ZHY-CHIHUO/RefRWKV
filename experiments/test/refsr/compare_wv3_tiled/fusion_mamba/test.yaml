@@ -1,0 +1,14 @@
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - ssim
+  save_images: false
+  device: null
+  batch_size: 1
+  steps: null
+  output: experiments/test/refsr/compare_wv3_tiled/fusion_mamba
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/fusion_mamba/pancollection_wv3/x4/fusion_mamba_pancollection_wv3_official/checkpoints/last.ckpt
+source_config: configs/test/test.yaml
+split: test

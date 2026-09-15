@@ -1,0 +1,17 @@
+test:
+  splits:
+  - test
+  metrics:
+  - rmse
+  - uiqi
+  - psnr_wuhan
+  - sam_deg
+  - ergas
+  save_images: false
+  device: null
+  batch_size: null
+  steps: null
+  output: experiments/test/refsr/rdm_stf/wuhan/x1/epoch=0863-step=000864
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_stf/wuhan/x1/rdm_stf_wuhan/checkpoints/epoch=0863-step=000864.ckpt
+source_config: configs/test/test.yaml
+split: test

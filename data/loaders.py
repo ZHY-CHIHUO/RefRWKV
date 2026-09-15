@@ -341,6 +341,27 @@ def _wuhan_roots(data: Mapping[str, Any], required_splits: tuple[str, ...]) -> l
     return roots
 
 
+def _wuhan_num_patches(data: Mapping[str, Any], mode: str):
+    """Official STFMamba train.py uses PatchSet.total_index = 12000.
+
+    Only the cropped train (and optional val) splits may virtualize that
+    epoch size.  Full-image test stays on the true temporal-pair count.
+    """
+    key = {
+        "train": "num_patches",
+        "val": "val_num_patches",
+        "test": "test_num_patches",
+        "test_easy": "test_num_patches",
+        "test_hard": "test_num_patches",
+    }.get(mode)
+    if key is None:
+        return None
+    value = data.get(key)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 def _wuhan_kwargs(data: Mapping[str, Any], *, mode: str, patch_size: int | None, max_samples) -> dict[str, Any]:
     """Materialize the shared Wuhan TIFF loader options."""
     return {
@@ -364,6 +385,7 @@ def _wuhan_kwargs(data: Mapping[str, Any], *, mode: str, patch_size: int | None,
         "lr_native_scale": data.get("lr_native_scale", 1),
         "lr_provenance": str(data.get("lr_provenance", "sensor")),
         "return_sample_id": bool(data.get("return_sample_id", False)),
+        "num_patches": _wuhan_num_patches(data, mode),
     }
 
 

@@ -27,6 +27,7 @@ from runtime.config import is_refsr_model, normalize_reference_mode, validate_co
 from runtime.experiments import layout_from_config
 from runtime.tiling import tiled_forward
 from metrics.wuhan import wuhan_metric_tensors
+from metrics.pansharpening import q2n, qnr
 
 LOGGER = logging.getLogger(__name__)
 VALID_SPLITS = {"test", "test_easy", "test_hard"}
@@ -39,8 +40,15 @@ VALID_METRICS = {
     "sam_rad",
     "sam_deg",
     "ergas",
+    "q2n",
+    "d_lambda",
+    "d_s",
+    "qnr",
 }
-WUHAN_METRICS = {"rmse", "uiqi", "psnr_wuhan", "sam_rad", "sam_deg", "ergas"}
+WUHAN_ONLY_METRICS = {"rmse", "uiqi", "psnr_wuhan"}
+WUHAN_METRICS = WUHAN_ONLY_METRICS | {"sam_rad", "sam_deg", "ergas"}
+PAN_GT_METRICS = {"q2n", "sam_rad", "sam_deg", "ergas"}
+PAN_NOREF_METRICS = {"d_lambda", "d_s", "qnr"}
 _METRIC_ALIASES = {
     "psnr": ("psnr",),
     "ssim": ("ssim",),
@@ -51,6 +59,14 @@ _METRIC_ALIASES = {
     "sam_rad": ("sam_rad",),
     "sam_deg": ("sam_deg",),
     "ergas": ("ergas",),
+    "q2n": ("q2n",),
+    "q8": ("q2n",),
+    "d_lambda": ("d_lambda",),
+    "dlambda": ("d_lambda",),
+    "dλ": ("d_lambda",),
+    "d_s": ("d_s",),
+    "ds": ("d_s",),
+    "qnr": ("qnr",),
     "all": tuple(sorted(VALID_METRICS)),
 }
 
@@ -73,7 +89,7 @@ def normalize_test_metrics(value: Any = None) -> list[str]:
         try:
             expanded = _METRIC_ALIASES[name]
         except KeyError as exc:
-            options = ", ".join(sorted((*VALID_METRICS, "sam", "all")))
+            options = ", ".join(sorted((*VALID_METRICS, "sam", "q8", "dlambda", "ds", "all")))
             raise ValueError(f"unknown test metric {item!r}; choose from {options}") from exc
         for metric in expanded:
             if metric not in result:
@@ -121,6 +137,56 @@ def _test_options(
     if effective_output is not None and not isinstance(effective_output, (str, Path)):
         raise ValueError("test.output 必须是路径或 null")
     return selected_metrics, save_predictions, effective_device, effective_steps, effective_batch, effective_output
+
+
+_TILE_AT_TRAIN_CROP = {"rdm_pan", "fusion_mamba"}
+_ALWAYS_TILED_MODELS = {"fusion_mamba", "stf_mamba", "rdm_stf", "rdm_pan"}
+
+
+def resolve_eval_tiles(
+    model_name: str,
+    data_meta: Mapping[str, Any],
+    *,
+    scale: int,
+    wuhan_run: bool,
+) -> tuple[int | None, int]:
+    """Pick LR-grid tile size/overlap for models that cannot take the full image.
+
+    ``rdm_pan`` and ``fusion_mamba`` default to the training crop: HR
+    ``data.patch_size`` (64) so the LR tile is ``patch_size / scale`` (16).
+    That keeps CUDA WKV at T=64 and matches FusionMamba's 64x64 PAN crop.
+    """
+    name = str(model_name).strip().lower()
+    tiled = bool(wuhan_run) or name in _ALWAYS_TILED_MODELS
+    if not tiled:
+        return None, 0
+    tile_size = data_meta.get("eval_tile_size")
+    overlap = data_meta.get("eval_tile_overlap", 0)
+    if tile_size is None and name in _TILE_AT_TRAIN_CROP:
+        patch = data_meta.get("patch_size", 64)
+        if isinstance(patch, bool) or not isinstance(patch, int) or patch < 1:
+            raise ValueError("data.patch_size must be a positive integer")
+        if int(patch) % int(scale):
+            raise ValueError(
+                f"data.patch_size ({patch}) must be divisible by scale ({scale})"
+            )
+        tile_size = int(patch) // int(scale)
+        if overlap in (None, 0):
+            overlap = tile_size // 2
+    if overlap is None:
+        overlap = 0
+    if tile_size is not None and (
+        isinstance(tile_size, bool) or not isinstance(tile_size, int) or tile_size < 1
+    ):
+        raise ValueError("data.eval_tile_size must be a positive integer or null")
+    if (
+        isinstance(overlap, bool)
+        or not isinstance(overlap, int)
+        or overlap < 0
+        or (tile_size is not None and overlap >= tile_size)
+    ):
+        raise ValueError("data.eval_tile_overlap must be in [0, data.eval_tile_size)")
+    return tile_size, int(overlap)
 
 
 def select_device(config: Mapping[str, Any], requested: str | None = None) -> torch.device:
@@ -195,6 +261,27 @@ def _reference_for_refsr_batch(
     if not torch.is_tensor(ref):
         raise TypeError(f"batch[{ref_key!r}] must be a tensor, got {type(ref).__name__}")
     return ref
+
+
+def _batch_has_gt(batch: Mapping[str, Any]) -> bool:
+    if "has_gt" not in batch:
+        return True
+    flag = batch["has_gt"]
+    if torch.is_tensor(flag):
+        return bool(flag.reshape(-1)[0].item())
+    if isinstance(flag, (list, tuple)):
+        return bool(flag[0])
+    return bool(flag)
+
+
+def _metric_stats(values: Sequence[float]) -> dict[str, Any]:
+    mean = sum(values) / len(values)
+    if len(values) > 1:
+        variance = sum((item - mean) ** 2 for item in values) / (len(values) - 1)
+        std = variance ** 0.5
+    else:
+        std = 0.0
+    return {"mean": mean, "std": std, "per_image": list(values)}
 
 
 def _image_tensor(value: torch.Tensor, *, value_range: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -416,6 +503,8 @@ def run_inference(
         key: [] for key in ("rmse", "uiqi", "psnr", "sam_rad", "sam_deg", "ergas")
     }
     wuhan_band_rmse: list[list[float]] = []
+    wuhan_band_uiqi: list[list[float]] = []
+    wuhan_band_psnr: list[list[float]] = []
     dataset_meta = config.get("dataset", {})
     if not isinstance(dataset_meta, Mapping):
         dataset_meta = {}
@@ -434,11 +523,33 @@ def run_inference(
         )
         if value is not None
     )
-    unsupported_wuhan = sorted(WUHAN_METRICS.intersection(selected_metrics) - set(WUHAN_METRICS if wuhan_run else ()))
+    pan_run = any(
+        "pancollection" in str(value).strip().lower()
+        for value in (
+            dataset_meta.get("id"),
+            dataset_meta.get("kind"),
+            dataset_meta.get("format"),
+            data_meta.get("dataset_format"),
+            data_meta.get("dataset_kind"),
+            data_meta.get("format"),
+            str(data_meta.get("root", "")),
+        )
+        if value is not None
+    )
+    unsupported_wuhan = sorted(
+        WUHAN_ONLY_METRICS.intersection(selected_metrics) - set(WUHAN_ONLY_METRICS if wuhan_run else ())
+    )
     if unsupported_wuhan:
         raise ValueError(
             f"metrics {unsupported_wuhan} 只适用于 Wuhan 数据集；当前数据集不是 Wuhan"
         )
+    pan_requested = [name for name in selected_metrics if name in PAN_GT_METRICS or name in PAN_NOREF_METRICS]
+    if pan_requested and not (pan_run or wuhan_run):
+        missing = [name for name in pan_requested if name in PAN_NOREF_METRICS or name == "q2n"]
+        if missing and not pan_run:
+            raise ValueError(
+                f"metrics {sorted(set(missing))} 需要 PanCollection 的 MS/PAN/LMS 输入"
+            )
     wuhan_metric_keys = {
         "rmse": "rmse",
         "uiqi": "uiqi",
@@ -451,20 +562,16 @@ def run_inference(
         wuhan_metric_keys[name] for name in selected_metrics if name in wuhan_metric_keys
     }
     wuhan_ratio = float(data_meta.get("physical_resolution_ratio", 30.0 / 8.0))
-    tiled_model = wuhan_run or model_name in {"fusion_mamba", "stf_mamba", "rdm_stf"}
-    eval_tile_size = data_meta.get("eval_tile_size") if tiled_model else None
-    eval_tile_overlap = data_meta.get("eval_tile_overlap", 0) if tiled_model else 0
-    if eval_tile_size is not None and (
-        isinstance(eval_tile_size, bool) or not isinstance(eval_tile_size, int) or eval_tile_size < 1
-    ):
-        raise ValueError("data.eval_tile_size must be a positive integer or null")
-    if (
-        isinstance(eval_tile_overlap, bool)
-        or not isinstance(eval_tile_overlap, int)
-        or eval_tile_overlap < 0
-        or (eval_tile_size is not None and eval_tile_overlap >= eval_tile_size)
-    ):
-        raise ValueError("data.eval_tile_overlap must be in [0, data.eval_tile_size)")
+    eval_tile_size, eval_tile_overlap = resolve_eval_tiles(
+        model_name, data_meta, scale=scale, wuhan_run=wuhan_run
+    )
+    if eval_tile_size is not None:
+        LOGGER.info(
+            "tiled inference on LR grid: tile_size=%s overlap=%s (HR %sx)",
+            eval_tile_size,
+            eval_tile_overlap,
+            scale,
+        )
     inference_steps = int(
         configured_steps
         if configured_steps is not None
@@ -568,26 +675,54 @@ def run_inference(
                 raise ValueError(
                     f"模型输出与 HR 尺寸不一致: {tuple(prediction_metric.shape)} vs {tuple(hr_metric.shape)}"
                 )
-            if "psnr" in metric_values:
-                metric_values["psnr"].extend(
-                    per_image_psnr(prediction_metric, hr_metric).detach().cpu().tolist()
-                )
-            if "ssim" in metric_values:
-                metric_values["ssim"].extend(
-                    gaussian_ssim(prediction_metric, hr_metric).detach().cpu().tolist()
-                )
-            if wuhan_run and requested_wuhan_keys:
+            has_gt = _batch_has_gt(batch)
+            if has_gt:
+                if "psnr" in metric_values:
+                    metric_values["psnr"].extend(
+                        per_image_psnr(prediction_metric, hr_metric).detach().cpu().tolist()
+                    )
+                if "ssim" in metric_values:
+                    metric_values["ssim"].extend(
+                        gaussian_ssim(prediction_metric, hr_metric).detach().cpu().tolist()
+                    )
+            spectral_keys = {"sam_rad", "sam_deg", "ergas"}
+            need_spectral = bool(spectral_keys.intersection(selected_metrics) or (wuhan_run and requested_wuhan_keys))
+            if has_gt and (wuhan_run or pan_run) and need_spectral:
                 values = wuhan_metric_tensors(
                     prediction_metric,
                     hr_metric,
-                    resolution_ratio=wuhan_ratio,
+                    resolution_ratio=wuhan_ratio if wuhan_run else float(scale),
                     value_range="zero_one",
                 )
-                for key in wuhan_values:
-                    if key in requested_wuhan_keys:
-                        wuhan_values[key].extend(values[key].detach().cpu().tolist())
-                if "rmse" in requested_wuhan_keys:
-                    wuhan_band_rmse.extend(values["rmse_per_band"].detach().cpu().tolist())
+                if wuhan_run and requested_wuhan_keys:
+                    for key in wuhan_values:
+                        if key in requested_wuhan_keys:
+                            wuhan_values[key].extend(values[key].detach().cpu().tolist())
+                    if "rmse" in requested_wuhan_keys:
+                        wuhan_band_rmse.extend(values["rmse_per_band"].detach().cpu().tolist())
+                    if "uiqi" in requested_wuhan_keys:
+                        wuhan_band_uiqi.extend(values["uiqi_per_band"].detach().cpu().tolist())
+                    if "psnr" in requested_wuhan_keys:
+                        wuhan_band_psnr.extend(values["psnr_per_band"].detach().cpu().tolist())
+                for key in ("sam_rad", "sam_deg", "ergas"):
+                    if key in metric_values:
+                        metric_values[key].extend(values[key].detach().cpu().tolist())
+            if has_gt and "q2n" in metric_values:
+                metric_values["q2n"].extend(q2n(prediction_metric, hr_metric).tolist())
+            need_qnr = bool(PAN_NOREF_METRICS.intersection(metric_values))
+            if need_qnr:
+                ms_up = batch.get("lms")
+                if ms_up is None:
+                    raise KeyError("QNR/Dλ/Ds require batch['lms'] (upsampled MS)")
+                ms_up_metric, _ = _image_tensor(ms_up, value_range="zero_one")
+                pan_metric, _ = _image_tensor(
+                    batch[config["data"].get("ref_key", "ref")],
+                    value_range="zero_one",
+                )
+                qnr_values = qnr(prediction_metric, ms_up_metric, pan_metric, ratio=scale)
+                for key in ("d_lambda", "d_s", "qnr"):
+                    if key in metric_values:
+                        metric_values[key].extend(qnr_values[key].tolist())
             if set(batch_sample_ids) & set(sample_ids):
                 duplicate = sorted(set(batch_sample_ids) & set(sample_ids))
                 raise ValueError(f"duplicate sample_id encountered during evaluation: {duplicate}")
@@ -619,6 +754,8 @@ def run_inference(
         "sample_ids": sample_ids,
         "image_naming": "sample_id",
         "metrics": selected_metrics,
+        "eval_tile_size": eval_tile_size,
+        "eval_tile_overlap": eval_tile_overlap,
         "save_images": save_predictions,
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
         "test_config": str(config.get("_test_config_path"))
@@ -626,11 +763,16 @@ def run_inference(
         else None,
     }
     for name, values in metric_values.items():
-        if name in WUHAN_METRICS:
+        if name in WUHAN_ONLY_METRICS:
+            continue
+        if name in {"sam_rad", "sam_deg", "ergas"} and wuhan_run:
             continue
         if not values:
+            if name in {"psnr", "ssim"} | PAN_GT_METRICS:
+                LOGGER.info("skipping %s: this split has no GT", name)
+                continue
             raise RuntimeError(f"metric {name!r} did not produce any values")
-        metrics[name] = {"mean": sum(values) / len(values), "per_image": values}
+        metrics[name] = _metric_stats(values)
     if wuhan_run and requested_wuhan_keys:
         wuhan_payload: dict[str, Any] = {
             "resolution_ratio": wuhan_ratio,
@@ -642,12 +784,17 @@ def run_inference(
             values = wuhan_values[key]
             if not values:
                 raise RuntimeError(f"Wuhan metric {key!r} did not produce any values")
-            wuhan_payload[key] = {"mean": sum(values) / len(values), "per_image": values}
-        if "rmse" in requested_wuhan_keys:
-            wuhan_payload["rmse_per_band"] = (
-                torch.as_tensor(wuhan_band_rmse, dtype=torch.float64).mean(dim=0).tolist()
-                if wuhan_band_rmse
-                else []
+            wuhan_payload[key] = _metric_stats(values)
+        band_payload = (
+            ("rmse", "rmse_per_band", wuhan_band_rmse),
+            ("uiqi", "uiqi_per_band", wuhan_band_uiqi),
+            ("psnr", "psnr_per_band", wuhan_band_psnr),
+        )
+        for key, name, rows in band_payload:
+            if key not in requested_wuhan_keys:
+                continue
+            wuhan_payload[name] = (
+                torch.as_tensor(rows, dtype=torch.float64).mean(dim=0).tolist() if rows else []
             )
         metrics["wuhan"] = wuhan_payload
         for name, key in wuhan_metric_keys.items():
@@ -659,4 +806,4 @@ def run_inference(
     return metrics
 
 
-__all__ = ["VALID_SPLITS", "VALID_METRICS", "normalize_test_metrics", "run_inference", "select_device"]
+__all__ = ["VALID_SPLITS", "VALID_METRICS", "normalize_test_metrics", "resolve_eval_tiles", "run_inference", "select_device"]

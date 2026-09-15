@@ -1,5 +1,6 @@
 """Evaluation metrics shared by training and test runners."""
 
+from .pansharpening import d_lambda, d_s, q2n, qnr
 from .wuhan import (
     compute_wuhan_metrics,
     ergas,
@@ -13,6 +14,10 @@ from .wuhan import (
 )
 
 __all__ = [
+    "d_lambda",
+    "d_s",
+    "q2n",
+    "qnr",
     "compute_wuhan_metrics",
     "ergas",
     "metric_report",

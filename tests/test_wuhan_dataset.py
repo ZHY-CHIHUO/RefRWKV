@@ -59,6 +59,34 @@ class WuhanDatasetTests(unittest.TestCase):
             self.assertEqual(len(dataset.path_cache), 4)
             # All temporal tensors have the same crop geometry.
             self.assertEqual({tuple(sample[key].shape[-2:]) for key in ("lr_t1", "lr_t2", "hr_t1", "hr_t2")}, {(8, 8)})
+            self.assertEqual(len(dataset), 1)
+
+    def test_official_num_patches_virtualizes_train_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_root(root)
+            dataset = WuhanSTFDataset(
+                root,
+                mode="train",
+                patch_size=8,
+                augment=False,
+                return_quadruple=True,
+                num_patches=16,
+            )
+            self.assertEqual(len(dataset.pairs), 1)
+            self.assertEqual(len(dataset), 16)
+            sample = dataset[15]
+            self.assertEqual(sample["lr"].shape, (4, 8, 8))
+            self.assertEqual(sample["lr_t1"].shape, (4, 8, 8))
+            with self.assertRaises(IndexError):
+                dataset[16]
+            with self.assertRaises(ValueError):
+                WuhanSTFDataset(
+                    root,
+                    mode="test",
+                    patch_size=None,
+                    num_patches=16,
+                )
 
     def test_identity_metrics(self) -> None:
         value = torch.rand(2, 4, 8, 8)
@@ -67,6 +95,11 @@ class WuhanDatasetTests(unittest.TestCase):
         self.assertTrue(torch.allclose(result["uiqi"], torch.ones(2)))
         self.assertTrue(torch.allclose(result["sam_rad"], torch.zeros(2)))
         self.assertTrue(torch.allclose(result["ergas"], torch.zeros(2)))
+        self.assertEqual(tuple(result["rmse_per_band"].shape), (2, 4))
+        self.assertEqual(tuple(result["uiqi_per_band"].shape), (2, 4))
+        self.assertEqual(tuple(result["psnr_per_band"].shape), (2, 4))
+        self.assertTrue(torch.allclose(result["rmse_per_band"], torch.zeros(2, 4)))
+        self.assertTrue(torch.allclose(result["uiqi_per_band"], torch.ones(2, 4)))
 
     def test_rgb_to_four_band_transfer_keeps_reconstruction_head_new(self) -> None:
         class Boundary(torch.nn.Module):

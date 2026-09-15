@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from evaluation.runner import resolve_eval_tiles
 from runtime.tiling import tiled_forward
 
 
@@ -68,6 +69,44 @@ class TiledForwardTests(unittest.TestCase):
             input_scales=(1, 2),
         )
         self.assertTrue(torch.allclose(actual, expected, atol=1.0e-6, rtol=1.0e-6))
+
+
+class ResolveEvalTilesTests(unittest.TestCase):
+    def test_rdm_pan_defaults_to_training_lr_crop(self) -> None:
+        tile, overlap = resolve_eval_tiles(
+            "rdm_pan",
+            {"patch_size": 64, "eval_tile_size": None, "eval_tile_overlap": 0},
+            scale=4,
+            wuhan_run=False,
+        )
+        self.assertEqual((tile, overlap), (16, 8))
+
+    def test_fusion_mamba_uses_the_same_crop(self) -> None:
+        tile, overlap = resolve_eval_tiles(
+            "fusion_mamba",
+            {"patch_size": 64, "eval_tile_size": None, "eval_tile_overlap": 0},
+            scale=4,
+            wuhan_run=False,
+        )
+        self.assertEqual((tile, overlap), (16, 8))
+
+    def test_explicit_tile_size_is_kept(self) -> None:
+        tile, overlap = resolve_eval_tiles(
+            "rdm_pan",
+            {"patch_size": 64, "eval_tile_size": 16, "eval_tile_overlap": 0},
+            scale=4,
+            wuhan_run=False,
+        )
+        self.assertEqual((tile, overlap), (16, 0))
+
+    def test_other_models_are_not_tiled(self) -> None:
+        tile, overlap = resolve_eval_tiles(
+            "refsrwkv",
+            {"patch_size": 64, "eval_tile_size": None},
+            scale=4,
+            wuhan_run=False,
+        )
+        self.assertEqual((tile, overlap), (None, 0))
 
 
 if __name__ == "__main__":

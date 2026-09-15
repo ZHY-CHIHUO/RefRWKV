@@ -1,0 +1,20 @@
+test:
+  splits:
+  - test_hard
+  metrics:
+  - d_lambda
+  - d_s
+  - qnr
+  save_images: false
+  device: null
+  batch_size: null
+  steps: null
+  output: experiments/test/refsr/compare_wv3_fm_official/fusion_mamba_last
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/fusion_mamba/pancollection_wv3/x4/fusion_mamba_pancollection_wv3_official/checkpoints/last.ckpt
+source_config: configs/test/test.yaml
+split: test_hard
+overrides:
+- data.eval_tile_size=64
+- data.eval_tile_overlap=0
+- dataset.files.test_hard=full_examples/test_wv3_OrigScale_multiExm1.h5
+- data.files.test_hard=full_examples/test_wv3_OrigScale_multiExm1.h5

@@ -86,7 +86,8 @@ def wuhan_metric_tensors(
     mse = diff.square().mean(dim=(1, 2, 3))
     rmse = mse.sqrt()
     band_mse = diff.square().mean(dim=(2, 3))
-    psnr = (10.0 * torch.log10(1.0 / band_mse.clamp_min(float(eps)))).mean(dim=1)
+    psnr_band = 10.0 * torch.log10(1.0 / band_mse.clamp_min(float(eps)))
+    psnr = psnr_band.mean(dim=1)
 
     pred_mean = pred.mean(dim=(2, 3))
     truth_mean = truth.mean(dim=(2, 3))
@@ -105,7 +106,8 @@ def wuhan_metric_tensors(
         torch.ones_like(denominator),
         numerator / denominator.clamp_min(float(eps)),
     )
-    uiqi = uiqi_band.clamp(-1.0, 1.0).mean(dim=1)
+    uiqi_band = uiqi_band.clamp(-1.0, 1.0)
+    uiqi = uiqi_band.mean(dim=1)
 
     dot = (pred * truth).sum(dim=1)
     pred_norm = pred.square().sum(dim=1).sqrt()
@@ -133,6 +135,8 @@ def wuhan_metric_tensors(
         "sam_deg": sam_deg,
         "ergas": ergas,
         "rmse_per_band": band_rmse,
+        "uiqi_per_band": uiqi_band,
+        "psnr_per_band": psnr_band,
     }
 
 
@@ -145,7 +149,7 @@ def compute_wuhan_metrics(
 ) -> dict[str, Any]:
     """Compute scalar metrics for one image (or mean over a batch).
 
-    The returned mapping includes ``per_band`` RMSE values in addition to the
+    The returned mapping includes per-band RMSE/UIQI/PSNR in addition to the
     six paper metrics, making it suitable for a JSON report.
     """
     values = wuhan_metric_tensors(
@@ -157,7 +161,8 @@ def compute_wuhan_metrics(
     result: dict[str, Any] = {}
     for key in ("rmse", "uiqi", "psnr", "sam_rad", "sam_deg", "ergas"):
         result[key] = float(values[key].mean().detach().cpu().item())
-    result["rmse_per_band"] = values["rmse_per_band"].mean(dim=0).detach().cpu().tolist()
+    for key in ("rmse_per_band", "uiqi_per_band", "psnr_per_band"):
+        result[key] = values[key].mean(dim=0).detach().cpu().tolist()
     result["resolution_ratio"] = float(resolution_ratio)
     return result
 

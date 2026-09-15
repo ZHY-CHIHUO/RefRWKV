@@ -49,6 +49,8 @@ def evaluate(
         "ERGAS": result["ergas"],
         "RMSE": result["rmse"],
         "RMSE_per_band": result["rmse_per_band"],
+        "UIQI_per_band": result["uiqi_per_band"],
+        "PSNR_per_band": result["psnr_per_band"],
         "resolution_ratio": result["resolution_ratio"],
     }
 

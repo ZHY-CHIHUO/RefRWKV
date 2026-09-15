@@ -39,6 +39,9 @@ class STFMambaAdapterTests(unittest.TestCase):
             self.assertEqual(config["loss"]["name"], "charbonnier")
             self.assertAlmostEqual(float(config["loss"]["eps"]), 1e-3)
             self.assertAlmostEqual(float(config["loss"]["ssim_weight"]), 1.0)
+            self.assertEqual(int(config["data"]["num_patches"]), 12000)
+            self.assertIsNone(config["data"].get("val_num_patches"))
+            self.assertIsNone(config["data"].get("test_num_patches"))
             if config["model"]["name"] == "rdm_stf":
                 self.assertEqual(int(config["data"]["batch_size"]), 10)
             else:

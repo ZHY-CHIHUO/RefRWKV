@@ -43,3 +43,23 @@ bash scripts/shortcuts/test/fusion_mamba_pancollection_wv3.sh \
 bash scripts/shortcuts/test/bi_wkv_cuda.sh
 bash scripts/shortcuts/test/bi_wkv_cuda.sh --unittest
 ```
+
+## `compare_wv3_pan.sh`
+
+WV3 上对比 FusionMamba 与 RDM-PAN，指标与论文表格一致：
+
+- Reduced：`PSNR Q2n SAM ERGAS`
+- Full-res：`Dλ Ds QNR`（Ds 使用 toolbox 1.0 的 MATLAB `imresize`）
+
+```bash
+bash scripts/shortcuts/test/compare_wv3_pan.sh
+bash scripts/shortcuts/test/compare_wv3_pan.sh fusion_mamba
+bash scripts/shortcuts/test/compare_wv3_pan.sh rdm_pan
+```
+
+默认权重是各自 `last.ckpt`。可用环境变量覆盖：
+
+- `FUSION_MAMBA_CKPT`
+- `RDM_PAN_CKPT`
+- `REFRWKV_OUTPUT`（默认 `experiments/test/refsr/compare_wv3_pan`）
+- `REFRWKV_PYTHON`

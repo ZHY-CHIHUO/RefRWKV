@@ -56,6 +56,6 @@ hr  <- gt       # 例如 WV3: 8 x 64 x 64
 
 ## Wuhan
 
-`data/refsr/Wuhan-dataset/` 是四通道、已配准到同一像素网格的 temporal-pair TIFF 数据。网络倍率为 `1`，`3.75` 只用于 ERGAS 的物理分辨率项。完整网格测试使用重叠 tile，具体配置在 `configs/runs/refsrwkv/wuhan.yaml`。
+`data/refsr/Wuhan-dataset/` 是四通道、已配准到同一像素网格的 temporal-pair TIFF 数据。网络倍率为 `1`，`3.75` 只用于 ERGAS 的物理分辨率项。STF 训练按官方 STFMamba `PatchSet.total_index=12000` 从 8 对 TIFF 随机裁 128 patch（约 1200 step/epoch，batch 10）；测试仍是完整 1000×1000 网格。完整网格测试使用重叠 tile，具体配置在 `configs/runs/refsrwkv/wuhan.yaml`。
 
 数据准备脚本位于 `scripts/prepare/`，不要把下载数据或生成缓存提交到仓库。

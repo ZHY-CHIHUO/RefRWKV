@@ -101,7 +101,7 @@ class PanCollectionDatasetTests(unittest.TestCase):
             train_loader, val_loader = build_pancollection_loaders(self._config(root))
             train_batch = next(iter(train_loader))
             val_batch = next(iter(val_loader))
-            self.assertEqual(set(train_batch), {"lr", "ref", "hr"})
+            self.assertTrue({"lr", "ref", "hr"}.issubset(train_batch))
             self.assertEqual(tuple(train_batch["lr"].shape), (1, 8, 2, 2))
             self.assertEqual(tuple(train_batch["ref"].shape), (1, 1, 8, 8))
             self.assertEqual(tuple(val_batch["hr"].shape), (1, 8, 8, 8))
@@ -118,6 +118,19 @@ class PanCollectionDatasetTests(unittest.TestCase):
             train_loader, val_loader = build_pancollection_loaders(config)
             self.assertEqual(len(train_loader.dataset), 2)
             self.assertEqual(len(val_loader.dataset), 1)
+
+    def test_full_resolution_file_without_gt_uses_lms_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "full.h5"
+            with h5py.File(path, "w") as handle:
+                handle.create_dataset("ms", data=np.full((1, 8, 2, 2), 1023.5, dtype=np.float32))
+                handle.create_dataset("pan", data=np.full((1, 1, 8, 8), 512, dtype=np.float32))
+                handle.create_dataset("lms", data=np.full((1, 8, 8, 8), 800, dtype=np.float32))
+            dataset = PanCollectionH5Dataset(path, mode="test", scale=4, patch_size=None)
+            sample = dataset[0]
+            self.assertFalse(bool(sample["has_gt"]))
+            self.assertEqual(tuple(sample["hr"].shape), (8, 8, 8))
+            self.assertEqual(tuple(sample["lms"].shape), (8, 8, 8))
 
     def test_rejects_non_x4_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

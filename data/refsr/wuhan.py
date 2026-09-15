@@ -17,8 +17,11 @@ Each item exposes the usual direct-RefSR aliases (``lr``, ``ref``, ``hr``)
 for the ``L_t2, G_t1 -> G_t2`` prediction contract.  STF models set
 ``return_quadruple=true`` so the batch also carries ``lr_t1`` as ``C0``
 for ``(C0, F0, C1) -> F1``.  Values are ``uint16 / 11848`` clipped to
-``[0, 1]``; this is not the official STFMamba LGC/DX 6-band ``.npy``
-loader (``[-1, 1]``, ``len=12000``).
+``[0, 1]``.  The official STFMamba ``PatchSet`` is a 6-band LGC/DX ``.npy``
+loader with ``total_index = 12000``; Wuhan training matches that epoch size
+by drawing 12000 synchronized 128 crops from the real temporal pairs instead
+of iterating the 8 pair directories once.  Validation/test stay on the true
+pair count, and test uses the full 1000x1000 grid.
 TIFF arrays are cached by absolute path in each dataset process, and one crop
 and one spatial augmentation are shared by all four images.
 """
@@ -71,6 +74,7 @@ class WuhanSTFDataset(Dataset):
         lr_native_scale: int | None = 1,
         lr_provenance: str = "sensor",
         return_sample_id: bool = False,
+        num_patches: int | None = None,
     ) -> None:
         mode = str(mode).strip().lower()
         if mode not in self._VALID_MODES:
@@ -108,6 +112,13 @@ class WuhanSTFDataset(Dataset):
         if cache_size is not None:
             if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 1:
                 raise ValueError("cache_size must be a positive integer or None")
+        if num_patches is not None:
+            if isinstance(num_patches, bool) or not isinstance(num_patches, int) or num_patches < 1:
+                raise ValueError("num_patches must be a positive integer or None")
+            if patch_size is None:
+                raise ValueError(
+                    "num_patches requires patch_size; full-image splits cannot be virtualized"
+                )
 
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.mode = mode
@@ -122,6 +133,7 @@ class WuhanSTFDataset(Dataset):
         self.clip_range = bool(clip_range)
         self.cache_enabled = bool(cache)
         self.cache_size = cache_size
+        self.num_patches = num_patches
         # The explicit path-keyed dictionary is useful for both performance and
         # diagnostics (and is intentionally process-local when workers > 0).
         self._cache: dict[str, np.ndarray] = {}
@@ -144,9 +156,15 @@ class WuhanSTFDataset(Dataset):
             self.pairs = [self.pairs[index] for index in indices]
 
         self.filenames = [pair["name"] for pair in self.pairs]
+        length = len(self)
+        extra = (
+            f"{length} patches/epoch, "
+            if self.num_patches is not None
+            else ""
+        )
         print(
             f"WuhanSTFDataset [{mode}]: {len(self.pairs)} temporal pairs, "
-            f"channels=4, tensor_scale=x1, return_quadruple={self.return_quadruple}"
+            f"{extra}channels=4, tensor_scale=x1, return_quadruple={self.return_quadruple}"
         )
         if patch_size is not None:
             print(f"  Synchronized crop: {patch_size}x{patch_size}")
@@ -327,7 +345,12 @@ class WuhanSTFDataset(Dataset):
         return images
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        pair = self.pairs[index]
+        length = len(self)
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            raise IndexError(f"index {index} out of range for Wuhan dataset of length {length}")
+        pair = self.pairs[index % len(self.pairs)]
         images = self._load_pair(pair)
         rng = random if self.mode == "train" else random.Random(self.sample_seed + int(index))
         images = self._crop_and_augment(images, rng)
@@ -356,11 +379,13 @@ class WuhanSTFDataset(Dataset):
             for key, value in values.items()
         }
         if self.return_sample_id:
-            result["sample_id"] = pair["name"]
+            result["sample_id"] = (
+                f"{pair['name']}#{index}" if self.num_patches is not None else pair["name"]
+            )
         return result
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return int(self.num_patches) if self.num_patches is not None else len(self.pairs)
 
 
 WuhanDataset = WuhanSTFDataset
