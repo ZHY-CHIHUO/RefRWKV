@@ -1,0 +1,25 @@
+dataset:
+  id: pancollection_qb
+  name: PanCollection QuickBird reduced-resolution pansharpening
+  kind: pancollection_h5
+  format: pancollection_h5
+  # Local checkout first; the cluster copy is the fallback on ps.
+  root: data/refsr/PanCollection/training_qb
+  root_candidates:
+    - data/refsr/PanCollection/training_qb
+    - /mnt/sdb/datasets/全色多光谱融合数据集/PanCollection/training_qb
+  default_scale: 4
+  lr: {native_scale: 4, provenance: sensor, source: stored}
+  value_scale: 2047.0
+  source:
+    channels: 4
+    ref_channels: 1
+    normalization: 2047.0
+    layout: NCHW
+  h5_keys: {hr: gt, lr: ms, ref: pan}
+  files:
+    train: train_qb.h5
+    val: valid_qb.h5
+    test: reduced_examples/test_qb_multiExm1.h5
+    test_easy: reduced_examples/test_qb_multiExm1.h5
+    test_hard: full_examples/test_qb_OrigScale_multiExm1.h5
