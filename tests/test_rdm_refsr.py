@@ -508,7 +508,7 @@ class RDMRefSRTests(unittest.TestCase):
 
     def test_pan_stream_ignores_pan_dc(self) -> None:
         torch.manual_seed(0)
-        model = _pan_model()
+        model = _pan_model(highpass_pan=True)
         nn.init.normal_(model.to_hrms[-1].weight, 0.0, 0.02)
         lr = torch.rand(1, 8, 4, 4)
         ref = torch.rand(1, 1, 8, 8).clamp(0.2, 0.8)

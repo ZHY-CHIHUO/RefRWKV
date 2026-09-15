@@ -1,11 +1,5 @@
-# Dedicated PAN RDM v2 on reduced-resolution WV3.
-# Includes:
-# - High-pass PAN input (removes DC bias)
-# - Adaptive final dual-stream softmax mix
-# - Spatial-conditioned SpectralGate
-# - Light spatial (shuffle_prob=0.05) & spectral drop (1 band) regularization
-# - Consistency loss (0.1) & pan structure loss (0.02)
-# - BS=64, max_epochs=800, augment=true
+# Dedicated PAN RDM v3 on reduced-resolution WV3.
+# Same as v2 except PAN is the raw image (no high-pass DC removal).
 base:
   - ../../common/rdm_pan.yaml
   - ../../models/refsr/rdm_pan.yaml
@@ -15,12 +9,12 @@ dataset:
 
 task: refsr
 run:
-  name: pancollection_wv3_rdm_pan_v2_x4
+  name: pancollection_wv3_rdm_pan_v3_x4
   scale: 4
   lr_patch: 16
 
 model:
-  highpass_pan: true
+  highpass_pan: false
 
 data:
   root: data/refsr/PanCollection/training_wv3

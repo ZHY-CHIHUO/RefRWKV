@@ -1699,7 +1699,7 @@ class Backbone_VSSM(VSSM):
             return
         
         try:
-            _ckpt = torch.load(open(ckpt, "rb"), map_location=torch.device("cpu"))
+            _ckpt = torch.load(open(ckpt, "rb"), map_location=torch.device("cpu"), weights_only=False)
             print(f"Successfully load ckpt {ckpt}")
             incompatibleKeys = self.load_state_dict(_ckpt[key], strict=False)
             print(incompatibleKeys)        

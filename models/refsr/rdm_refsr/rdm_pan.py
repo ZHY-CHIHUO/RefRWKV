@@ -242,6 +242,7 @@ class RDMPan(nn.Module):
         shuffle_prob: float = 0.0,
         shuffle_block: int = 4,
         spectral_drop_bands: int = 0,
+        highpass_pan: bool = False,
         **unused: Any,
     ) -> None:
         super().__init__()
@@ -291,6 +292,7 @@ class RDMPan(nn.Module):
         self.use_reference = True
         self.clamp_output = bool(clamp_output)
         self.spectral_drop_bands = int(spectral_drop_bands)
+        self.highpass_pan = bool(highpass_pan)
         self.channel_multipliers = (1, 2, 4)
         self.high_order = False
 
@@ -369,12 +371,12 @@ class RDMPan(nn.Module):
             )
 
         skip = F.interpolate(lr, size=output_size, mode="bicubic", align_corners=False)
-        # PAN carries structure, not radiometry.  On reduced-res this still
-        # sharpens GT; on full-res it stops PAN brightness leaking as white
-        # specks / shifted blobs.
-        pan_low = F.interpolate(ref, size=lr.shape[-2:], mode="area")
-        pan_low = F.interpolate(pan_low, size=output_size, mode="bicubic", align_corners=False)
-        pan = self.raise_pan(ref - pan_low)
+        pan_in = ref
+        if self.highpass_pan:
+            pan_low = F.interpolate(ref, size=lr.shape[-2:], mode="area")
+            pan_low = F.interpolate(pan_low, size=output_size, mode="bicubic", align_corners=False)
+            pan_in = ref - pan_low
+        pan = self.raise_pan(pan_in)
         ms_in = self._drop_spectrum(skip)
         ms = self.raise_ms(ms_in)
 

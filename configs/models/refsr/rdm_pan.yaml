@@ -18,5 +18,6 @@ model:
   shuffle_prob: 0.05    # Light spatial block shuffle for RWKV directional robustness
   shuffle_block: 4
   spectral_drop_bands: 1 # Randomly zero 1 MS band during train to enforce spectral robustness
+  highpass_pan: false
   use_reference: true
   clamp_output: true

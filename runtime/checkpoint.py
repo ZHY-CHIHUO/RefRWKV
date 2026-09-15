@@ -6,7 +6,33 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import functools
+
 import torch
+
+
+def _torch_load(*args, **kwargs):
+    """Call ``torch.load`` with an explicit ``weights_only`` flag.
+
+    PyTorch 2.6+ warns on every omitted ``weights_only``.  Lightning checkpoints
+    are full pickle objects, so the safe default here is ``False``.
+    """
+    if kwargs.get("weights_only") is None:
+        kwargs["weights_only"] = False
+    try:
+        return _ORIGINAL_TORCH_LOAD(*args, **kwargs)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        kwargs.pop("weights_only", None)
+        return _ORIGINAL_TORCH_LOAD(*args, **kwargs)
+
+
+_ORIGINAL_TORCH_LOAD = getattr(torch.load, "__wrapped__", torch.load)
+if not getattr(torch.load, "_rdm_weights_only_patched", False):
+    _patched = functools.wraps(_ORIGINAL_TORCH_LOAD)(_torch_load)
+    _patched._rdm_weights_only_patched = True
+    torch.load = _patched
 
 
 _OUTER_PREFIXES = (
@@ -26,10 +52,7 @@ def load_checkpoint(path: str | Path) -> Any:
     path = Path(path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint not found: {path}")
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _find_tensor_mapping(value: Any) -> dict[str, torch.Tensor] | None:
