@@ -1,0 +1,43 @@
+# Dedicated PAN RDM v4 on reduced-resolution WV3.
+# Same as v2 (high-pass PAN, augment, spectral drop, BS=64, 800 epoch)
+# except the training loss is pure L1: no consistency / pan_struct terms.
+base:
+  - ../../common/rdm_pan.yaml
+  - ../../models/refsr/rdm_pan.yaml
+
+dataset:
+  config: ../../datasets/refsr/pancollection_wv3.yaml
+
+task: refsr
+run:
+  name: pancollection_wv3_rdm_pan_v4_x4
+  scale: 4
+  lr_patch: 16
+
+model:
+  highpass_pan: true
+
+loss:
+  name: l1
+  consistency_weight: 0.0
+  pan_struct_weight: 0.0
+
+data:
+  root: data/refsr/PanCollection/training_wv3
+  reference_mode: paired
+  lr_source: stored
+  lr_native_scale: 4
+  lr_provenance: sensor
+  value_scale: 2047.0
+  patch_size: 64
+  test_patch_size: null
+  eval_tile_size: 16
+  eval_tile_overlap: 8
+  batch_size: 64
+  val_batch_size: 64
+  max_samples_val: null
+
+test:
+  splits: [test]
+  metrics: [psnr, ssim]
+  save_images: false

@@ -19,6 +19,7 @@
 | `rdm_refsr_pancollection_wv3.sh` | RDM-PAN WV3 全色融合训练，batch 32，训练协议与 FusionMamba 对齐。 |
 | `rdm_pan_pancollection_wv3_v2.sh` | RDM-PAN WV3 v2：4× 全色融合，batch 64，800 epoch，几何增强 + 光谱置零。 |
 | `rdm_pan_pancollection_wv3_v3.sh` | RDM-PAN WV3 v3：与 v2 相同，但 PAN 不再做高通去直流。 |
+| `rdm_pan_pancollection_wv3_v4.sh` | RDM-PAN WV3 v4：v2 配方但纯 L1，关掉 consistency / pan_struct。 |
 | `rdm_pan_pancollection_qb_v2.sh` | RDM-PAN QuickBird v2：4 波段 MS + PAN，配方与 WV3 v2 相同。 |
 | `stf_mamba_wuhan.sh` | 官方 STFMamba 的 4 波段 Wuhan 四元组训练，`(C0,F0,C1)->F1`，`[0,1]`。 |
 | `rdm_stf_wuhan.sh` | RDM-STF Wuhan 四元组训练，输入契约与 STFMamba 相同。 |
@@ -33,6 +34,7 @@ bash scripts/shortcuts/train/fusion_mamba_pancollection_wv3.sh
 bash scripts/shortcuts/train/rdm_refsr_pancollection_wv3.sh
 bash scripts/shortcuts/train/rdm_pan_pancollection_wv3_v2.sh
 bash scripts/shortcuts/train/rdm_pan_pancollection_wv3_v3.sh
+bash scripts/shortcuts/train/rdm_pan_pancollection_wv3_v4.sh
 
 # RDM-PAN QuickBird
 bash scripts/shortcuts/train/rdm_pan_pancollection_qb_v2.sh
