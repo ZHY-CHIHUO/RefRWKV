@@ -1,0 +1,54 @@
+# Dedicated PAN RDM v5 on reduced-resolution WV3.
+# Core Design:
+# 1. highpass_pan: false -> Keep complete PAN (no frequency loss, restores 39.4+ PSNR).
+# 2. Retain Adaptive Softmax Fusion & Spatial SpectralGate (from v4).
+# 3. Pure L1 loss (no conflicting auxiliary losses).
+# 4. BS=32, Step LR scheduler (aligns with v1 training dynamics for deeper optimization).
+base:
+  - ../../common/rdm_pan.yaml
+  - ../../models/refsr/rdm_pan.yaml
+
+dataset:
+  config: ../../datasets/refsr/pancollection_wv3.yaml
+
+task: refsr
+run:
+  name: pancollection_wv3_rdm_pan_v5_x4
+  scale: 4
+  lr_patch: 16
+
+model:
+  highpass_pan: false
+  spectral_drop_bands: 0
+
+loss:
+  name: l1
+  consistency_weight: 0.0
+  pan_struct_weight: 0.0
+
+data:
+  root: data/refsr/PanCollection/training_wv3
+  reference_mode: paired
+  lr_source: stored
+  lr_native_scale: 4
+  lr_provenance: sensor
+  value_scale: 2047.0
+  patch_size: 64
+  test_patch_size: null
+  eval_tile_size: 16
+  eval_tile_overlap: 8
+  batch_size: 32
+  val_batch_size: 32
+  max_samples_val: null
+
+train:
+  learning_rate: 0.0005
+  lr_scheduler: step
+  lr_step_size: 300
+  lr_gamma: 0.5
+  max_epochs: 800
+
+test:
+  splits: [test]
+  metrics: [psnr, ssim]
+  save_images: false
