@@ -1,0 +1,19 @@
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - q2n
+  - sam
+  - ergas
+  save_images: false
+  device: cuda
+  batch_size: 1
+  steps: null
+  output: experiments/test/refsr/rdm_pan_v5/best_psnr
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_v5_x4/checkpoints/best_psnr-0799.ckpt
+source_config: configs/test/test.yaml
+split: test
+overrides:
+- data.eval_tile_size=16
+- data.eval_tile_overlap=8

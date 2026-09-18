@@ -1,0 +1,16 @@
+test:
+  splits:
+  - test
+  metrics:
+  - psnr
+  - q2n
+  - sam
+  - ergas
+  save_images: false
+  device: cpu
+  batch_size: 1
+  steps: null
+  output: null
+checkpoint: /home/zhy/PROJECT/RefRWKV/experiments/train/refsr/rdm_pan/pancollection_wv3/x4/pancollection_wv3_rdm_pan_v5_x4/checkpoints/best_overall-0779.ckpt
+source_config: configs/test/test.yaml
+split: test
